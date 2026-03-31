@@ -30,7 +30,8 @@ mod transport;
 pub use transport::QlogConfig;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 pub use crate::transport_parameters::{
-    TransportParameterConfig, TransportParameterId, TransportParameterKind,
+    TransportParameterConfig, TransportParameterId, TransportParameterKind, VersionEntry,
+    VersionInformation,
 };
 
 /// Global configuration for the endpoint, affecting all connections

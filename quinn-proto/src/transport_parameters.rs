@@ -27,7 +27,7 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Public impersonation API: ordered transport parameter list
+// Public API: ordered transport parameter list
 // ---------------------------------------------------------------------------
 
 /// A single entry in a user-specified transport parameter list.
@@ -63,6 +63,41 @@ pub enum TransportParameterKind {
         /// Raw bytes for the value field.
         value: Vec<u8>,
     },
+
+    /// Emit the `version_information` transport parameter (ID `0x11`).
+    ///
+    /// Defined in RFC 9368 (QUIC Version Negotiation).  The wire format is a
+    /// sequence of big-endian `u32` QUIC version numbers: the chosen version
+    /// followed by the available versions list.
+    ///
+    /// Any [`VersionEntry::Grease`] items in `available` are replaced by a
+    /// freshly-generated GREASE version number at connection time.
+    VersionInformation(VersionInformation),
+}
+
+/// The `version_information` transport parameter value (TP ID `0x11`).
+///
+/// # Wire format
+/// `[chosen: u32be, avail_0: u32be, avail_1: u32be, …]`
+#[derive(Debug, Clone)]
+pub struct VersionInformation {
+    /// The QUIC version the endpoint has chosen for this connection.
+    /// QUIC v1 (RFC 9000) = `1`.
+    pub chosen_version: u32,
+    /// Available versions advertised by the endpoint.
+    pub available: Vec<VersionEntry>,
+}
+
+/// A single entry in the `version_information` available-versions list.
+#[derive(Debug, Clone)]
+pub enum VersionEntry {
+    /// A real QUIC version number (big-endian `u32`).
+    Real(u32),
+    /// A GREASE version number, generated at connection time.
+    ///
+    /// Format: `0xXaXaXaXa` where each byte has the low nibble forced to `0x0a`
+    /// and the high nibble is random (RFC 9368 §3).
+    Grease,
 }
 
 /// Configures which transport parameters are emitted and in what order.
@@ -221,6 +256,24 @@ pub(crate) enum WriteEntry {
     Grease(ReservedTransportParameter),
     /// A custom/unknown parameter with a verbatim byte value.
     Custom { id: u64, value: Vec<u8> },
+    /// The `version_information` transport parameter (ID `0x11`).
+    ///
+    /// All GREASE version entries have been resolved to concrete `u32` values
+    /// at the time this entry is created.
+    VersionInformation {
+        chosen_version: u32,
+        available: Vec<u32>,
+    },
+}
+
+/// Generate a GREASE QUIC version number.
+///
+/// Format: `0xXaXaXaXa` — each byte has its low nibble forced to `0x0a` and
+/// its high nibble randomised (RFC 9368 §3).
+fn grease_quic_version(rng: &mut impl RngCore) -> u32 {
+    let mut bytes = [0u8; 4];
+    rng.fill_bytes(&mut bytes);
+    u32::from_be_bytes(bytes.map(|b| (b & 0xf0) | 0x0a))
 }
 
 apply_params!(make_struct);
@@ -249,6 +302,20 @@ impl TransportParameters {
                             id: *id,
                             value: value.clone(),
                         },
+                        TransportParameterKind::VersionInformation(vi) => {
+                            let available = vi
+                                .available
+                                .iter()
+                                .map(|entry| match entry {
+                                    VersionEntry::Real(v) => *v,
+                                    VersionEntry::Grease => grease_quic_version(rng),
+                                })
+                                .collect();
+                            WriteEntry::VersionInformation {
+                                chosen_version: vi.chosen_version,
+                                available,
+                            }
+                        }
                     })
                     .collect();
                 if tp_config.shuffle {
@@ -445,6 +512,22 @@ impl TransportParameters {
                     w.write_var(*id);
                     w.write_var(value.len() as u64);
                     w.put_slice(value);
+                }
+                WriteEntry::VersionInformation {
+                    chosen_version,
+                    available,
+                } => {
+                    // TP ID 0x11 (RFC 9368).
+                    // Value: chosen_version (u32be) followed by each available
+                    // version (u32be).  Total length = 4 * (1 + available.len()).
+                    const TP_VERSION_INFORMATION: u64 = 0x11;
+                    let value_len = 4u64 * (1 + available.len() as u64);
+                    w.write_var(TP_VERSION_INFORMATION);
+                    w.write_var(value_len);
+                    w.put_u32(*chosen_version);
+                    for v in available {
+                        w.put_u32(*v);
+                    }
                 }
                 WriteEntry::Known(id) => {
                     self.write_known(*id, w);
@@ -1176,6 +1259,99 @@ mod test {
                 }
                 other => panic!("expected Grease, got {other:?}"),
             }
+        }
+    }
+
+    /// The `version_information` TP (0x11) must be written as a big-endian u32
+    /// sequence and ignored on read (unknown TP to the decoder).
+    #[test]
+    fn version_information_write_and_ignored_on_read() {
+        let mut buf = Vec::new();
+
+        // Manually build a WriteEntry::VersionInformation and write it.
+        let entry = WriteEntry::VersionInformation {
+            chosen_version: 1,
+            available: vec![1, 0x0a0a0a0a],
+        };
+        let params = TransportParameters {
+            write_entries: Some(vec![entry]),
+            ..TransportParameters::default()
+        };
+        params.write(&mut buf);
+
+        // Wire format: varint(0x11), varint(12), u32be(1), u32be(1), u32be(0x0a0a0a0a)
+        assert_eq!(&buf[..2], &[0x11, 12]); // id=0x11, len=12 (3×4 bytes)
+        assert_eq!(&buf[2..6], &[0, 0, 0, 1]); // chosen_version = 1
+        assert_eq!(&buf[6..10], &[0, 0, 0, 1]); // available[0] = 1
+        assert_eq!(&buf[10..14], &[0x0a, 0x0a, 0x0a, 0x0a]); // available[1] = GREASE
+
+        // The decoder doesn't know 0x11 — it should be silently skipped.
+        let decoded = TransportParameters::read(Side::Client, &mut buf.as_slice()).unwrap();
+        assert_eq!(decoded, TransportParameters::default());
+    }
+
+    /// GREASE version numbers must have each byte's low nibble == 0x0a.
+    #[test]
+    fn grease_quic_version_format() {
+        let mut rng = rand::rng();
+        for _ in 0..1000 {
+            let v = grease_quic_version(&mut rng);
+            let bytes = v.to_be_bytes();
+            for byte in bytes {
+                assert_eq!(byte & 0x0f, 0x0a, "low nibble must be 0x0a, got {byte:#04x}");
+            }
+        }
+    }
+
+    /// `VersionInformation` with a real + GREASE available entry is written with
+    /// the correct structure when resolved through TransportParameterKind.
+    #[test]
+    fn version_information_kind_resolution() {
+        use crate::config::TransportConfig;
+
+        let vi = VersionInformation {
+            chosen_version: 1,
+            available: vec![VersionEntry::Real(1), VersionEntry::Grease],
+        };
+        let config = TransportParameterConfig::new(vec![
+            TransportParameterKind::VersionInformation(vi),
+        ], false);
+        let mut transport = TransportConfig::default();
+        transport.transport_parameter_config(config);
+
+        let mut rng = rand::rng();
+        use crate::cid_generator::ConnectionIdGenerator;
+        struct FixedLen;
+        impl ConnectionIdGenerator for FixedLen {
+            fn generate_cid(&mut self) -> ConnectionId {
+                ConnectionId::new(&[0u8; 8])
+            }
+            fn cid_len(&self) -> usize { 8 }
+            fn cid_lifetime(&self) -> Option<std::time::Duration> { None }
+        }
+        let ep_config = crate::config::EndpointConfig::default();
+        let tp = TransportParameters::new(
+            &transport,
+            &ep_config,
+            &mut FixedLen,
+            ConnectionId::new(&[0u8; 8]),
+            None,
+            &mut rng,
+        );
+
+        let entries = tp.write_entries.as_ref().unwrap();
+        assert_eq!(entries.len(), 1);
+        let WriteEntry::VersionInformation { chosen_version, available } = &entries[0] else {
+            panic!("expected VersionInformation entry");
+        };
+        assert_eq!(*chosen_version, 1);
+        assert_eq!(available.len(), 2);
+        // One entry must be the real version 1; the other must be a GREASE version.
+        // GREASE is inserted at a random position so we don't assert order.
+        assert!(available.contains(&1));
+        let grease = *available.iter().find(|&&v| v != 1).unwrap();
+        for byte in grease.to_be_bytes() {
+            assert_eq!(byte & 0x0f, 0x0a, "GREASE byte {byte:#04x} low nibble must be 0x0a");
         }
     }
 }
