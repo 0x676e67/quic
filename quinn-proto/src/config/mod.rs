@@ -29,6 +29,9 @@ mod transport;
 #[cfg(feature = "qlog")]
 pub use transport::QlogConfig;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+pub use crate::transport_parameters::{
+    TransportParameterConfig, TransportParameterId, TransportParameterKind,
+};
 
 /// Global configuration for the endpoint, affecting all connections
 ///
