@@ -9,7 +9,7 @@ use qlog::streamer::QlogStreamer;
 use crate::QlogStream;
 use crate::{
     Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    connection::qlog::QlogSink, transport_parameters::TransportParameterConfig,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -56,6 +56,12 @@ pub struct TransportConfig {
     pub(crate) enable_segmentation_offload: bool,
 
     pub(crate) qlog_sink: QlogSink,
+
+    /// Optional ordered transport parameter list.
+    ///
+    /// When `Some`, overrides the default random-shuffle serialisation with
+    /// the exact sequence specified.  See [`TransportParameterConfig`].
+    pub(crate) transport_parameter_config: Option<TransportParameterConfig>,
 }
 
 impl TransportConfig {
@@ -348,6 +354,20 @@ impl TransportConfig {
         self.qlog_sink = stream.into();
         self
     }
+
+    /// Set a custom transport parameter list.
+    ///
+    /// When set, every outgoing connection built from this config will serialise
+    /// its QUIC transport parameters using the entries in `config`, replacing
+    /// the default random shuffle.  Use [`TransportParameterConfig::new`] with
+    /// `shuffle: false` for a fully deterministic wire order, or `shuffle: true`
+    /// to apply a per-connection Fisher-Yates shuffle.
+    /// Custom and GREASE entries are also supported.  See [`TransportParameterConfig`] and
+    /// [`TransportParameterKind`][crate::transport_parameters::TransportParameterKind].
+    pub fn transport_parameter_config(&mut self, config: TransportParameterConfig) -> &mut Self {
+        self.transport_parameter_config = Some(config);
+        self
+    }
 }
 
 impl Default for TransportConfig {
@@ -391,6 +411,8 @@ impl Default for TransportConfig {
             enable_segmentation_offload: true,
 
             qlog_sink: QlogSink::default(),
+
+            transport_parameter_config: None,
         }
     }
 }
@@ -424,6 +446,7 @@ impl fmt::Debug for TransportConfig {
             congestion_controller_factory: _,
             enable_segmentation_offload,
             qlog_sink,
+            transport_parameter_config: _,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
 
