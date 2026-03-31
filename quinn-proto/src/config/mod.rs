@@ -26,6 +26,9 @@ use crate::{
 };
 
 mod transport;
+pub use crate::transport_parameters::{
+    TransportParameterConfig, TransportParameterId, TransportParameterKind,
+};
 #[cfg(feature = "qlog")]
 pub use transport::QlogConfig;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
