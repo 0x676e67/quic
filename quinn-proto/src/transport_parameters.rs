@@ -169,7 +169,7 @@ impl TransportParameters {
             .into(),
             max_datagram_frame_size: config
                 .datagram_receive_buffer_size
-                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+                .map(|x| VarInt::try_from(x as u64).unwrap_or(VarInt::MAX)),
             grease_quic_bit: endpoint_config.grease_quic_bit,
             min_ack_delay: Some(
                 VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
