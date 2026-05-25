@@ -215,6 +215,12 @@ macro_rules! make_struct {
             /// `None`    — receiver-side `TransportParameters`; `write()` falls back to the
             ///             identity order of `TransportParameterId::SUPPORTED`.
             pub(crate) write_entries: Option<Vec<WriteEntry>>,
+
+            /// Client's cached SRTT hint sent to the server (TP ID `0x3127`), in microseconds.
+            ///
+            /// Only set on the sender side (client); `None` means the parameter is not emitted.
+            /// On the receiver side (server) this stores the value the client advertised.
+            pub(crate) initial_rtt_tp: Option<VarInt>,
         }
 
         // We deliberately don't implement the `Default` trait, since that would be public, and
@@ -237,6 +243,7 @@ macro_rules! make_struct {
                     stateless_reset_token: None,
                     preferred_address: None,
                     grease_transport_parameter: None,
+                    initial_rtt_tp: None,
                     write_entries: None,
                 }
             }
@@ -608,6 +615,13 @@ impl TransportParameters {
                     w.write(x);
                 }
             }
+            TransportParameterId::InitialRTT => {
+                if let Some(x) = self.initial_rtt_tp {
+                    w.write_var(id as u64);
+                    w.write_var(x.size() as u64);
+                    w.write(x);
+                }
+            }
             id => {
                 macro_rules! write_params {
                     {$($(#[$doc:meta])* $name:ident ($pid:ident) = $default:expr,)*} => {
@@ -703,6 +717,12 @@ impl TransportParameters {
                     _ => return Err(Error::Malformed),
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
+                TransportParameterId::InitialRTT => {
+                    if len > 8 || params.initial_rtt_tp.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.initial_rtt_tp = Some(r.get()?);
+                }
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -885,11 +905,14 @@ pub enum TransportParameterId {
 
     /// <https://datatracker.ietf.org/doc/html/draft-ietf-quic-ack-frequency#section-10.1>
     MinAckDelayDraft07 = 0xFF04DE1B,
+
+    /// A client-side transport parameter to send a cached SRTT hint to the server.
+    InitialRTT = 0x3127,
 }
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 21] = [
+    const SUPPORTED: [Self; 22] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -911,6 +934,7 @@ impl TransportParameterId {
         Self::RetrySourceConnectionId,
         Self::GreaseQuicBit,
         Self::MinAckDelayDraft07,
+        Self::InitialRTT,
     ];
 }
 
@@ -950,6 +974,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::RetrySourceConnectionId == id => Self::RetrySourceConnectionId,
             id if Self::GreaseQuicBit == id => Self::GreaseQuicBit,
             id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
+            id if Self::InitialRTT == id => Self::InitialRTT,
             _ => return Err(()),
         };
         Ok(param)

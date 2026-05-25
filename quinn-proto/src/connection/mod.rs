@@ -16,8 +16,8 @@ use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
     Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
+    MIN_INITIAL_SIZE, RttStore, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
+    TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -2230,6 +2230,7 @@ impl Connection {
         if space == SpaceId::Data && self.side.is_client() {
             // Discard 0-RTT keys because 1-RTT keys are available.
             self.zero_rtt_crypto = None;
+            self.save_rtt();
         }
     }
 
@@ -3493,6 +3494,20 @@ impl Connection {
         }
     }
 
+    fn save_rtt(&self) {
+        if let ConnectionSide::Client {
+            rtt_store,
+            server_name,
+            ..
+        } = &self.side
+        {
+            if let Some(rtt_store) = rtt_store {
+                let rtt_us = self.path.rtt.get().as_micros() as u64;
+                rtt_store.insert(server_name, rtt_us);
+            }
+        }
+    }
+
     fn set_close_timer(&mut self, now: Instant) {
         self.timers
             .set(Timer::Close, now + 3 * self.pto(self.highest_space));
@@ -3820,6 +3835,7 @@ enum ConnectionSide {
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        rtt_store: Option<Arc<dyn RttStore>>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3856,10 +3872,12 @@ impl From<SideArgs> for ConnectionSide {
             SideArgs::Client {
                 token_store,
                 server_name,
+                rtt_store,
             } => Self::Client {
                 token: token_store.take(&server_name).unwrap_or_default(),
                 token_store,
                 server_name,
+                rtt_store,
             },
             SideArgs::Server {
                 server_config,
@@ -3875,6 +3893,7 @@ pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        rtt_store: Option<Arc<dyn RttStore>>,
     },
     Server {
         server_config: Arc<ServerConfig>,
