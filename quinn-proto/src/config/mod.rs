@@ -22,6 +22,7 @@ use crate::{
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
+    rtt_store::RttStore,
     shared::ConnectionId,
 };
 
@@ -569,6 +570,14 @@ pub struct ClientConfig {
 
     /// QUIC protocol version to use
     pub(crate) version: u32,
+
+    /// Automatic per-server RTT cache for the `initial_rtt` transport parameter (ID `0x3127`).
+    ///
+    /// When a client connection drains after the handshake completes, quinn-proto automatically
+    /// calls [`RttStore::store`] with the measured SRTT.  On every subsequent connection to the
+    /// same server, [`RttStore::load`] is called and the result is emitted as the `initial_rtt`
+    /// TP, matching Chrome's behaviour (first connection: no TP; later connections: measured RTT).
+    pub(crate) rtt_store: Option<Arc<dyn RttStore>>,
 }
 
 impl ClientConfig {
@@ -582,6 +591,7 @@ impl ClientConfig {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
             version: 1,
+            rtt_store: None,
         }
     }
 
@@ -612,6 +622,18 @@ impl ClientConfig {
     /// Defaults to [`TokenMemoryCache`], which is suitable for most internet applications.
     pub fn token_store(&mut self, store: Arc<dyn TokenStore>) -> &mut Self {
         self.token_store = store;
+        self
+    }
+
+    /// Set a custom [`RttStore`]
+    ///
+    /// Defaults to [`RttMemoryCache`], which keeps the latest measured SRTT per server name
+    /// for the lifetime of the process.  Supply a custom implementation to persist RTT values
+    /// across process restarts.
+    ///
+    /// Set to [`NoneRttStore`](crate::NoneRttStore) to disable the `initial_rtt` TP entirely.
+    pub fn rtt_store(&mut self, store: Arc<dyn RttStore>) -> &mut Self {
+        self.rtt_store = Some(store);
         self
     }
 

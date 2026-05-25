@@ -16,7 +16,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
-    Side, Transmit, TransportConfig, TransportError,
+    Side, Transmit, TransportConfig, TransportError, VarInt,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
@@ -337,7 +337,7 @@ impl Endpoint {
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);
-        let params = TransportParameters::new(
+        let mut params = TransportParameters::new(
             &config.transport,
             &self.config,
             self.local_cid_generator.as_ref(),
@@ -345,6 +345,15 @@ impl Endpoint {
             None,
             &mut self.rng,
         );
+
+        // Populate initial_rtt TP: explicit override takes priority, then the automatic
+        // per-server RTT cache.  Neither is set on the very first connection to a server.
+        params.initial_rtt_tp = config.rtt_store.as_ref().and_then(|rtt_store| {
+            rtt_store
+                .load(server_name)
+                .and_then(|us| VarInt::from_u64(us).ok())
+        });
+
         let tls = config
             .crypto
             .start_session(config.version, server_name, &params)?;
@@ -365,6 +374,7 @@ impl Endpoint {
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
+                rtt_store: config.rtt_store,
             },
         );
         Ok((ch, conn))
