@@ -16,7 +16,7 @@ default = ["json-output", "qlog"]
 # Allow for json output from the perf client
 json-output = ["serde", "serde_json"]
 # Enable qlog support
-qlog = ["quic_rs/qlog"]
+qlog = ["quic-rs/qlog"]
 # Enable tokio-console https://github.com/tokio-rs/console
 # See https://docs.rs/console-subscriber/latest/console_subscriber/struct.Builder.html#method.with_default_env
 #    for useful environment variables in particular to change listen addr and port
@@ -30,8 +30,8 @@ bytes = { workspace = true }
 clap = { workspace = true }
 console-subscriber = { version = "0.5.0", features = ["parking_lot"], optional = true }
 hdrhistogram = { workspace = true }
-quic_rs = { package = "quic-rs", path = "../quic-rs" }
-quic_proto_rs = { package = "quic-proto-rs", path = "../quic-proto-rs" }
+quic-rs = { path = "../quic-rs" }
+quic-proto-rs= { path = "../quic-proto-rs" }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true, optional = true  }
