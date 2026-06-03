@@ -833,9 +833,6 @@ impl ReservedTransportParameter {
 }
 
 /// Identifies a QUIC transport parameter by its wire ID.
-///
-/// Standard IDs are defined in [RFC 9000 §22.3](https://www.rfc-editor.org/rfc/rfc9000#section-22.3).
-/// Unknown or custom IDs can be supplied via [`WriteEntry::Custom`].
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportParameterId {
