@@ -150,7 +150,11 @@ impl OpenStreamStats {
         send_stream_stats
     }
 
-    pub fn new_receiver(&self, stream: &quic_rs::RecvStream, download_size: u64) -> Arc<StreamStats> {
+    pub fn new_receiver(
+        &self,
+        stream: &quic_rs::RecvStream,
+        download_size: u64,
+    ) -> Arc<StreamStats> {
         let recv_stream_stats = StreamStats {
             id: stream.id(),
             request_size: download_size,

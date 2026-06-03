@@ -79,8 +79,9 @@ pub async fn run(opt: Opt) -> Result<()> {
     let mut endpoint_cfg = quic_rs::EndpointConfig::default();
     endpoint_cfg.max_udp_payload_size(opt.common.max_udp_payload_size)?;
 
-    let endpoint = quic_rs::Endpoint::new(endpoint_cfg, Some(config), socket, Arc::new(TokioRuntime))
-        .context("creating endpoint")?;
+    let endpoint =
+        quic_rs::Endpoint::new(endpoint_cfg, Some(config), socket, Arc::new(TokioRuntime))
+            .context("creating endpoint")?;
 
     info!("listening on {}", endpoint.local_addr().unwrap());
 

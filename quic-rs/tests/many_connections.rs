@@ -30,7 +30,8 @@ fn connect_n_nodes_to_1_and_send_1mb_data() {
 
     let (cfg, listener_cert) = configure_listener();
     let endpoint =
-        quic_rs::Endpoint::server(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        quic_rs::Endpoint::server(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap();
     let listener_addr = endpoint.local_addr().unwrap();
 
     let expected_messages = 50;
@@ -142,7 +143,8 @@ fn configure_connector(node_cert: CertificateDer<'static>) -> quic_rs::ClientCon
 fn configure_listener() -> (quic_rs::ServerConfig, CertificateDer<'static>) {
     let (our_cert, our_priv_key) = gen_cert();
     let mut our_cfg =
-        quic_rs::ServerConfig::with_single_cert(vec![our_cert.clone()], our_priv_key.into()).unwrap();
+        quic_rs::ServerConfig::with_single_cert(vec![our_cert.clone()], our_priv_key.into())
+            .unwrap();
 
     let transport_config = Arc::get_mut(&mut our_cfg.transport).unwrap();
     transport_config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
