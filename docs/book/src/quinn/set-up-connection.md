@@ -39,7 +39,7 @@ The `SERVER_NAME` argument is the DNS name, matching the certificate configured 
 
 [Next up](data-transfer.md), let's have a look at sending data over this connection.
 
-[Endpoint]: https://docs.rs/quinn/latest/quinn/struct.Endpoint.html
-[server]: https://docs.rs/quinn/latest/quinn/struct.Endpoint.html#method.server
-[client]: https://docs.rs/quinn/latest/quinn/struct.Endpoint.html#method.client
-[connect]: https://docs.rs/quinn/latest/quinn/struct.Endpoint.html#method.connect
+[Endpoint]: https://docs.rs/quic-rs/latest/quic_rs/struct.Endpoint.html
+[server]: https://docs.rs/quic-rs/latest/quic_rs/struct.Endpoint.html#method.server
+[client]: https://docs.rs/quic-rs/latest/quic_rs/struct.Endpoint.html#method.client
+[connect]: https://docs.rs/quic-rs/latest/quic_rs/struct.Endpoint.html#method.connect

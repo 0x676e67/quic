@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use quinn::Connection;
+use quic_rs::Connection;
 
 fn main() {}
 

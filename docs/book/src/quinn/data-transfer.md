@@ -77,8 +77,8 @@ _iterating datagram stream(s)_
 {{#include ../bin/data-transfer.rs:50:56}}
 ```
 
-[Endpoint]: https://docs.rs/quinn/latest/quinn/struct.Endpoint.html
-[Connection]: https://docs.rs/quinn/latest/quinn/struct.Connection.html
-[open_bi]: https://docs.rs/quinn/latest/quinn/struct.Connection.html#method.open_bi
-[open_uni]: https://docs.rs/quinn/latest/quinn/struct.Connection.html#method.open_uni
-[send_datagram]: https://docs.rs/quinn/latest/quinn/struct.Connection.html#method.send_datagram
+[Endpoint]: https://docs.rs/quic-rs/latest/quic_rs/struct.Endpoint.html
+[Connection]: https://docs.rs/quic-rs/latest/quic_rs/struct.Connection.html
+[open_bi]: https://docs.rs/quic-rs/latest/quic_rs/struct.Connection.html#method.open_bi
+[open_uni]: https://docs.rs/quic-rs/latest/quic_rs/struct.Connection.html#method.open_uni
+[send_datagram]: https://docs.rs/quic-rs/latest/quic_rs/struct.Connection.html#method.send_datagram

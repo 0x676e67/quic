@@ -1,6 +1,6 @@
 # Certificates
 
-In this chapter, we discuss the configuration of the certificates that are **required** for a working Quinn connection.
+In this chapter, we discuss the configuration of the certificates that are **required** for a working quic-rs connection.
 
 As QUIC uses TLS 1.3 for authentication of connections, the server needs to provide the client with a certificate confirming its identity, and the client must be configured to trust the certificates it receives from the server.
 
@@ -12,7 +12,7 @@ When the [rustls][3] `dangerous_configuration` feature flag is enabled, a client
 Start by adding a [rustls][3] dependency with the `dangerous_configuration` feature flag to your `Cargo.toml` file.
 
 ```toml
-quinn = "0.11"
+quic-rs = "0.12"
 rustls = "0.23"
 ```
 
@@ -103,8 +103,8 @@ This is the only thing you need to do for your client to trust a server certific
 [5]: https://en.wikipedia.org/wiki/Self-signed_certificate#:~:text=In%20cryptography%20and%20computer%20security,a%20CA%20aim%20to%20provide.
 [6]: https://letsencrypt.org/getting-started/
 [7]: https://certbot.eff.org/instructions
-[ClientConfig]: https://docs.rs/quinn/latest/quinn/struct.ClientConfig.html
+[ClientConfig]: https://docs.rs/quic-rs/latest/quic_rs/struct.ClientConfig.html
 [ServerCertVerifier]: https://docs.rs/rustls/latest/rustls/client/trait.ServerCertVerifier.html
-[set_default_client_config]: https://docs.rs/quinn/latest/quinn/struct.Endpoint.html#method.set_default_client_config
+[set_default_client_config]: https://docs.rs/quic-rs/latest/quic_rs/struct.Endpoint.html#method.set_default_client_config
 [generate_simple_self_signed]: https://docs.rs/rcgen/latest/rcgen/fn.generate_simple_self_signed.html
 [Certificate]: https://docs.rs/rcgen/latest/rcgen/struct.Certificate.html
