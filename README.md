@@ -2,9 +2,9 @@
 
 [![Crates.io](https://img.shields.io/crates/v/quic-rs.svg)](https://crates.io/crates/quic-rs)
 
-quic-rs is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
-This repository is a hard fork of [Quinn](https://github.com/quinn-rs/quinn), maintained as a
-separate project with its own crate names, release flow, and package layout.
+**quic-rs** is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
+
+> An independent hard fork of [quinn](https://github.com/quinn-rs/quinn) featuring a decoupled package layout and autonomous release flow.
 
 ## Features
 
@@ -68,7 +68,7 @@ its UDP buffer sizes.
 
 ### Certificates
 
-By default, quic-rs clients validate the cryptographic identity of servers they
+By default, `quic-rs` clients validate the cryptographic identity of servers they
 connect to. This prevents an active, on-path attacker from intercepting
 messages, but requires trusting some certificate authority. For many purposes,
 this can be accomplished by using certificates from [Let's Encrypt][letsencrypt]
@@ -94,7 +94,7 @@ future runs.
 All feedback welcome. Feel free to file bugs, requests for documentation and
 any other feedback to the [issue tracker][issues].
 
-The quic-proto-rs test suite uses simulated IO for reproducibility and to avoid
+The `quic-proto-rs` test suite uses simulated IO for reproducibility and to avoid
 long sleeps in certain timing-sensitive tests. If the `SSLKEYLOGFILE`
 environment variable is set, the tests will emit UDP packets for inspection
 using external protocol analyzers like Wireshark, and NSS-compatible key logs

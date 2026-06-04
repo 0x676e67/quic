@@ -7,7 +7,7 @@ resolver = "2"
 rust-version = "1.80.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/quinn-rs/quinn"
+repository = "https://github.com/0x676e67/quic-rs"
 keywords = ["quic"]
 categories = ["network-programming", "asynchronous"]
 
