@@ -26,15 +26,7 @@ use crate::{
     shared::ConnectionId,
 };
 
-// ---------------------------------------------------------------------------
-// Public API: ordered transport parameter list
-// ---------------------------------------------------------------------------
-
 /// A single entry in a user-specified transport parameter list.
-///
-/// Build a [`TransportParameterConfig`] from an ordered `Vec` of these, then
-/// set it on [`TransportConfig`] to make every outgoing connection use that
-/// exact parameter order instead of quinn's default random shuffle.
 #[derive(Debug, Clone)]
 pub enum TransportParameterKind {
     /// Emit a standard, typed parameter by its well-known ID.
@@ -53,10 +45,6 @@ pub enum TransportParameterKind {
     Grease,
 
     /// Emit a custom/unknown parameter with a raw byte value.
-    ///
-    /// Use this for non-standard extensions that quinn doesn't know about.
-    /// The `value` bytes are written verbatim as the parameter value; an empty
-    /// `Vec` produces a zero-length value field.
     Custom {
         /// Parameter ID — any QUIC varint value (≤ 2^62 − 1).
         id: u64,

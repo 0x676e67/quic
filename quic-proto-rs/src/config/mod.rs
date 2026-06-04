@@ -113,7 +113,7 @@ impl EndpointConfig {
     /// Get the current value of [`max_udp_payload_size`](Self::max_udp_payload_size)
     //
     // While most parameters don't need to be readable, this must be exposed to allow higher-level
-    // layers, e.g. the `quinn` crate, to determine how large a receive buffer to allocate to
+    // layers, e.g. the `quic-rs` crate, to determine how large a receive buffer to allocate to
     // support an externally-defined `EndpointConfig`.
     //
     // While `get_` accessors are typically unidiomatic in Rust, we favor concision for setters,
@@ -155,9 +155,9 @@ impl EndpointConfig {
 
     /// Optional seed to be used internally for random number generation
     ///
-    /// By default, quinn will initialize an endpoint's rng using a platform entropy source.
-    /// However, you can seed the rng yourself through this method (e.g. if you need to run quinn
-    /// deterministically or if you are using quinn in an environment that doesn't have a source of
+    /// By default, `quic-rs` will initialize an endpoint's rng using a platform entropy source.
+    /// However, you can seed the rng yourself through this method (e.g. if you need to run `quic-rs`
+    /// deterministically or if you are using `quic-rs` in an environment that doesn't have a source of
     /// entropy available).
     pub fn rng_seed(&mut self, seed: Option<[u8; 32]>) -> &mut Self {
         self.rng_seed = seed;
