@@ -41,12 +41,6 @@ working directory, with the client fetching `./Cargo.toml`. By default, the
 server generates a self-signed certificate and stores it to disk, where the
 client will automatically find and trust it.
 
-**Links**
-
-- Talk at [RustFest Paris (May 2018) presentation][talk]; [slides][slides]; [YouTube][youtube]
-- Usage [examples][examples]
-- Guide [book][documentation]
-
 ## Usage Notes
 
 <details>
