@@ -17,9 +17,6 @@
 
 ## Overview
 
-Compared with upstream Quinn, this fork publishes `quic-rs` and `quic-proto-rs` with its own
-release flow and package layout.
-
 - **quic-rs:** High-level async API based on tokio, see [examples][examples] for usage. This will be used by most developers. (Basic benchmarks are included.)
 - **quic-proto-rs:** Deterministic state machine of the protocol which performs [**no** I/O][sans-io] internally and is suitable for use with custom event loops (and potentially a C or C++ API).
 - **bench:** Benchmarks without any framework.
