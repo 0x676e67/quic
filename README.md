@@ -15,13 +15,6 @@
 - Future-based async API
 - Minimum supported Rust version of 1.80.0
 
-## Overview
-
-- **quic-rs:** High-level async API based on tokio, see [examples][examples] for usage. This will be used by most developers. (Basic benchmarks are included.)
-- **quic-proto-rs:** Deterministic state machine of the protocol which performs [**no** I/O][sans-io] internally and is suitable for use with custom event loops (and potentially a C or C++ API).
-- **bench:** Benchmarks without any framework.
-- **fuzz:** Fuzz tests.
-
 # Getting Started
 
 **Examples**
@@ -36,62 +29,23 @@ working directory, with the client fetching `./Cargo.toml`. By default, the
 server generates a self-signed certificate and stores it to disk, where the
 client will automatically find and trust it.
 
-## Usage Notes
+## License
 
-<details>
-<summary>
-Click to show the notes
-</summary>
+This project is licensed under either of
 
-### Buffers
+ * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+   http://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or
+   http://opensource.org/licenses/MIT)
 
-A quic-rs endpoint corresponds to a single UDP socket, no matter how many
-connections are in use. Handling high aggregate data rates on a single endpoint
-can require a larger UDP buffer than is configured by default in most
-environments. If you observe erratic latency and/or throughput over a stable
-network link, consider increasing the buffer sizes used. For example, you could
-adjust the `SO_SNDBUF` and `SO_RCVBUF` options of the UDP socket to be used
-before passing it in to quic-rs. Note that some platforms (e.g. Linux) require
-elevated privileges or modified system configuration for a process to increase
-its UDP buffer sizes.
-
-### Certificates
-
-By default, `quic-rs` clients validate the cryptographic identity of servers they
-connect to. This prevents an active, on-path attacker from intercepting
-messages, but requires trusting some certificate authority. For many purposes,
-this can be accomplished by using certificates from [Let's Encrypt][letsencrypt]
-for servers, and relying on the default configuration for clients.
-
-For some cases, including peer-to-peer, trust-on-first-use, deliberately
-insecure applications, or any case where servers are not identified by domain
-name, this isn't practical. Arbitrary certificate validation logic can be
-implemented by customizing the `rustls` configuration; see the
-[insecure_connection.rs][insecure] example for details.
-
-When operating your own certificate authority doesn't make sense, [rcgen][rcgen]
-can be used to generate self-signed certificates on demand. To support
-trust-on-first-use, servers that automatically generate self-signed certificates
-should write their generated certificate to persistent storage and reuse it on
-future runs.
-
-</details>
-<p></p>
+at your option.
 
 ## Contribution
 
-All feedback welcome. Feel free to file bugs, requests for documentation and
-any other feedback to the [issue tracker][issues].
-
-The `quic-proto-rs` test suite uses simulated IO for reproducibility and to avoid
-long sleeps in certain timing-sensitive tests. If the `SSLKEYLOGFILE`
-environment variable is set, the tests will emit UDP packets for inspection
-using external protocol analyzers like Wireshark, and NSS-compatible key logs
-for the client side of each connection will be written to the path specified in
-the variable.
-
-The minimum supported Rust version for published releases of our
-crates will always be at least 6 months old at the time of release.
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
 
 [quic]: https://quicwg.github.io/
 [issues]: https://github.com/0x676e67/quic-rs/issues
