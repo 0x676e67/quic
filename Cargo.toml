@@ -1,6 +1,6 @@
 [workspace]
-members = ["quic-rs", "quic-proto-rs", "bench", "perf", "fuzz", "docs/book"]
-default-members = ["quic-rs", "quic-proto-rs", "bench", "perf"]
+members = ["quic", "quic-proto", "bench", "perf", "fuzz", "docs/book"]
+default-members = ["quic", "quic-proto", "bench", "perf"]
 resolver = "2"
 
 [workspace.package]

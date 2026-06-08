@@ -14,7 +14,7 @@ libfuzzer-sys = "0.4.2"
 
 [dependencies.proto]
 features = ["arbitrary"]
-path = "../quic-proto-rs"
+path = "../quic-proto"
 package = "quic-proto-rs"
 
 [[bin]]
