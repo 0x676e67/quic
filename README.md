@@ -2,9 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/quic-rs.svg)](https://crates.io/crates/quic-rs)
 
-**quic-rs** is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
-
-> An independent hard fork of [quinn](https://github.com/quinn-rs/quinn) featuring a decoupled package layout and autonomous release flow.
+**quic-rs** is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol and a [quinn](https://github.com/quinn-rs/quinn) fork focused on extended QUIC support.
 
 ## Features
 
@@ -99,7 +97,7 @@ The minimum supported Rust version for published releases of our
 crates will always be at least 6 months old at the time of release.
 
 [quic]: https://quicwg.github.io/
-[issues]: https://github.com/djc/quinn/issues
+[issues]: https://github.com/0x676e67/quic-rs/issues
 [rustls]: https://github.com/ctz/rustls
 [ring]: https://github.com/briansmith/ring
 [talk]: https://paris.rustfest.eu/sessions/a-quic-future-in-rust
@@ -108,7 +106,7 @@ crates will always be at least 6 months old at the time of release.
 [youtube]: https://www.youtube.com/watch?v=EHgyY5DNdvI
 [letsencrypt]: https://letsencrypt.org/
 [rcgen]: https://crates.io/crates/rcgen
-[examples]: https://github.com/djc/quinn/tree/main/quic-rs/examples
+[examples]: https://github.com/0x676e67/quic-rs/tree/main/quic/examples
 [documentation]: https://quinn-rs.github.io/quinn/networking-introduction.html
 [sans-io]: https://sans-io.readthedocs.io/how-to-sans-io.html
-[insecure]: https://github.com/quinn-rs/quinn/blob/main/quic-rs/examples/insecure_connection.rs
+[insecure]: https://github.com/0x676e67/quic-rs/blob/main/quic/examples/insecure_connection.rs
