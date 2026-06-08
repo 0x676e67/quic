@@ -5,8 +5,8 @@ use std::{io, net::SocketAddr, num::ParseIntError, str::FromStr, sync::Arc, time
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "qlog")]
-use quinn::QlogConfig;
-use quinn::{
+use quic_rs::QlogConfig;
+use quic_rs::{
     AckFrequencyConfig, TransportConfig, VarInt,
     congestion::{self, ControllerFactory},
     udp::UdpSocketState,
