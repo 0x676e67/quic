@@ -227,7 +227,7 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        todo!()
+        None
     }
 
     #[inline]
