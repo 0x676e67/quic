@@ -3,7 +3,7 @@ use crate::crypto::btls::error::map_ptr_result;
 use crate::crypto::btls::hkdf::DIGEST_BLOCK_LEN;
 use btls::hash::MessageDigest;
 use btls_sys as bffi;
-use rand::RngCore;
+use rand::Rng;
 use std::ffi::{c_uint, c_void};
 use std::result::Result as StdResult;
 

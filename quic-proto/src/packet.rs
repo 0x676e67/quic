@@ -13,7 +13,7 @@ use crate::{
 ///
 /// Due to packet number encryption, it is impossible to fully decode a header
 /// (which includes a variable-length packet number) without crypto context.
-/// The crypto context (represented by the `Crypto` type in Quinn) is usually
+/// The crypto context (represented by the `Crypto` type in this implementation) is usually
 /// part of the `Connection`, or can be derived from the destination CID for
 /// Initial packets.
 ///
@@ -575,7 +575,7 @@ impl ProtectedHeader {
 
     /// Decode a plain header from given buffer, with given [`ConnectionIdParser`].
     pub fn decode(
-        buf: &mut io::Cursor<BytesMut>,
+        buf: &mut io::Cursor<impl AsRef<[u8]>>,
         cid_parser: &(impl ConnectionIdParser + ?Sized),
         supported_versions: &[u32],
         grease_quic_bit: bool,

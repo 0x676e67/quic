@@ -1,5 +1,5 @@
 use hdrhistogram::Histogram;
-use quic_rs::StreamId;
+use quic::StreamId;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -121,7 +121,7 @@ impl Stats {
     #[cfg(feature = "json-output")]
     pub fn print_json(&self, path: &Path) -> io::Result<()> {
         if path == Path::new("-") {
-            json::print(self, std::io::stdout());
+            json::print(self, io::stdout());
         } else {
             let file = File::create(path)?;
             json::print(self, file)
@@ -135,7 +135,7 @@ impl Stats {
 pub struct OpenStreamStats(Arc<Mutex<Vec<Arc<StreamStats>>>>);
 
 impl OpenStreamStats {
-    pub fn new_sender(&self, stream: &quic_rs::SendStream, upload_size: u64) -> Arc<StreamStats> {
+    pub fn new_sender(&self, stream: &quic::SendStream, upload_size: u64) -> Arc<StreamStats> {
         let send_stream_stats = StreamStats {
             id: stream.id(),
             request_size: upload_size,
@@ -150,11 +150,7 @@ impl OpenStreamStats {
         send_stream_stats
     }
 
-    pub fn new_receiver(
-        &self,
-        stream: &quic_rs::RecvStream,
-        download_size: u64,
-    ) -> Arc<StreamStats> {
+    pub fn new_receiver(&self, stream: &quic::RecvStream, download_size: u64) -> Arc<StreamStats> {
         let recv_stream_stats = StreamStats {
             id: stream.id(),
             request_size: download_size,
@@ -250,7 +246,7 @@ fn throughput_bytes_per_second(duration_in_micros: u64, size: u64) -> f64 {
 mod json {
     use crate::stats;
     use crate::stats::{Stats, StreamIntervalStats};
-    use quic_rs::StreamId;
+    use quic::StreamId;
     use serde::{self, Serialize, Serializer, ser::SerializeStruct};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -285,7 +281,7 @@ mod json {
 
     fn serialize_timestamp<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         use serde::ser::SerializeMap;
         let mut state = s.serialize_map(Some(1))?;
@@ -359,7 +355,7 @@ mod json {
 
     impl Stream {
         fn from_stream_interval_stats(
-            stats: &stats::StreamIntervalStats,
+            stats: &StreamIntervalStats,
             period: &stats::IntervalPeriod,
         ) -> Self {
             let bits_per_second = stats.bytes as f64 * 8.0 / period.seconds;

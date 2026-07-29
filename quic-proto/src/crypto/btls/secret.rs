@@ -17,7 +17,7 @@ impl Secret {
     /// Performs an in-place key update.
     #[inline]
     pub(crate) fn update(&mut self, version: QuicVersion, suite: &CipherSuite) -> Result<()> {
-        let out = &mut [0u8; Secret::MAX_LEN][..self.len()];
+        let out = &mut [0u8; Self::MAX_LEN][..self.len()];
         suite
             .hkdf
             .expand_label(self.slice(), version.key_update_label(), out)?;
@@ -61,7 +61,7 @@ impl Secrets {
         version: QuicVersion,
         dst_cid: &ConnectionId,
         side: Side,
-    ) -> Result<Secrets> {
+    ) -> Result<Self> {
         // Initial secrets always use AES-128-GCM and SHA256.
         let suite = CipherSuite::aes128_gcm_sha256();
 
@@ -90,7 +90,7 @@ impl Secrets {
             .hkdf
             .expand_label(initial_secret, remote_label, remote.slice_mut())?;
 
-        Ok(Secrets {
+        Ok(Self {
             version,
             suite,
             local,

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 
-use quic_proto_rs::{
+use quic_proto::{
     ConnectionId, Side, TransportError,
     crypto::{
         self, CryptoError,
@@ -131,11 +131,11 @@ impl crypto::Session for NoProtectionSession {
 
 impl crypto::ClientConfig for NoProtectionClientConfig {
     fn start_session(
-        self: std::sync::Arc<Self>,
+        self: Arc<Self>,
         version: u32,
         server_name: &str,
         params: &transport_parameters::TransportParameters,
-    ) -> Result<Box<dyn crypto::Session>, quic_rs::ConnectError> {
+    ) -> Result<Box<dyn crypto::Session>, quic::ConnectError> {
         let tls = self
             .inner
             .clone()

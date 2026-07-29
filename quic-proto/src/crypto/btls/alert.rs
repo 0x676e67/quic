@@ -44,11 +44,11 @@ pub(crate) struct Alert(u8);
 
 impl Alert {
     pub(crate) fn from(value: u8) -> Self {
-        Alert(value)
+        Self(value)
     }
 
     pub(crate) fn handshake_failure() -> Self {
-        Alert(bffi::SSL_AD_HANDSHAKE_FAILURE as u8)
+        Self(bffi::SSL_AD_HANDSHAKE_FAILURE as u8)
     }
 
     pub(crate) fn get_description(&self) -> &'static str {
@@ -68,12 +68,12 @@ impl Display for Alert {
 
 impl From<Alert> for TransportErrorCode {
     fn from(alert: Alert) -> Self {
-        TransportErrorCode::crypto(alert.0)
+        Self::crypto(alert.0)
     }
 }
 
 impl From<Alert> for TransportError {
     fn from(alert: Alert) -> Self {
-        TransportError::new(alert.into(), alert.get_description().to_string())
+        Self::new(alert.into(), alert.get_description().to_string())
     }
 }

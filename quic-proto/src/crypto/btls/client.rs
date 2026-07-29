@@ -332,13 +332,13 @@ impl Session {
 
     /// Called by the static callbacks to retrieve the instance pointer.
     #[inline]
-    fn get_instance(ssl: *const bffi::SSL) -> &'static mut Session {
+    fn get_instance(ssl: *const bffi::SSL) -> &'static mut Self {
         unsafe {
             let data = bffi::SSL_get_ex_data(ssl, *SESSION_INDEX);
             if data.is_null() {
                 panic!("BUG: Session instance missing")
             }
-            &mut *(data as *mut Session)
+            &mut *(data as *mut Self)
         }
     }
 

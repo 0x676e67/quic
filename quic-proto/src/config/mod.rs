@@ -78,11 +78,11 @@ impl EndpointConfig {
     /// information in local connection IDs, e.g. to support stateless packet-level load balancers.
     ///
     /// Defaults to [`HashedConnectionIdGenerator`].
-    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
+    pub fn cid_generator(
         &mut self,
-        factory: F,
+        factory: Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
     ) -> &mut Self {
-        self.connection_id_generator_factory = Arc::new(factory);
+        self.connection_id_generator_factory = factory;
         self
     }
 
@@ -113,7 +113,7 @@ impl EndpointConfig {
     /// Get the current value of [`max_udp_payload_size`](Self::max_udp_payload_size)
     //
     // While most parameters don't need to be readable, this must be exposed to allow higher-level
-    // layers, e.g. the `quic-rs` crate, to determine how large a receive buffer to allocate to
+    // layers, e.g. the `quic` crate, to determine how large a receive buffer to allocate to
     // support an externally-defined `EndpointConfig`.
     //
     // While `get_` accessors are typically unidiomatic in Rust, we favor concision for setters,
@@ -155,9 +155,9 @@ impl EndpointConfig {
 
     /// Optional seed to be used internally for random number generation
     ///
-    /// By default, `quic-rs` will initialize an endpoint's rng using a platform entropy source.
-    /// However, you can seed the rng yourself through this method (e.g. if you need to run `quic-rs`
-    /// deterministically or if you are using `quic-rs` in an environment that doesn't have a source of
+    /// By default, `quic` will initialize an endpoint's rng using a platform entropy source.
+    /// However, you can seed the rng yourself through this method (e.g. if you need to run `quic`
+    /// deterministically or if you are using `quic` in an environment that doesn't have a source of
     /// entropy available).
     pub fn rng_seed(&mut self, seed: Option<[u8; 32]>) -> &mut Self {
         self.rng_seed = seed;
@@ -183,7 +183,7 @@ impl Default for EndpointConfig {
     fn default() -> Self {
         #[cfg(feature = "ring")]
         {
-            use rand::RngCore;
+            use rand::Rng;
             use ring::hmac;
 
             let mut reset_key = [0; 64];
@@ -195,7 +195,7 @@ impl Default for EndpointConfig {
         #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
         {
             use aws_lc_rs::hmac;
-            use rand::RngCore;
+            use rand::Rng;
 
             let mut reset_key = [0; 64];
             rand::rng().fill_bytes(&mut reset_key);
@@ -205,7 +205,7 @@ impl Default for EndpointConfig {
 
         #[cfg(all(feature = "btls", not(any(feature = "aws-lc-rs", feature = "ring"))))]
         {
-            Self::new(Arc::new(crate::crypto::btls::HmacKey::sha256()))
+            Self::new(Arc::new(crypto::btls::HmacKey::sha256()))
         }
     }
 }
@@ -416,7 +416,7 @@ impl ServerConfig {
     pub fn with_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
         #[cfg(feature = "ring")]
         {
-            use rand::RngCore;
+            use rand::Rng;
             use ring::hkdf;
 
             let rng = &mut rand::rng();
@@ -430,7 +430,7 @@ impl ServerConfig {
         #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
         {
             use aws_lc_rs::hkdf;
-            use rand::RngCore;
+            use rand::Rng;
 
             let rng = &mut rand::rng();
             let mut master_key = [0u8; 64];
@@ -445,7 +445,7 @@ impl ServerConfig {
             Self::new(
                 crypto,
                 Arc::new(
-                    crate::crypto::btls::HandshakeTokenKey::new()
+                    crypto::btls::HandshakeTokenKey::new()
                         .expect("failed to create btls handshake token key"),
                 ),
             )

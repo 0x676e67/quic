@@ -1,6 +1,6 @@
 //! Traits and implementations for the QUIC cryptography protocol
 //!
-//! The protocol logic in Quinn is contained in types that abstract over the actual
+//! The protocol logic in `quic-proto` is contained in types that abstract over the actual
 //! cryptographic protocol used. This module contains the traits used for this
 //! abstraction layer as well as a single implementation of these traits that uses
 //! *ring* and rustls to implement the TLS protocol support.

@@ -4,6 +4,7 @@ version = "0.1.0"
 publish = false
 license = "MIT OR Apache-2.0"
 edition = "2021"
+authors.workspace = true
 
 [package.metadata]
 cargo-fuzz = true
@@ -15,7 +16,7 @@ libfuzzer-sys = "0.4.2"
 [dependencies.proto]
 features = ["arbitrary"]
 path = "../quic-proto"
-package = "quic-proto-rs"
+package = "quic-proto"
 
 [[bin]]
 name = "streams"

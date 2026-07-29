@@ -8,8 +8,7 @@ use btls_sys as bffi;
 use bytes::BytesMut;
 use std::ffi::c_uint;
 use std::fmt::{Debug, Formatter};
-use std::mem;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, size_of};
 use std::result::Result as StdResult;
 
 const SAMPLE_LEN: usize = 16; // 128-bits.
@@ -212,7 +211,7 @@ trait CryptoHeaderKey: crypto::HeaderKey {
 struct AesHeaderKey(bffi::AES_KEY);
 
 impl AesHeaderKey {
-    fn new(key: &Key) -> Result<AesHeaderKey> {
+    fn new(key: &Key) -> Result<Self> {
         let hpk = unsafe {
             let mut hpk = MaybeUninit::uninit();
 
@@ -273,7 +272,7 @@ struct ChaChaHeaderKey(Key);
 impl ChaChaHeaderKey {
     const ZEROS: [u8; 5] = [0; 5];
 
-    fn new(key: &Key) -> Result<ChaChaHeaderKey> {
+    fn new(key: &Key) -> Result<Self> {
         Ok(Self(*key))
     }
 }
@@ -289,7 +288,7 @@ impl CryptoHeaderKey for ChaChaHeaderKey {
         }
 
         // Extract the counter and the nonce from the sample.
-        let (counter, nonce) = sample.split_at(mem::size_of::<u32>());
+        let (counter, nonce) = sample.split_at(size_of::<u32>());
         let counter = u32::from_ne_bytes(counter.try_into().unwrap());
 
         let mut out: [u8; 5] = [0; 5];
@@ -482,9 +481,8 @@ impl AeadKey {
         data: &mut [u8],
         additional_data: &[u8],
     ) -> StdResult<usize, crypto::CryptoError> {
-        let mut out_len = match data.len().checked_sub(self.suite.aead.tag_len) {
-            Some(n) => n,
-            None => return Err(crypto::CryptoError {}),
+        let Some(mut out_len) = data.len().checked_sub(self.suite.aead.tag_len) else {
+            return Err(crypto::CryptoError {});
         };
 
         unsafe {

@@ -42,7 +42,7 @@ macro_rules! bounded_array {
             /// Creates a new instance with random contents.
             #[inline]
             $vis fn random() -> Self {
-                use rand::RngCore;
+                use rand::Rng;
 
                 let mut buf = [0u8; Self::MAX_LEN];
                 rand::rng().fill_bytes(&mut buf);

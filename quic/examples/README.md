@@ -1,6 +1,6 @@
 ## HTTP/0.9 File Serving Example
 
-These examples belong to quic-rs, a hard fork of Quinn with its own crate names and release flow.
+These examples belong to quic, a hard fork of Quinn with its own crate names and release flow.
 
 The `server` and `client` examples demonstrate fetching files using a HTTP-like toy protocol.
 

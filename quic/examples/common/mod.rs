@@ -1,7 +1,7 @@
 #![cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 //! Commonly used code in most examples.
 
-use quic_rs::{ClientConfig, Endpoint, ServerConfig};
+use quic::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 use std::{error::Error, net::SocketAddr, sync::Arc};
@@ -38,7 +38,7 @@ pub(crate) fn make_server_endpoint(
     Ok((endpoint, server_cert))
 }
 
-/// Builds a default quic-rs client config and trusts given certificates.
+/// Builds a default quic client config and trusts given certificates.
 ///
 /// ## Args
 ///

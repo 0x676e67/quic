@@ -1,6 +1,6 @@
 use std::hash::Hasher;
 
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 
 use crate::Duration;
 use crate::MAX_CID_SIZE;
@@ -96,7 +96,7 @@ impl ConnectionIdGenerator for RandomConnectionIdGenerator {
 /// [`validate`](ConnectionIdGenerator::validate)d
 ///
 /// This generator uses a non-cryptographic hash and can therefore still be spoofed, but nonetheless
-/// helps prevents Quinn from responding to non-QUIC packets at very low cost.
+/// helps prevent an endpoint from responding to non-QUIC packets at very low cost.
 pub struct HashedConnectionIdGenerator {
     key: u64,
     lifetime: Option<Duration>,

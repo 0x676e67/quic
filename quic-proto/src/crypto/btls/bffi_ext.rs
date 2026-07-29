@@ -459,7 +459,7 @@ impl QuicSslSession for SslSession {
     }
 
     fn copy_without_early_data(&mut self) -> SslSession {
-        unsafe { SslSession::from_ptr(bffi::SSL_SESSION_copy_without_early_data(self.as_ptr())) }
+        unsafe { Self::from_ptr(bffi::SSL_SESSION_copy_without_early_data(self.as_ptr())) }
     }
 
     fn encode<W: BufMut>(&self, out: &mut W) -> BoringResult {
@@ -485,7 +485,7 @@ impl QuicSslSession for SslSession {
                 .as_mut()
                 .map_or_else(
                     || Err(ErrorStack::get()),
-                    |session| Ok(SslSession::from_ptr(session)),
+                    |session| Ok(Self::from_ptr(session)),
                 )
         }
     }
@@ -504,9 +504,9 @@ impl Level {
 
     pub fn next(&self) -> Self {
         match self {
-            Level::Initial => Level::Handshake,
-            Level::EarlyData => Level::Handshake,
-            _ => Level::Application,
+            Self::Initial => Self::Handshake,
+            Self::EarlyData => Self::Handshake,
+            _ => Self::Application,
         }
     }
 }
@@ -526,10 +526,10 @@ impl From<bffi::ssl_encryption_level_t> for Level {
 impl From<Level> for bffi::ssl_encryption_level_t {
     fn from(value: Level) -> Self {
         match value {
-            Level::Initial => bffi::ssl_encryption_level_t::ssl_encryption_initial,
-            Level::EarlyData => bffi::ssl_encryption_level_t::ssl_encryption_early_data,
-            Level::Handshake => bffi::ssl_encryption_level_t::ssl_encryption_handshake,
-            Level::Application => bffi::ssl_encryption_level_t::ssl_encryption_application,
+            Level::Initial => Self::ssl_encryption_initial,
+            Level::EarlyData => Self::ssl_encryption_early_data,
+            Level::Handshake => Self::ssl_encryption_handshake,
+            Level::Application => Self::ssl_encryption_application,
         }
     }
 }

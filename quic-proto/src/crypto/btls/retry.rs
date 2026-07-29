@@ -40,9 +40,8 @@ pub(crate) fn is_valid_retry(
     header: &[u8],
     payload: &[u8],
 ) -> bool {
-    let tag_start = match payload.len().checked_sub(TAG_LEN) {
-        Some(x) => x,
-        None => return false,
+    let Some(tag_start) = payload.len().checked_sub(TAG_LEN) else {
+        return false;
     };
 
     let mut pseudo_packet =

@@ -10,7 +10,7 @@ use assert_matches::assert_matches;
 use aws_lc_rs::hmac;
 use bytes::{Bytes, BytesMut};
 use hex_literal::hex;
-use rand::RngCore;
+use rand::Rng;
 #[cfg(feature = "ring")]
 use ring::hmac;
 #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
@@ -188,7 +188,9 @@ fn server_stateless_reset() {
     rng.fill_bytes(&mut key_material);
 
     let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
-    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    endpoint_config.cid_generator(Arc::new(move || {
+        Box::new(HashedConnectionIdGenerator::from_key(0))
+    }));
     let endpoint_config = Arc::new(endpoint_config);
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
@@ -217,7 +219,9 @@ fn client_stateless_reset() {
     rng.fill_bytes(&mut key_material);
 
     let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
-    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    endpoint_config.cid_generator(Arc::new(move || {
+        Box::new(HashedConnectionIdGenerator::from_key(0))
+    }));
     let endpoint_config = Arc::new(endpoint_config);
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
@@ -245,7 +249,9 @@ fn stateless_reset_limit() {
     let _guard = subscribe();
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42);
     let mut endpoint_config = EndpointConfig::default();
-    endpoint_config.cid_generator(move || Box::new(RandomConnectionIdGenerator::new(8)));
+    endpoint_config.cid_generator(Arc::new(move || {
+        Box::new(RandomConnectionIdGenerator::new(8))
+    }));
     let endpoint_config = Arc::new(endpoint_config);
     let mut endpoint = Endpoint::new(
         endpoint_config.clone(),
@@ -416,10 +422,7 @@ fn reject_self_signed_server_cert() {
     // the client is trusting (in which case we'd get a different error).
     let mut cert = rcgen::CertificateParams::new(["localhost".into()]).unwrap();
     let mut issuer = rcgen::DistinguishedName::new();
-    issuer.push(
-        rcgen::DnType::OrganizationName,
-        "Crazy Quinn's House of Certificates",
-    );
+    issuer.push(rcgen::DnType::OrganizationName, "quic test certificate");
     cert.distinguished_name = issuer;
     let cert = cert
         .self_signed(&rcgen::KeyPair::generate().unwrap())
@@ -833,9 +836,21 @@ fn alpn_success() {
         .crypto_session()
         .handshake_data()
         .unwrap()
-        .downcast::<crate::crypto::rustls::HandshakeData>()
+        .downcast::<crypto::rustls::HandshakeData>()
         .unwrap();
     assert_eq!(hd.protocol.unwrap(), &b"bar"[..]);
+    assert_eq!(
+        hd.protocol_version
+            .unwrap()
+            .downcast_ref::<rustls::ProtocolVersion>(),
+        Some(&rustls::ProtocolVersion::TLSv1_3)
+    );
+    assert!(
+        hd.cipher_suite
+            .unwrap()
+            .downcast_ref::<rustls::CipherSuite>()
+            .is_some()
+    );
 }
 
 #[test]
@@ -2024,6 +2039,28 @@ fn datagram_recv_buffer_overflow() {
 }
 
 #[test]
+fn datagram_larger_than_send_buffer_is_too_large() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut client_config = client_config();
+    let mut transport_config = TransportConfig::default();
+    transport_config.datagram_send_buffer_size(1);
+    client_config.transport_config(transport_config.into());
+    let (client_ch, _) = pair.connect_with(client_config);
+
+    assert_matches!(
+        pair.client_datagrams(client_ch)
+            .send(Bytes::from_static(&[0; 2]), true),
+        Err(SendDatagramError::TooLarge)
+    );
+    assert_matches!(
+        pair.client_datagrams(client_ch)
+            .send(Bytes::from_static(&[0; 2]), false),
+        Err(SendDatagramError::TooLarge)
+    );
+}
+
+#[test]
 fn datagram_unsupported() {
     let _guard = subscribe();
     let server = ServerConfig {
@@ -3149,6 +3186,30 @@ fn pure_sender_voluntarily_acks() {
 
     let receiver_acks_final = pair.server_conn_mut(server_ch).stats().frame_rx.acks;
     assert!(receiver_acks_final > receiver_acks_initial);
+}
+
+/// Initials rejected under saturation (here via `max_incoming(0)`) are dropped without
+/// sending a response: the client times out rather than receiving a CONNECTION_REFUSED.
+#[test]
+fn silently_drop_rejected_initials() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    server_config.max_incoming(0);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive();
+    pair.server.assert_no_accept();
+    // `drive()` stops once the client's only remaining timer is its idle timeout; advance
+    // past it so the unanswered attempt gives up.
+    pair.time += Duration::from_secs(60);
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::TimedOut,
+        })
+    );
 }
 
 #[test]
