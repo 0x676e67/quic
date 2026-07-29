@@ -12,7 +12,7 @@ use async_io::Timer;
 use super::AsyncTimer;
 use super::{AsyncUdpSocket, Runtime, UdpSender, UdpSenderHelper, UdpSenderHelperSocket};
 
-/// A quic-rs runtime for smol
+/// A quic runtime for smol
 #[derive(Debug)]
 pub struct SmolRuntime;
 

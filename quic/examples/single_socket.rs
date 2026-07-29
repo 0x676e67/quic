@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use quic_rs::Endpoint;
+use quic::Endpoint;
 
 mod common;
 use common::{make_client_endpoint, make_server_endpoint};

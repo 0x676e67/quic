@@ -14,7 +14,7 @@ use tokio::{
 
 use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSenderHelper, UdpSenderHelperSocket};
 
-/// A quic-rs runtime for Tokio
+/// A quic runtime for Tokio
 #[derive(Debug)]
 pub struct TokioRuntime;
 
