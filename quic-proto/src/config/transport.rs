@@ -41,6 +41,7 @@ pub struct TransportConfig {
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
+    pub(crate) max_outgoing_bytes_per_second: Option<u64>,
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
@@ -249,6 +250,14 @@ impl TransportConfig {
         self
     }
 
+    /// Configures an outbound rate limit (in bytes per second) for each connection.
+    ///
+    /// Defaults to `None`, which disables rate limiting.
+    pub fn max_outgoing_bytes_per_second(&mut self, value: Option<u64>) -> &mut Self {
+        self.max_outgoing_bytes_per_second = value;
+        self
+    }
+
     /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
     pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
         self.persistent_congestion_threshold = value;
@@ -396,6 +405,7 @@ impl Default for TransportConfig {
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
             ack_frequency_config: None,
+            max_outgoing_bytes_per_second: None,
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
@@ -435,6 +445,7 @@ impl fmt::Debug for TransportConfig {
             mtu_discovery_config,
             pad_to_mtu,
             ack_frequency_config,
+            max_outgoing_bytes_per_second,
             persistent_congestion_threshold,
             keep_alive_interval,
             crypto_buffer_size,
@@ -465,6 +476,10 @@ impl fmt::Debug for TransportConfig {
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
+            .field(
+                "max_outgoing_bytes_per_second",
+                max_outgoing_bytes_per_second,
+            )
             .field(
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,
@@ -603,28 +618,25 @@ impl QlogConfig {
 
         let writer = self.writer?;
         let trace = qlog::TraceSeq::new(
-            qlog::VantagePoint {
+            self.title.clone(),
+            self.description.clone(),
+            None,
+            Some(qlog::VantagePoint {
                 name: None,
                 ty: qlog::VantagePointType::Unknown,
                 flow: None,
-            },
-            self.title.clone(),
-            self.description.clone(),
-            Some(qlog::Configuration {
-                time_offset: Some(0.0),
-                original_uris: None,
             }),
-            None,
+            vec![],
         );
 
         let mut streamer = QlogStreamer::new(
-            qlog::QLOG_VERSION.into(),
             self.title,
             self.description,
-            None,
             self.start_time,
             trace,
             qlog::events::EventImportance::Core,
+            // `Instant` should have sub-microsecond precision on most platforms
+            qlog::streamer::EventTimePrecision::NanoSeconds,
             writer,
         );
 
@@ -792,7 +804,7 @@ impl From<VarInt> for IdleTimeout {
     }
 }
 
-impl std::convert::TryFrom<Duration> for IdleTimeout {
+impl TryFrom<Duration> for IdleTimeout {
     type Error = VarIntBoundsExceeded;
 
     fn try_from(timeout: Duration) -> Result<Self, Self::Error> {

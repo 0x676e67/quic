@@ -4,7 +4,7 @@ default-members = ["quic", "quic-proto", "bench", "perf"]
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["The quinn Developers", "0x676e67 <gngppz@gmail.com>"]
@@ -23,35 +23,35 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc = "3"
 directories-next = "2"
-fastbloom = "0.17"
+fastbloom = { version = "0.17", default-features = false }
 futures-io = "0.3.19"
-getrandom = { version = "0.3", default-features = false }
+getrandom = { version = "0.4", default-features = false }
 hdrhistogram = { version = "7.2", default-features = false }
 hex-literal = "1"
 lru-slab = "0.1.2"
 log = "0.4"
 pin-project-lite = "0.2"
-qlog = "0.16"
-rand = "0.9"
+qlog = "0.18"
+rand = "0.10.1"
 rcgen = "0.14"
 ring = "0.17"
 rustc-hash = "2"
 rustls = { version = "0.23.5", default-features = false, features = ["std"] }
-rustls-platform-verifier = "0.6"
+rustls-platform-verifier = "0.7"
 rustls-pki-types = "1.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 slab = "0.4.6"
 smol = "2"
 socket2 = ">=0.5, <0.7"
+libc = "0.2"
 thiserror = "2.0.3"
 tinyvec = { version = "1.1", features = ["alloc"] }
 tokio = { version = "1.28.1", features = ["sync"] }
 tracing = { version = "0.1.10", default-features = false, features = ["std"] }
-tracing-futures = { version = "0.2.0", default-features = false, features = ["std-future"] }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
 url = "2"
-wasm-bindgen-test = { version = "0.3.45" }
+wasm-bindgen-test = { version = "0.3.76" }
 web-time = "1"
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
 cfg_aliases = "0.2"
@@ -68,6 +68,7 @@ elided_lifetimes_in_paths = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 unnameable_types = "warn"
 unreachable_pub = "warn"
+unused_qualifications = "warn"
 
 [workspace.lints.clippy]
 manual_let_else = "warn"

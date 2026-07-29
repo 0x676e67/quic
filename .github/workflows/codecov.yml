@@ -12,7 +12,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - shell: bash
@@ -31,7 +31,7 @@ jobs:
             --features="arbitrary,aws-lc-rs,bloom,futures-io,json-output,lock_tracking,tracing-log,platform-verifier,qlog,ring,runtime-smol,runtime-tokio,rustls,rustls-aws-lc-rs,rustls-log,rustls-ring,serde,serde_json" \
             --workspace --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
