@@ -9,7 +9,7 @@ use std::{
 };
 
 use proto::crypto::rustls::QuicClientConfig;
-use quic_rs::{ClientConfig, Endpoint};
+use quic::{ClientConfig, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 mod common;

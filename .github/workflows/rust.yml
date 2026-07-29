@@ -135,30 +135,30 @@ jobs:
       - uses: bytecodealliance/actions/wasm-tools/setup@v1
       - uses: cargo-bins/cargo-binstall@main
 
-      - run: cargo test --locked -p quic-proto-rs --target wasm32-unknown-unknown --no-run
-      - run: cargo rustc --locked -p quic-rs --target wasm32-unknown-unknown --no-default-features --features=tracing-log,platform-verifier,rustls-ring --crate-type=cdylib
+      - run: cargo test --locked -p quic-proto --target wasm32-unknown-unknown --no-run
+      - run: cargo rustc --locked -p quic --target wasm32-unknown-unknown --no-default-features --features=tracing-log,platform-verifier,rustls-ring --crate-type=cdylib
 
       # If the Wasm file contains any 'import "env"' declarations, then
       # some non-Wasm-compatible code made it into the final code.
-      - name: Ensure no 'import "env"' in quic_proto_rs Wasm
+      - name: Ensure no 'import "env"' in quic_proto Wasm
         run: |
-          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/deps/quic_proto_rs-*.wasm | grep 'import "env"'
-      - name: Ensure no 'import "env"' in quic_rs Wasm
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/deps/quic_proto-*.wasm | grep 'import "env"'
+      - name: Ensure no 'import "env"' in quic Wasm
         run: |
-          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/quic_rs.wasm | grep 'import "env"'
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/quic.wasm | grep 'import "env"'
 
       # Match the version of wasm-bindgen used in `Cargo.lock`
       - run: cargo binstall wasm-bindgen-cli@0.2.114 --locked --no-confirm
-      - run: cargo test --locked -p quic-proto-rs --target wasm32-unknown-unknown
+      - run: cargo test --locked -p quic-proto --target wasm32-unknown-unknown
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       # Note that we must also update the README when changing the MSRV
-      - uses: dtolnay/rust-toolchain@1.80.0
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --lib --all-features -p quic-proto-rs -p quic-rs
+      - run: cargo check --locked --lib --all-features -p quic-proto -p quic
 
   lint:
     runs-on: ubuntu-latest

@@ -10,7 +10,7 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::error_span;
 use tracing_futures::Instrument as _;
 
-use quic_rs::{Endpoint, TokioRuntime};
+use quic::{Endpoint, TokioRuntime};
 
 benchmark_group!(
     benches,
@@ -72,8 +72,8 @@ fn send_data(bench: &mut Bencher, data: &'static [u8], concurrent_streams: usize
 }
 
 struct Context {
-    server_config: quic_rs::ServerConfig,
-    client_config: quic_rs::ClientConfig,
+    server_config: quic::ServerConfig,
+    client_config: quic::ClientConfig,
 }
 
 impl Context {
@@ -83,7 +83,7 @@ impl Context {
         let cert = CertificateDer::from(cert.cert);
 
         let mut server_config =
-            quic_rs::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+            quic::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(1024_u16.into());
 
@@ -92,7 +92,7 @@ impl Context {
 
         Self {
             server_config,
-            client_config: quic_rs::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+            client_config: quic::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
         }
     }
 
@@ -142,7 +142,7 @@ impl Context {
     pub(crate) fn make_client(
         &self,
         server_addr: SocketAddr,
-    ) -> (quic_rs::Endpoint, quic_rs::Connection, Runtime) {
+    ) -> (quic::Endpoint, quic::Connection, Runtime) {
         let runtime = rt();
         let endpoint = {
             let _guard = runtime.enter();

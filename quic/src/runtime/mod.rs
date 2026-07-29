@@ -88,7 +88,7 @@ pub trait UdpSender: Send + Sync + Debug + 'static {
     /// Usually implementations of this will poll the socket for writability before trying to
     /// write to them, and retry both if writing fails.
     ///
-    /// quic-rs will create multiple [`UdpSender`]s, one for each task it's using it from. Thus it's
+    /// quic will create multiple [`UdpSender`]s, one for each task it's using it from. Thus it's
     /// important to poll the underlying socket in a way that doesn't overwrite wakers.
     ///
     /// A single [`UdpSender`] will be re-used, even if `poll_send` returns `Poll::Ready` once,

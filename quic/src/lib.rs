@@ -3,7 +3,7 @@
 //! [QUIC](https://en.wikipedia.org/wiki/QUIC) is a modern transport protocol addressing
 //! shortcomings of TCP, such as head-of-line blocking, poor security, slow handshakes, and
 //! inefficient congestion control. This crate provides a portable userspace implementation. It
-//! builds on top of quic-proto-rs, which implements protocol logic independent of any particular
+//! builds on top of quic-proto, which implements protocol logic independent of any particular
 //! runtime.
 //!
 //! The entry point of this crate is the [`Endpoint`].
@@ -29,7 +29,7 @@
 //! multiple TCP connections between the same two hosts, while providing more useful behavior than
 //! raw UDP sockets.
 //!
-//! quic-rs also exposes unreliable datagrams, which are a low-level primitive preferred when
+//! quic also exposes unreliable datagrams, which are a low-level primitive preferred when
 //! automatic fragmentation and retransmission of certain data is not desired.
 //!
 //! QUIC uses encryption and identity verification built directly on TLS 1.3. Just as with a TLS

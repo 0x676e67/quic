@@ -272,7 +272,7 @@ pub struct HandshakeData {
 
 /// A QUIC-compatible TLS client configuration
 ///
-/// Quinn implicitly constructs a `QuicClientConfig` with reasonable defaults within
+/// The `quic` crate implicitly constructs a `QuicClientConfig` with reasonable defaults within
 /// [`ClientConfig::with_root_certificates()`][root_certs] and [`ClientConfig::try_with_platform_verifier()`][platform].
 /// Alternatively, `QuicClientConfig`'s [`TryFrom`] implementation can be used to wrap around a
 /// custom [`rustls::ClientConfig`], in which case care should be taken around certain points:
@@ -427,7 +427,7 @@ impl std::error::Error for NoInitialCipherSuite {}
 
 /// A QUIC-compatible TLS server configuration
 ///
-/// Quinn implicitly constructs a `QuicServerConfig` with reasonable defaults within
+/// The `quic` crate implicitly constructs a `QuicServerConfig` with reasonable defaults within
 /// [`ServerConfig::with_single_cert()`][single]. Alternatively, `QuicServerConfig`'s [`TryFrom`]
 /// implementation or `with_initial` method can be used to wrap around a custom
 /// [`rustls::ServerConfig`], in which case care should be taken around certain points:

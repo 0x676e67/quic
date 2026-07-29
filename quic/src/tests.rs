@@ -544,7 +544,7 @@ fn run_echo(args: EchoArgs) {
             // Note for anyone modifying the platform support in this test:
             // If `local_ip` gets available on additional platforms - which
             // requires modifying this test - please update the list of supported
-            // platforms in the doc comment of `quinn_udp::RecvMeta::dst_ip`.
+            // platforms in the doc comment of `udp::RecvMeta::dst_ip`.
             if cfg!(target_os = "linux")
                 || cfg!(target_os = "android")
                 || cfg!(target_os = "freebsd")
