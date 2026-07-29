@@ -2,9 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
-**quic** is a [quinn](https://github.com/quinn-rs/quinn) fork focused on
-implementing specific extensions to the IETF [QUIC][quic] transport protocol.
-It is written in pure Rust and provides an async-compatible API.
+**quic** is a pure-Rust, async-compatible [quinn](https://github.com/quinn-rs/quinn) fork implementing selected [QUIC][quic] extensions, including those unlikely to be merged upstream.
 
 ## Features
 
