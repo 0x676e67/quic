@@ -5,7 +5,6 @@ cargo-test-*
 tarpaulin-report.html
 
 # Cargo
-Cargo.lock
 debug/
 target/
 **/target/
