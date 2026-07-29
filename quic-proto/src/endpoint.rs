@@ -19,13 +19,13 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
-    Side, Transmit, TransportConfig, TransportError, VarInt,
+    Side, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
     connection::{Connection, ConnectionError, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
-    frame,
+    frame, initial_rtt,
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
         PacketNumber, PartialDecode, ProtectedInitialHeader,
@@ -353,13 +353,12 @@ impl Endpoint {
             &mut self.rng,
         );
 
-        // Populate initial_rtt TP: explicit override takes priority, then the automatic
-        // per-server RTT cache.  Neither is set on the very first connection to a server.
-        params.initial_rtt_tp = config.rtt_store.as_ref().and_then(|rtt_store| {
-            rtt_store
-                .load(server_name)
-                .and_then(|us| VarInt::from_u64(us).ok())
-        });
+        let cached_initial_rtt = config
+            .initial_rtt_cache
+            .as_ref()
+            .and_then(|cache| cache.get(server_name))
+            .and_then(initial_rtt::encode);
+        params.initial_rtt_tp = cached_initial_rtt.map(|(_, value)| value);
 
         let tls = config
             .crypto
@@ -381,7 +380,8 @@ impl Endpoint {
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
-                rtt_store: config.rtt_store,
+                initial_rtt: cached_initial_rtt.map(|(rtt, _)| rtt),
+                initial_rtt_cache: config.initial_rtt_cache,
             },
         );
         Ok((ch, conn))

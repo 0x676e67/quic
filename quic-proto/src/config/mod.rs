@@ -22,7 +22,7 @@ use crate::{
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
-    rtt_store::RttStore,
+    initial_rtt::InitialRttCache,
     shared::ConnectionId,
 };
 
@@ -565,19 +565,17 @@ pub struct ClientConfig {
     /// Validation token store to use
     pub(crate) token_store: Arc<dyn TokenStore>,
 
+    /// Per-server cache for the `initial_rtt` transport parameter (ID `0x3127`).
+    ///
+    /// A measured SRTT is cached when a client connection closes and reused by subsequent
+    /// connections to the same server.
+    pub(crate) initial_rtt_cache: Option<Arc<dyn InitialRttCache>>,
+
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
 
     /// QUIC protocol version to use
     pub(crate) version: u32,
-
-    /// Automatic per-server RTT cache for the `initial_rtt` transport parameter (ID `0x3127`).
-    ///
-    /// When a client connection drains after the handshake completes, `quic-proto` automatically
-    /// calls [`RttStore::insert`] with the measured SRTT. On every subsequent connection to the
-    /// same server, [`RttStore::load`] is called and the result is emitted as the `initial_rtt`
-    /// TP, matching Chrome's behaviour (first connection: no TP; later connections: measured RTT).
-    pub(crate) rtt_store: Option<Arc<dyn RttStore>>,
 }
 
 impl ClientConfig {
@@ -591,7 +589,7 @@ impl ClientConfig {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
             version: 1,
-            rtt_store: None,
+            initial_rtt_cache: None,
         }
     }
 
@@ -625,13 +623,13 @@ impl ClientConfig {
         self
     }
 
-    /// Set a custom [`RttStore`]
+    /// Set an [`InitialRttCache`]
     ///
-    /// By default, no RTT store is configured and the `initial_rtt` transport parameter is
-    /// disabled. Use [`RttMemoryCache`](crate::RttMemoryCache) to keep the latest measured SRTT per
-    /// server name for the lifetime of the process, or supply a custom persistent implementation.
-    pub fn rtt_store(&mut self, store: Arc<dyn RttStore>) -> &mut Self {
-        self.rtt_store = Some(store);
+    /// By default, no cache is configured and the `initial_rtt` transport parameter is disabled.
+    /// Use [`InitialRttMemoryCache`](crate::InitialRttMemoryCache) to keep the latest measured SRTT
+    /// per server name for the lifetime of the process.
+    pub fn initial_rtt_cache(&mut self, cache: Arc<dyn InitialRttCache>) -> &mut Self {
+        self.initial_rtt_cache = Some(cache);
         self
     }
 

@@ -706,10 +706,11 @@ impl TransportParameters {
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
                 TransportParameterId::InitialRTT => {
-                    if len > 8 || params.initial_rtt_tp.is_some() {
+                    let value = r.get::<VarInt>()?;
+                    if side.is_client() || len != value.size() || params.initial_rtt_tp.is_some() {
                         return Err(Error::Malformed);
                     }
-                    params.initial_rtt_tp = Some(r.get()?);
+                    params.initial_rtt_tp = Some(value);
                 }
                 _ => {
                     macro_rules! parse {
@@ -982,6 +983,24 @@ mod test {
     use rand::TryRng;
 
     use super::*;
+
+    #[test]
+    fn initial_rtt_coding_and_direction() {
+        let params = TransportParameters {
+            initial_rtt_tp: Some(VarInt::from_u32(20_000)),
+            ..TransportParameters::default()
+        };
+        let mut buf = Vec::new();
+        params.write(&mut buf);
+
+        let decoded = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+        assert_eq!(decoded.initial_rtt_tp, params.initial_rtt_tp);
+        assert!(TransportParameters::read(Side::Client, &mut buf.as_slice()).is_err());
+
+        let mut duplicated = buf.clone();
+        duplicated.extend_from_slice(&buf);
+        assert!(TransportParameters::read(Side::Server, &mut duplicated.as_slice()).is_err());
+    }
 
     #[test]
     fn coding() {
