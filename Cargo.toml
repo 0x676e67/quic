@@ -51,7 +51,7 @@ tokio = { version = "1.28.1", features = ["sync"] }
 tracing = { version = "0.1.10", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
 url = "2"
-wasm-bindgen-test = { version = "0.3.45" }
+wasm-bindgen-test = { version = "0.3.76" }
 web-time = "1"
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
 cfg_aliases = "0.2"
