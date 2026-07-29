@@ -3,7 +3,7 @@
 //! [QUIC](https://en.wikipedia.org/wiki/QUIC) is a modern transport protocol addressing
 //! shortcomings of TCP, such as head-of-line blocking, poor security, slow handshakes, and
 //! inefficient congestion control. This crate provides a portable userspace implementation. It
-//! builds on top of quic-proto-rs, which implements protocol logic independent of any particular
+//! builds on top of quic-proto, which implements protocol logic independent of any particular
 //! runtime.
 //!
 //! The entry point of this crate is the [`Endpoint`].
@@ -29,7 +29,7 @@
 //! multiple TCP connections between the same two hosts, while providing more useful behavior than
 //! raw UDP sockets.
 //!
-//! quic-rs also exposes unreliable datagrams, which are a low-level primitive preferred when
+//! quic also exposes unreliable datagrams, which are a low-level primitive preferred when
 //! automatic fragmentation and retransmission of certain data is not desired.
 //!
 //! QUIC uses encryption and identity verification built directly on TLS 1.3. Just as with a TLS
@@ -74,7 +74,7 @@ pub use udp;
 
 pub use crate::connection::{
     AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError, ZeroRttAccepted,
+    SendDatagramError,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
@@ -101,7 +101,7 @@ enum ConnectionEvent {
     Rebind(Pin<Box<dyn UdpSender>>),
 }
 
-fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
+fn udp_transmit<'a>(t: &Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
     udp::Transmit {
         destination: t.destination,
         ecn: t.ecn.map(udp_ecn),
@@ -111,11 +111,11 @@ fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> 
     }
 }
 
-fn udp_ecn(ecn: proto::EcnCodepoint) -> udp::EcnCodepoint {
+fn udp_ecn(ecn: EcnCodepoint) -> udp::EcnCodepoint {
     match ecn {
-        proto::EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
-        proto::EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
-        proto::EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
+        EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
+        EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
+        EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
     }
 }
 

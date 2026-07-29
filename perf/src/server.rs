@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quic_rs::{TokioRuntime, crypto::rustls::QuicServerConfig};
+use quic::{TokioRuntime, crypto::rustls::QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tracing::{debug, error, info};
 
@@ -68,7 +68,7 @@ pub async fn run(opt: Opt) -> Result<()> {
     )?;
 
     let crypto = Arc::new(QuicServerConfig::try_from(crypto)?);
-    let mut config = quic_rs::ServerConfig::with_crypto(match opt.common.no_protection {
+    let mut config = quic::ServerConfig::with_crypto(match opt.common.no_protection {
         true => Arc::new(NoProtectionServerConfig::new(crypto)),
         false => crypto,
     });
@@ -76,12 +76,11 @@ pub async fn run(opt: Opt) -> Result<()> {
 
     let socket = opt.common.bind_socket(opt.listen)?;
 
-    let mut endpoint_cfg = quic_rs::EndpointConfig::default();
+    let mut endpoint_cfg = quic::EndpointConfig::default();
     endpoint_cfg.max_udp_payload_size(opt.common.max_udp_payload_size)?;
 
-    let endpoint =
-        quic_rs::Endpoint::new(endpoint_cfg, Some(config), socket, Arc::new(TokioRuntime))
-            .context("creating endpoint")?;
+    let endpoint = quic::Endpoint::new(endpoint_cfg, Some(config), socket, Arc::new(TokioRuntime))
+        .context("creating endpoint")?;
 
     info!("listening on {}", endpoint.local_addr().unwrap());
 
@@ -99,7 +98,7 @@ pub async fn run(opt: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle(handshake: quic_rs::Incoming, opt: Arc<Opt>) -> Result<()> {
+async fn handle(handshake: quic::Incoming, opt: Arc<Opt>) -> Result<()> {
     let connection = handshake.await.context("handshake failed")?;
 
     debug!("{} connected", connection.remote_address());
@@ -111,7 +110,7 @@ async fn handle(handshake: quic_rs::Incoming, opt: Arc<Opt>) -> Result<()> {
     Ok(())
 }
 
-async fn conn_stats(connection: quic_rs::Connection, opt: Arc<Opt>) -> Result<()> {
+async fn conn_stats(connection: quic::Connection, opt: Arc<Opt>) -> Result<()> {
     if opt.common.conn_stats {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -122,7 +121,7 @@ async fn conn_stats(connection: quic_rs::Connection, opt: Arc<Opt>) -> Result<()
     Ok(())
 }
 
-async fn drive_uni(connection: quic_rs::Connection) -> Result<()> {
+async fn drive_uni(connection: quic::Connection) -> Result<()> {
     while let Ok(stream) = connection.accept_uni().await {
         let connection = connection.clone();
         tokio::spawn(async move {
@@ -134,14 +133,14 @@ async fn drive_uni(connection: quic_rs::Connection) -> Result<()> {
     Ok(())
 }
 
-async fn handle_uni(connection: quic_rs::Connection, stream: quic_rs::RecvStream) -> Result<()> {
+async fn handle_uni(connection: quic::Connection, stream: quic::RecvStream) -> Result<()> {
     let bytes = read_req(stream).await?;
     let response = connection.open_uni().await?;
     respond(bytes, response).await?;
     Ok(())
 }
 
-async fn drive_bi(connection: quic_rs::Connection) -> Result<()> {
+async fn drive_bi(connection: quic::Connection) -> Result<()> {
     while let Ok((send, recv)) = connection.accept_bi().await {
         tokio::spawn(async move {
             if let Err(e) = handle_bi(send, recv).await {
@@ -152,13 +151,13 @@ async fn drive_bi(connection: quic_rs::Connection) -> Result<()> {
     Ok(())
 }
 
-async fn handle_bi(send: quic_rs::SendStream, recv: quic_rs::RecvStream) -> Result<()> {
+async fn handle_bi(send: quic::SendStream, recv: quic::RecvStream) -> Result<()> {
     let bytes = read_req(recv).await?;
     respond(bytes, send).await?;
     Ok(())
 }
 
-async fn read_req(mut stream: quic_rs::RecvStream) -> Result<u64> {
+async fn read_req(mut stream: quic::RecvStream) -> Result<u64> {
     let mut buf = [0; 8];
     stream
         .read_exact(&mut buf)
@@ -170,7 +169,7 @@ async fn read_req(mut stream: quic_rs::RecvStream) -> Result<u64> {
     Ok(n)
 }
 
-async fn drain_stream(mut stream: quic_rs::RecvStream) -> Result<()> {
+async fn drain_stream(mut stream: quic::RecvStream) -> Result<()> {
     #[rustfmt::skip]
     let mut bufs = [
         Bytes::new(), Bytes::new(), Bytes::new(), Bytes::new(),
@@ -187,7 +186,7 @@ async fn drain_stream(mut stream: quic_rs::RecvStream) -> Result<()> {
     Ok(())
 }
 
-async fn respond(mut bytes: u64, mut stream: quic_rs::SendStream) -> Result<()> {
+async fn respond(mut bytes: u64, mut stream: quic::SendStream) -> Result<()> {
     static DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
 
     while bytes > 0 {

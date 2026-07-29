@@ -40,22 +40,22 @@ impl std::error::Error for Error {}
 
 impl Error {
     pub(crate) fn ssl() -> Self {
-        Error::SslError(ErrorStack::get())
+        Self::SslError(ErrorStack::get())
     }
 
     pub(crate) fn invalid_input(msg: String) -> Self {
-        Error::IoError(io::Error::new(ErrorKind::InvalidInput, msg))
+        Self::IoError(io::Error::new(ErrorKind::InvalidInput, msg))
     }
 
     pub(crate) fn other(msg: String) -> Self {
-        Error::IoError(io::Error::other(msg))
+        Self::IoError(io::Error::other(msg))
     }
 }
 
 /// Support conversion to CryptoError.
 impl From<Error> for crypto::CryptoError {
     fn from(_: Error) -> Self {
-        crypto::CryptoError
+        Self
     }
 }
 
@@ -73,25 +73,25 @@ impl From<Error> for ConnectError {
 
 impl From<ErrorStack> for Error {
     fn from(e: ErrorStack) -> Self {
-        Error::SslError(e)
+        Self::SslError(e)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
-        Error::IoError(e)
+        Self::IoError(e)
     }
 }
 
 impl From<ConnectError> for Error {
     fn from(e: ConnectError) -> Self {
-        Error::ConnectError(e)
+        Self::ConnectError(e)
     }
 }
 
 impl From<TransportError> for Error {
     fn from(e: TransportError) -> Self {
-        Error::TransportError(e)
+        Self::TransportError(e)
     }
 }
 

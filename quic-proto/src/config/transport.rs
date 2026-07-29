@@ -41,6 +41,7 @@ pub struct TransportConfig {
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
+    pub(crate) max_outgoing_bytes_per_second: Option<u64>,
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
@@ -92,7 +93,7 @@ impl TransportConfig {
     ///
     /// ```
     /// # use std::{convert::TryInto, time::Duration};
-    /// # use quic_proto_rs::{TransportConfig, VarInt, VarIntBoundsExceeded};
+    /// # use quic_proto::{TransportConfig, VarInt, VarIntBoundsExceeded};
     /// # fn main() -> Result<(), VarIntBoundsExceeded> {
     /// let mut config = TransportConfig::default();
     ///
@@ -249,6 +250,14 @@ impl TransportConfig {
         self
     }
 
+    /// Configures an outbound rate limit (in bytes per second) for each connection.
+    ///
+    /// Defaults to `None`, which disables rate limiting.
+    pub fn max_outgoing_bytes_per_second(&mut self, value: Option<u64>) -> &mut Self {
+        self.max_outgoing_bytes_per_second = value;
+        self
+    }
+
     /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
     pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
         self.persistent_congestion_threshold = value;
@@ -321,7 +330,7 @@ impl TransportConfig {
     ///
     /// # Example
     /// ```
-    /// # use quic_proto_rs::*; use std::sync::Arc;
+    /// # use quic_proto::*; use std::sync::Arc;
     /// let mut config = TransportConfig::default();
     /// config.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
     /// ```
@@ -396,6 +405,7 @@ impl Default for TransportConfig {
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
             ack_frequency_config: None,
+            max_outgoing_bytes_per_second: None,
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
@@ -435,6 +445,7 @@ impl fmt::Debug for TransportConfig {
             mtu_discovery_config,
             pad_to_mtu,
             ack_frequency_config,
+            max_outgoing_bytes_per_second,
             persistent_congestion_threshold,
             keep_alive_interval,
             crypto_buffer_size,
@@ -466,6 +477,10 @@ impl fmt::Debug for TransportConfig {
             .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
+                "max_outgoing_bytes_per_second",
+                max_outgoing_bytes_per_second,
+            )
+            .field(
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,
             )
@@ -490,7 +505,7 @@ impl fmt::Debug for TransportConfig {
 /// connection, so it can take them into account when sending acknowledgements (see each parameter's
 /// description for details on how it influences acknowledgement frequency).
 ///
-/// Quinn's implementation follows the fourth draft of the
+/// This implementation follows the fourth draft of the
 /// [QUIC Acknowledgement Frequency extension](https://datatracker.ietf.org/doc/html/draft-ietf-quic-ack-frequency-04).
 /// The defaults produce behavior slightly different than the behavior without this extension,
 /// because they change the way reordered packets are handled (see
@@ -603,28 +618,25 @@ impl QlogConfig {
 
         let writer = self.writer?;
         let trace = qlog::TraceSeq::new(
-            qlog::VantagePoint {
+            self.title.clone(),
+            self.description.clone(),
+            None,
+            Some(qlog::VantagePoint {
                 name: None,
                 ty: qlog::VantagePointType::Unknown,
                 flow: None,
-            },
-            self.title.clone(),
-            self.description.clone(),
-            Some(qlog::Configuration {
-                time_offset: Some(0.0),
-                original_uris: None,
             }),
-            None,
+            vec![],
         );
 
         let mut streamer = QlogStreamer::new(
-            qlog::QLOG_VERSION.into(),
             self.title,
             self.description,
-            None,
             self.start_time,
             trace,
             qlog::events::EventImportance::Core,
+            // `Instant` should have sub-microsecond precision on most platforms
+            qlog::streamer::EventTimePrecision::NanoSeconds,
             writer,
         );
 
@@ -673,7 +685,7 @@ impl Default for QlogConfig {
 ///
 /// # MTU discovery internals
 ///
-/// Quinn implements MTU discovery through DPLPMTUD (Datagram Packetization Layer Path MTU
+/// This implementation uses DPLPMTUD (Datagram Packetization Layer Path MTU
 /// Discovery), described in [section 14.3 of RFC
 /// 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-14.3). This method consists of sending
 /// QUIC packets padded to a particular size (called PMTU probes), and waiting to see if the remote
@@ -688,7 +700,7 @@ impl Default for QlogConfig {
 /// last time when MTU discovery completed.
 ///
 /// Since the search space for MTUs is quite big (the smallest possible MTU is 1200, and the highest
-/// is 65527), Quinn performs a binary search to keep the number of probes as low as possible. The
+/// is 65527), it performs a binary search to keep the number of probes as low as possible. The
 /// lower bound of the search is equal to [`TransportConfig::initial_mtu`] in the
 /// initial MTU discovery run, and is equal to the currently discovered MTU in subsequent runs. The
 /// upper bound is determined by the minimum of [`MtuDiscoveryConfig::upper_bound`] and the
@@ -773,7 +785,7 @@ impl Default for MtuDiscoveryConfig {
 ///
 /// ```
 /// # use std::{convert::TryFrom, time::Duration};
-/// # use quic_proto_rs::{IdleTimeout, VarIntBoundsExceeded, VarInt};
+/// # use quic_proto::{IdleTimeout, VarIntBoundsExceeded, VarInt};
 /// # fn main() -> Result<(), VarIntBoundsExceeded> {
 /// // A `VarInt`-encoded value in milliseconds
 /// let timeout = IdleTimeout::from(VarInt::from_u32(10_000));
@@ -792,7 +804,7 @@ impl From<VarInt> for IdleTimeout {
     }
 }
 
-impl std::convert::TryFrom<Duration> for IdleTimeout {
+impl TryFrom<Duration> for IdleTimeout {
     type Error = VarIntBoundsExceeded;
 
     fn try_from(timeout: Duration) -> Result<Self, Self::Error> {

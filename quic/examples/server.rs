@@ -14,8 +14,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use proto::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
+use tracing::instrument::Instrument as _;
 use tracing::{error, info, info_span};
-use tracing_futures::Instrument as _;
 
 mod common;
 
@@ -91,7 +91,7 @@ async fn run(options: Opt) -> Result<()> {
 
         (cert_chain, key)
     } else {
-        let dirs = directories_next::ProjectDirs::from("org", "quic", "quic-rs-examples").unwrap();
+        let dirs = directories_next::ProjectDirs::from("org", "quic", "quic-examples").unwrap();
         let path = dirs.data_local_dir();
         let cert_path = path.join("cert.der");
         let key_path = path.join("key.der");
@@ -128,7 +128,7 @@ async fn run(options: Opt) -> Result<()> {
     }
 
     let mut server_config =
-        quic_rs::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+        quic::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
 
@@ -137,7 +137,7 @@ async fn run(options: Opt) -> Result<()> {
         bail!("root path does not exist");
     }
 
-    let endpoint = quic_rs::Endpoint::server(server_config, options.listen)?;
+    let endpoint = quic::Endpoint::server(server_config, options.listen)?;
     eprintln!("listening on {}", endpoint.local_addr()?);
 
     while let Some(conn) = endpoint.accept().await {
@@ -167,7 +167,7 @@ async fn run(options: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(root: Arc<Path>, conn: quic_rs::Incoming) -> Result<()> {
+async fn handle_connection(root: Arc<Path>, conn: quic::Incoming) -> Result<()> {
     let connection = conn.await?;
     let span = info_span!(
         "connection",
@@ -175,7 +175,7 @@ async fn handle_connection(root: Arc<Path>, conn: quic_rs::Incoming) -> Result<(
         protocol = %connection
             .handshake_data()
             .unwrap()
-            .downcast::<quic_rs::crypto::rustls::HandshakeData>().unwrap()
+            .downcast::<quic::crypto::rustls::HandshakeData>().unwrap()
             .protocol
             .map_or_else(|| "<none>".into(), |x| String::from_utf8_lossy(&x).into_owned())
     );
@@ -186,7 +186,7 @@ async fn handle_connection(root: Arc<Path>, conn: quic_rs::Incoming) -> Result<(
         loop {
             let stream = connection.accept_bi().await;
             let stream = match stream {
-                Err(quic_rs::ConnectionError::ApplicationClosed { .. }) => {
+                Err(quic::ConnectionError::ApplicationClosed { .. }) => {
                     info!("connection closed");
                     return Ok(());
                 }
@@ -213,7 +213,7 @@ async fn handle_connection(root: Arc<Path>, conn: quic_rs::Incoming) -> Result<(
 
 async fn handle_request(
     root: Arc<Path>,
-    (mut send, mut recv): (quic_rs::SendStream, quic_rs::RecvStream),
+    (mut send, mut recv): (quic::SendStream, quic::RecvStream),
 ) -> Result<()> {
     let req = recv
         .read_to_end(64 * 1024)

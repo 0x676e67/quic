@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quic_rs::crypto::rustls::QuicClientConfig;
+use quic::crypto::rustls::QuicClientConfig;
 use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -30,18 +30,18 @@ pub fn configure_tracing_subscriber() {
 
 /// Creates a server endpoint which runs on the given runtime
 pub fn server_endpoint(
-    rt: &tokio::runtime::Runtime,
+    rt: &Runtime,
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     opt: &Opt,
-) -> (SocketAddr, quic_rs::Endpoint) {
+) -> (SocketAddr, quic::Endpoint) {
     let cert_chain = vec![cert];
-    let mut server_config = quic_rs::ServerConfig::with_single_cert(cert_chain, key).unwrap();
+    let mut server_config = quic::ServerConfig::with_single_cert(cert_chain, key).unwrap();
     server_config.transport = Arc::new(transport_config(opt));
 
     let endpoint = {
         let _guard = rt.enter();
-        quic_rs::Endpoint::server(
+        quic::Endpoint::server(
             server_config,
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
         )
@@ -56,9 +56,9 @@ pub async fn connect_client(
     server_addr: SocketAddr,
     server_cert: CertificateDer<'_>,
     opt: Opt,
-) -> Result<(quic_rs::Endpoint, quic_rs::Connection)> {
+) -> Result<(quic::Endpoint, quic::Connection)> {
     let endpoint =
-        quic_rs::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
+        quic::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
 
     let mut roots = RootCertStore::empty();
     roots.add(server_cert)?;
@@ -75,8 +75,7 @@ pub async fn connect_client(
         .with_root_certificates(roots)
         .with_no_client_auth();
 
-    let mut client_config =
-        quic_rs::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    let mut client_config = quic::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
     client_config.transport_config(Arc::new(transport_config(&opt)));
 
     let connection = endpoint
@@ -89,7 +88,7 @@ pub async fn connect_client(
     Ok((endpoint, connection))
 }
 
-pub async fn drain_stream(stream: &mut quic_rs::RecvStream, read_unordered: bool) -> Result<usize> {
+pub async fn drain_stream(stream: &mut quic::RecvStream, read_unordered: bool) -> Result<usize> {
     let mut read = 0;
 
     if read_unordered {
@@ -118,7 +117,7 @@ pub async fn drain_stream(stream: &mut quic_rs::RecvStream, read_unordered: bool
     Ok(read)
 }
 
-pub async fn send_data_on_stream(stream: &mut quic_rs::SendStream, stream_size: u64) -> Result<()> {
+pub async fn send_data_on_stream(stream: &mut quic::SendStream, stream_size: u64) -> Result<()> {
     const DATA: &[u8] = &[0xAB; 1024 * 1024];
     let bytes_data = Bytes::from_static(DATA);
 
@@ -150,14 +149,14 @@ pub fn rt() -> Runtime {
     Builder::new_current_thread().enable_all().build().unwrap()
 }
 
-pub fn transport_config(opt: &Opt) -> quic_rs::TransportConfig {
+pub fn transport_config(opt: &Opt) -> quic::TransportConfig {
     // High stream windows are chosen because the amount of concurrent streams
     // is configurable as a parameter.
-    let mut config = quic_rs::TransportConfig::default();
+    let mut config = quic::TransportConfig::default();
     config.max_concurrent_uni_streams(opt.max_streams.try_into().unwrap());
     config.initial_mtu(opt.initial_mtu);
 
-    let mut acks = quic_rs::AckFrequencyConfig::default();
+    let mut acks = quic::AckFrequencyConfig::default();
     acks.ack_eliciting_threshold(10u32.into());
     config.ack_frequency_config(Some(acks));
 

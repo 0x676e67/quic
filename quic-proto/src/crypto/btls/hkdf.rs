@@ -25,11 +25,11 @@ static SHA256: LazyLock<Hkdf> = LazyLock::new(|| Hkdf(MessageDigest::sha256()));
 static SHA384: LazyLock<Hkdf> = LazyLock::new(|| Hkdf(MessageDigest::sha384()));
 
 impl Hkdf {
-    pub(crate) fn sha256() -> Hkdf {
+    pub(crate) fn sha256() -> Self {
         *SHA256
     }
 
-    pub(crate) fn sha384() -> Hkdf {
+    pub(crate) fn sha384() -> Self {
         *SHA384
     }
 

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crc::Crc;
-use quic_rs::{ConnectionError, ReadError, StoppedError, TransportConfig, WriteError};
-use rand::{self, RngCore};
+use quic::{ConnectionError, ReadError, StoppedError, TransportConfig, WriteError};
+use rand::{self, Rng};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::runtime::Builder;
 
@@ -30,13 +30,12 @@ fn connect_n_nodes_to_1_and_send_1mb_data() {
 
     let (cfg, listener_cert) = configure_listener();
     let endpoint =
-        quic_rs::Endpoint::server(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            .unwrap();
+        quic::Endpoint::server(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
     let listener_addr = endpoint.local_addr().unwrap();
 
     let expected_messages = 50;
 
-    let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+    let crc = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
     let shared2 = shared.clone();
     let endpoint2 = endpoint.clone();
     let read_incoming_data = async move {
@@ -75,7 +74,7 @@ fn connect_n_nodes_to_1_and_send_1mb_data() {
         };
         runtime.spawn(async move {
             if let Err(e) = task.await {
-                use quic_rs::ConnectionError::*;
+                use quic::ConnectionError::*;
                 match e {
                     WriteError::ConnectionLost(ApplicationClosed { .. })
                     | WriteError::ConnectionLost(Reset) => {}
@@ -93,8 +92,8 @@ fn connect_n_nodes_to_1_and_send_1mb_data() {
     }
 }
 
-async fn read_from_peer(mut stream: quic_rs::RecvStream) -> Result<(), quic_rs::ConnectionError> {
-    let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+async fn read_from_peer(mut stream: quic::RecvStream) -> Result<(), ConnectionError> {
+    let crc = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
     match stream.read_to_end(1024 * 1024 * 5).await {
         Ok(data) => {
             assert!(hash_correct(&data, &crc));
@@ -102,7 +101,7 @@ async fn read_from_peer(mut stream: quic_rs::RecvStream) -> Result<(), quic_rs::
         }
         Err(e) => {
             use ReadError::*;
-            use quic_rs::ReadToEndError::*;
+            use quic::ReadToEndError::*;
             match e {
                 TooLong | Read(ClosedStream) | Read(ZeroRttRejected) | Read(IllegalOrderedRead) => {
                     unreachable!()
@@ -114,7 +113,7 @@ async fn read_from_peer(mut stream: quic_rs::RecvStream) -> Result<(), quic_rs::
     }
 }
 
-async fn write_to_peer(conn: quic_rs::Connection, data: Vec<u8>) -> Result<(), WriteError> {
+async fn write_to_peer(conn: quic::Connection, data: Vec<u8>) -> Result<(), WriteError> {
     let mut s = conn.open_uni().await.map_err(WriteError::ConnectionLost)?;
     s.write_all(&data).await?;
     s.finish().unwrap();
@@ -127,24 +126,23 @@ async fn write_to_peer(conn: quic_rs::Connection, data: Vec<u8>) -> Result<(), W
 }
 
 /// Builds client configuration. Trusts given node certificate.
-fn configure_connector(node_cert: CertificateDer<'static>) -> quic_rs::ClientConfig {
+fn configure_connector(node_cert: CertificateDer<'static>) -> quic::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(node_cert).unwrap();
 
     let mut transport_config = TransportConfig::default();
     transport_config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
 
-    let mut peer_cfg = quic_rs::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let mut peer_cfg = quic::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
     peer_cfg.transport_config(Arc::new(transport_config));
     peer_cfg
 }
 
 /// Builds listener configuration along with its certificate.
-fn configure_listener() -> (quic_rs::ServerConfig, CertificateDer<'static>) {
+fn configure_listener() -> (quic::ServerConfig, CertificateDer<'static>) {
     let (our_cert, our_priv_key) = gen_cert();
     let mut our_cfg =
-        quic_rs::ServerConfig::with_single_cert(vec![our_cert.clone()], our_priv_key.into())
-            .unwrap();
+        quic::ServerConfig::with_single_cert(vec![our_cert.clone()], our_priv_key.into()).unwrap();
 
     let transport_config = Arc::get_mut(&mut our_cfg.transport).unwrap();
     transport_config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));

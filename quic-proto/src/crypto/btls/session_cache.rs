@@ -97,7 +97,7 @@ pub struct SimpleCache {
 
 impl SimpleCache {
     pub fn new(num_entries: usize) -> Self {
-        SimpleCache {
+        Self {
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(num_entries).unwrap())),
         }
     }

@@ -79,7 +79,7 @@ async fn run(options: Opt) -> Result<()> {
     if let Some(ca_path) = options.ca {
         roots.add(CertificateDer::from(fs::read(ca_path)?))?;
     } else {
-        let dirs = directories_next::ProjectDirs::from("org", "quic", "quic-rs-examples").unwrap();
+        let dirs = directories_next::ProjectDirs::from("org", "quic", "quic-examples").unwrap();
         match fs::read(dirs.data_local_dir().join("cert.der")) {
             Ok(cert) => {
                 roots.add(CertificateDer::from(cert))?;
@@ -102,8 +102,8 @@ async fn run(options: Opt) -> Result<()> {
     }
 
     let client_config =
-        quic_rs::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    let endpoint = quic_rs::Endpoint::client(options.bind)?;
+        quic::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    let endpoint = quic::Endpoint::client(options.bind)?;
     endpoint.set_default_client_config(client_config);
 
     let request = format!("GET {}\r\n", url.path());

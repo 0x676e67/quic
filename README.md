@@ -1,8 +1,10 @@
-# quic-rs
+# quic
 
-[![Crates.io](https://img.shields.io/crates/v/quic-rs.svg)](https://crates.io/crates/quic-rs)
+[![CI](https://github.com/0x676e67/quic/actions/workflows/rust.yml/badge.svg)](https://github.com/0x676e67/quic/actions/workflows/rust.yml)
+![Crates.io License](https://img.shields.io/crates/l/quic)
+[![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
-**quic-rs** is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol and a [quinn](https://github.com/quinn-rs/quinn) fork focused on extended QUIC support.
+**quic** is a pure-Rust, async-compatible [quinn](https://github.com/quinn-rs/quinn) fork implementing selected [QUIC][quic] extensions, including those unlikely to be merged upstream.
 
 ## Features
 
@@ -13,11 +15,9 @@
   [rustls][rustls] and [*ring*][ring]
 - Application-layer datagrams for small, unreliable messages
 - Future-based async API
-- Minimum supported Rust version of 1.80.0
+- Minimum supported Rust version of 1.85.0
 
-# Getting Started
-
-**Examples**
+## Example
 
 ```sh
 $ cargo run --example server ./
@@ -48,16 +48,14 @@ Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
 
 [quic]: https://quicwg.github.io/
-[issues]: https://github.com/0x676e67/quic-rs/issues
+[issues]: https://github.com/0x676e67/quic/issues
 [rustls]: https://github.com/ctz/rustls
 [ring]: https://github.com/briansmith/ring
 [talk]: https://paris.rustfest.eu/sessions/a-quic-future-in-rust
-[slides]: https://github.com/djc/talks/blob/ff760845b51ba4836cce82e7f2c640ecb5fd59fa/2018-05-26%20A%20QUIC%20future%20in%20Rust/Quinn-Speaker.pdf
 [animation]: https://dirkjan.ochtman.nl/files/head-of-line-blocking.html
 [youtube]: https://www.youtube.com/watch?v=EHgyY5DNdvI
 [letsencrypt]: https://letsencrypt.org/
 [rcgen]: https://crates.io/crates/rcgen
-[examples]: https://github.com/0x676e67/quic-rs/tree/main/quic/examples
-[documentation]: https://quinn-rs.github.io/quinn/networking-introduction.html
+[examples]: https://github.com/0x676e67/quic/tree/main/quic/examples
 [sans-io]: https://sans-io.readthedocs.io/how-to-sans-io.html
-[insecure]: https://github.com/0x676e67/quic-rs/blob/main/quic/examples/insecure_connection.rs
+[insecure]: https://github.com/0x676e67/quic/blob/main/quic/examples/insecure_connection.rs

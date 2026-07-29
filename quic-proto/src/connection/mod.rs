@@ -10,7 +10,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
@@ -68,6 +68,7 @@ pub(crate) mod qlog;
 
 mod send_buffer;
 
+mod sent_packets;
 mod spaces;
 #[cfg(fuzzing)]
 pub use spaces::Retransmits;
@@ -376,7 +377,7 @@ impl Connection {
     /// - a call to `poll_transmit` returned `Some`
     /// - a call was made to `handle_timeout`
     #[must_use]
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
+    pub fn poll_timeout(&self) -> Option<Instant> {
         self.timers.next_timeout()
     }
 
@@ -709,7 +710,7 @@ impl Connection {
                         // Clamp the datagram to at most the minimum MTU to ensure that loss probes
                         // can get through and enable recovery even if the path MTU has shrank
                         // unexpectedly.
-                        std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                        cmp::min(segment_size, usize::from(INITIAL_MTU))
                     }
                 };
                 buf_capacity += next_datagram_size_limit;
@@ -1146,11 +1147,7 @@ impl Connection {
                     self.spaces[SpaceId::Data].pending.new_cids.push(frame);
                 });
                 // Update Timer::PushNewCid
-                if self
-                    .timers
-                    .get(Timer::PushNewCid)
-                    .map_or(true, |x| x <= now)
-                {
+                if self.timers.get(Timer::PushNewCid).is_none_or(|x| x <= now) {
                     self.reset_cid_retirement();
                 }
             }
@@ -1203,6 +1200,7 @@ impl Connection {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
                         self.path = prev;
+                        self.set_loss_detection_timer(now);
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -1443,12 +1441,9 @@ impl Connection {
         }
         let new_largest = {
             let space = &mut self.spaces[space];
-            if space
-                .largest_acked_packet
-                .map_or(true, |pn| ack.largest > pn)
-            {
+            if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
                 space.largest_acked_packet = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(&ack.largest) {
+                if let Some(info) = space.sent_packets.get(ack.largest) {
                     // This should always succeed, but a misbehaving peer might ACK a packet we
                     // haven't sent. At worst, that will result in us spuriously reducing the
                     // congestion window.
@@ -1469,7 +1464,7 @@ impl Connection {
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
-            for (&pn, _) in self.spaces[space].sent_packets.range(range) {
+            for (pn, _) in self.spaces[space].sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
         }
@@ -1725,7 +1720,7 @@ impl Connection {
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
 
-        for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
+        for (packet, info) in space.sent_packets.range(0..largest_acked_packet) {
             if prev_packet != Some(packet.wrapping_sub(1)) {
                 // An intervening packet was acknowledged
                 persistent_congestion_start = None;
@@ -1780,7 +1775,12 @@ impl Connection {
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+            // safe: lost_packets is populated just above
+            let largest_lost_sent = self.spaces[pn_space]
+                .sent_packets
+                .get(largest_lost)
+                .unwrap()
+                .time_sent;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
@@ -1890,7 +1890,7 @@ impl Connection {
                 continue;
             };
             let pto = last_ack_eliciting + duration;
-            if result.map_or(true, |(earliest_pto, _)| pto < earliest_pto) {
+            if result.is_none_or(|(earliest_pto, _)| pto < earliest_pto) {
                 result = Some((pto, space));
             }
         }
@@ -2158,7 +2158,9 @@ impl Connection {
 
         space
             .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len);
+            .insert(crypto.offset, crypto.data.clone(), payload_len)
+            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
+
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto.read_handshake(&chunk.bytes)? {
@@ -3357,7 +3359,7 @@ impl Connection {
                 id = %issued.id,
                 "NEW_CONNECTION_ID"
             );
-            frame::NewConnectionId {
+            NewConnectionId {
                 sequence: issued.sequence,
                 retire_prior_to: self.local_cid_state.retire_prior_to(),
                 id: issued.id,
@@ -3521,7 +3523,7 @@ impl Connection {
             negotiate_max_idle_timeout(self.config.max_idle_timeout, Some(params.max_idle_timeout));
         trace!("negotiated max idle timeout {:?}", self.idle_timeout);
         if let Some(ref info) = params.preferred_address {
-            self.rem_cids.insert(frame::NewConnectionId {
+            self.rem_cids.insert(NewConnectionId {
                 sequence: 1,
                 id: info.connection_id,
                 reset_token: info.stateless_reset_token,
@@ -3672,7 +3674,7 @@ impl Connection {
             .filter(|&&t| !matches!(t, Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard))
             .filter_map(|&t| Some((t, self.timers.get(t)?)))
             .min_by_key(|&(_, time)| time)
-            .map_or(true, |(timer, _)| timer == Timer::Idle)
+            .is_none_or(|(timer, _)| timer == Timer::Idle)
     }
 
     /// Whether explicit congestion notification is in use on outgoing packets.

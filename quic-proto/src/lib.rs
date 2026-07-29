@@ -1,10 +1,10 @@
 //! Low-level protocol logic for the QUIC protoocol
 //!
-//! quic-proto-rs contains a fully deterministic implementation of QUIC protocol logic. It contains
+//! quic-proto contains a fully deterministic implementation of QUIC protocol logic. It contains
 //! no networking code and does not get any relevant timestamps from the operating system. Most
-//! users may want to use the futures-based quic-rs API instead.
+//! users may want to use the futures-based quic API instead.
 //!
-//! The quic-proto-rs API might be of interest if you want to use it from a C or C++ project
+//! The quic-proto API might be of interest if you want to use it from a C or C++ project
 //! through C bindings or if you want to use a different event loop than the one tokio provides.
 //!
 //! The most important types are `Endpoint`, which conceptually represents the protocol state for
