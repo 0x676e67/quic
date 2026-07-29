@@ -47,6 +47,21 @@ use crate::{
     connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
 };
 
+fn is_msg_size_err(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EMSGSIZE)
+    }
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 /// A QUIC endpoint.
 ///
 /// An endpoint corresponds to a single UDP socket, may host many connections, and may act as both
@@ -784,7 +799,7 @@ impl Clone for EndpointRef {
 
 impl Drop for EndpointRef {
     fn drop(&mut self) {
-        if self.shared.ref_count.fetch_sub(1, Ordering::Relaxed) > 0 {
+        if self.shared.ref_count.fetch_sub(1, Ordering::Relaxed) > 1 {
             return;
         }
 
@@ -809,6 +824,8 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    /// Reused buffer that received datagrams are copied into and split into owned slices.
+    datagrams: BytesMut,
     recv_limiter: WorkLimiter,
 }
 
@@ -818,12 +835,10 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
+            as usize
+            * max_receive_segments;
+        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -832,6 +847,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            datagrams: BytesMut::with_capacity(datagram_capacity),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -862,8 +878,21 @@ impl RecvState {
             match socket.poll_recv(cx, &mut iovs, &mut metas) {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
+                    // Copy the received batch into `datagrams` and split each datagram off as
+                    // an owned slice. We can't read directly into `datagrams` and drop
+                    // `recv_buf`: once a slice has been handed to a connection the allocation
+                    // is shared, so the next `reserve` must allocate fresh backing memory.
+                    // Reading in place would therefore mean reserving the worst-case iovec
+                    // envelope before every poll and reallocating it whenever a prior datagram
+                    // is still in flight. `recv_buf` stays an allocate-once scratch buffer, and
+                    // we reserve only the bytes actually received.
+                    let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
+                    self.datagrams.reserve(batch_len);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
+                        self.datagrams.extend_from_slice(&buf[..meta.len]);
+                    }
+                    for meta in metas.iter().take(msgs) {
+                        let mut data = self.datagrams.split_to(meta.len);
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
                             let mut response_buffer = Vec::new();
@@ -911,6 +940,13 @@ impl RecvState {
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
                 Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    continue;
+                }
+                // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
+                // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
+                // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
+                // it anyways.
+                Poll::Ready(Err(ref e)) if is_msg_size_err(e) => {
                     continue;
                 }
                 Poll::Ready(Err(e)) => {
