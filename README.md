@@ -1,5 +1,7 @@
 # quic
 
+[![CI](https://github.com/0x676e67/quic/actions/workflows/rust.yml/badge.svg)](https://github.com/0x676e67/quic/actions/workflows/rust.yml)
+![Crates.io License](https://img.shields.io/crates/l/quic)
 [![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
 **quic** is a pure-Rust, async-compatible [quinn](https://github.com/quinn-rs/quinn) fork implementing selected [QUIC][quic] extensions, including those unlikely to be merged upstream.
