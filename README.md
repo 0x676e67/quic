@@ -17,6 +17,16 @@
 - Future-based async API
 - Minimum supported Rust version of 1.85.0
 
+## Overview
+
+- `quic`: High-level async API based on Tokio. Most applications should use
+  this crate; see the [examples] for usage.
+- `quic-proto`: Deterministic state machine for the QUIC protocol. It performs
+  [no I/O][sans-io] internally and can be integrated with custom event loops.
+- `bench`: Benchmarks without an external framework.
+- `perf`: Performance testing tools.
+- `fuzz`: Fuzz targets.
+
 ## Example
 
 ```sh
