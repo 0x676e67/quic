@@ -178,7 +178,7 @@ impl Connecting {
     ///
     /// This will return `None` for clients, or when the platform does not expose this
     /// information. See [`udp::RecvMeta::dst_ip`](udp::RecvMeta::dst_ip) for a list of
-    /// supported platforms when using the default [`udp`](udp) I/O backend.
+    /// supported platforms when using the default [`udp`] I/O backend.
     ///
     /// Will panic if called after `poll` has returned `Ready`.
     pub fn local_ip(&self) -> Option<IpAddr> {
@@ -564,7 +564,7 @@ impl Connection {
     ///
     /// This will return `None` for clients, or when the platform does not expose this
     /// information. See [`udp::RecvMeta::dst_ip`](udp::RecvMeta::dst_ip) for a list of
-    /// supported platforms when using the default [`udp`](udp) I/O backend.
+    /// supported platforms when using the default [`udp`] I/O backend.
     pub fn local_ip(&self) -> Option<IpAddr> {
         self.0.state.lock("local_ip").inner.local_ip()
     }
