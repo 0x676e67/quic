@@ -1,31 +1,26 @@
 # quic
 
+**quic** is a pure-Rust, async [quinn](https://github.com/quinn-rs/quinn) fork for select [QUIC][quic] extensions, including ones unlikely to land upstream.
+
 [![CI](https://github.com/0x676e67/quic/actions/workflows/rust.yml/badge.svg)](https://github.com/0x676e67/quic/actions/workflows/rust.yml)
 [![GitHub License](https://img.shields.io/github/license/0x676e67/quic)](https://github.com/0x676e67/quic/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
-**quic** is a pure-Rust, async-compatible [quinn](https://github.com/quinn-rs/quinn) fork implementing selected [QUIC][quic] extensions, including those unlikely to be merged upstream.
+More information about this crate can be found in the [crate documentation](https://docs.rs/quic).
 
 ## Features
 
-- Simultaneous client/server operation
-- Ordered and unordered stream reads for improved performance
-- Works on stable Rust, tested on Linux, macOS and Windows
-- Pluggable cryptography, with a standard implementation backed by
-  [rustls][rustls] and [*ring*][ring]
-- Application-layer datagrams for small, unreliable messages
-- Future-based async API
+- Client and server support
+- Ordered and unordered streams, plus unreliable datagrams
+- Pluggable cryptography backed by [rustls][rustls] and [*ring*][ring]
+- Async API for Linux, macOS and Windows
 - Minimum supported Rust version of 1.85.0
 
 ## Overview
 
-- `quic`: High-level async API based on Tokio. Most applications should use
-  this crate; see the [examples] for usage.
-- `quic-proto`: Deterministic state machine for the QUIC protocol. It performs
-  [no I/O][sans-io] internally and can be integrated with custom event loops.
-- `bench`: Benchmarks without an external framework.
-- `perf`: Performance testing tools.
-- `fuzz`: Fuzz targets.
+- `quic`: High-level async API; see the [examples] for usage.
+- `quic-proto`: [Sans-I/O][sans-io] QUIC state machine for custom event loops.
+- `bench`, `perf` and `fuzz`: Benchmarking, performance testing and fuzzing.
 
 ## Example
 
