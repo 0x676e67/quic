@@ -17,9 +17,7 @@
 - Future-based async API
 - Minimum supported Rust version of 1.85.0
 
-# Getting Started
-
-**Examples**
+## Example
 
 ```sh
 $ cargo run --example server ./
