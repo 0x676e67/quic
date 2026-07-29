@@ -6,7 +6,7 @@ resolver = "2"
 [workspace.package]
 rust-version = "1.88.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 authors = ["The quinn Developers", "0x676e67 <gngppz@gmail.com>"]
 repository = "https://github.com/0x676e67/quic"
 keywords = ["quic"]

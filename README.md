@@ -1,7 +1,7 @@
 # quic
 
 [![CI](https://github.com/0x676e67/quic/actions/workflows/rust.yml/badge.svg)](https://github.com/0x676e67/quic/actions/workflows/rust.yml)
-![Crates.io License](https://img.shields.io/crates/l/quic)
+[![GitHub License](https://img.shields.io/github/license/0x676e67/quic)](https://github.com/0x676e67/quic/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
 **quic** is a pure-Rust, async-compatible [quinn](https://github.com/quinn-rs/quinn) fork implementing selected [QUIC][quic] extensions, including those unlikely to be merged upstream.
@@ -31,21 +31,14 @@ client will automatically find and trust it.
 
 ## License
 
-This project is licensed under either of
-
- * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-   http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or
-   http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under either of Apache License, Version 2.0 ([LICENSE](LICENSE) or
+http://www.apache.org/licenses/LICENSE-2.0).
 
 ## Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in this project by you, as defined in the
-Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the [Apache-2.0](LICENSE) license,
+shall be licensed as above, without any additional terms or conditions.
 
 [quic]: https://quicwg.github.io/
 [issues]: https://github.com/0x676e67/quic/issues
