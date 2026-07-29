@@ -17,7 +17,6 @@ workspace = ".."
 default = ["rustls-ring", "tracing-log", "bloom"]
 
 aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys", "aws-lc-rs?/prebuilt-nasm"]
-
 aws-lc-rs-fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
 
 # Enables BloomTokenLog, and uses it by default
@@ -28,7 +27,6 @@ rustls = ["rustls-ring"]
 
 # Enable rustls with the `aws-lc-rs` crypto provider
 rustls-aws-lc-rs = ["dep:rustls", "rustls?/aws-lc-rs", "aws-lc-rs"]
-
 rustls-aws-lc-rs-fips = ["rustls-aws-lc-rs", "aws-lc-rs-fips"]
 
 # Enable rustls with the `ring` crypto provider
