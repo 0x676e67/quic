@@ -15,8 +15,8 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, RttStore, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
+    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, InitialRttCache, Instant, MAX_CID_SIZE,
+    MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
     TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
@@ -25,6 +25,7 @@ use crate::{
     connection::spaces::LostPacket,
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
+    initial_rtt,
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
         PacketNumber, PartialDecode, SpaceId,
@@ -261,6 +262,7 @@ impl Connection {
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
+        let initial_rtt = side_args.initial_rtt().unwrap_or(config.initial_rtt);
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let initial_space = PacketSpace {
@@ -284,7 +286,7 @@ impl Connection {
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
-            path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            path: PathData::new(remote, allow_mtud, None, 0, now, &config, initial_rtt),
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -2232,7 +2234,6 @@ impl Connection {
         if space == SpaceId::Data && self.side.is_client() {
             // Discard 0-RTT keys because 1-RTT keys are available.
             self.zero_rtt_crypto = None;
-            self.save_rtt();
         }
     }
 
@@ -2631,7 +2632,7 @@ impl Connection {
                         self.endpoint_events
                             .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
                     }
-                    self.handle_peer_params(params)?;
+                    self.handle_peer_params(now, params)?;
                     self.issue_first_cids(now);
                 } else {
                     // Server-only
@@ -2678,7 +2679,7 @@ impl Connection {
                             "transport parameters missing".to_owned(),
                         )
                     })?;
-                    self.handle_peer_params(params)?;
+                    self.handle_peer_params(now, params)?;
                     self.issue_first_cids(now);
                     self.init_0rtt();
                 }
@@ -3123,6 +3124,7 @@ impl Connection {
                 self.path_counter,
                 now,
                 &self.config,
+                self.config.initial_rtt,
             )
         };
         new_path.challenge = Some(self.rng.random());
@@ -3491,20 +3493,26 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
+        self.save_rtt();
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
         }
     }
 
     fn save_rtt(&self) {
+        if self.highest_space != SpaceId::Data {
+            return;
+        }
+        let Some(rtt) = self.path.rtt.smoothed() else {
+            return;
+        };
         if let ConnectionSide::Client {
-            rtt_store: Some(rtt_store),
+            initial_rtt_cache: Some(initial_rtt_cache),
             server_name,
             ..
         } = &self.side
         {
-            let rtt_us = self.path.rtt.get().as_micros() as u64;
-            rtt_store.insert(server_name, rtt_us);
+            initial_rtt_cache.insert(server_name, rtt);
         }
     }
 
@@ -3514,7 +3522,11 @@ impl Connection {
     }
 
     /// Handle transport parameters received from the peer
-    fn handle_peer_params(&mut self, params: TransportParameters) -> Result<(), TransportError> {
+    fn handle_peer_params(
+        &mut self,
+        now: Instant,
+        params: TransportParameters,
+    ) -> Result<(), TransportError> {
         if Some(self.orig_rem_cid) != params.initial_src_cid
             || (self.side.is_client()
                 && (Some(self.initial_dst_cid) != params.original_dst_cid
@@ -3523,6 +3535,17 @@ impl Connection {
             return Err(TransportError::TRANSPORT_PARAMETER_ERROR(
                 "CID authentication failure",
             ));
+        }
+
+        if self.side.is_client() && params.initial_rtt_tp.is_some() {
+            return Err(TransportError::TRANSPORT_PARAMETER_ERROR(
+                "server sent initial_rtt",
+            ));
+        }
+        if self.side.is_server() {
+            if let Some(initial_rtt) = params.initial_rtt_tp.and_then(initial_rtt::decode) {
+                self.path.set_initial_rtt(initial_rtt, now);
+            }
         }
 
         self.set_peer_params(params);
@@ -3835,7 +3858,7 @@ enum ConnectionSide {
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
         server_name: String,
-        rtt_store: Option<Arc<dyn RttStore>>,
+        initial_rtt_cache: Option<Arc<dyn InitialRttCache>>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3872,12 +3895,13 @@ impl From<SideArgs> for ConnectionSide {
             SideArgs::Client {
                 token_store,
                 server_name,
-                rtt_store,
+                initial_rtt: _,
+                initial_rtt_cache,
             } => Self::Client {
                 token: token_store.take(&server_name).unwrap_or_default(),
                 token_store,
                 server_name,
-                rtt_store,
+                initial_rtt_cache,
             },
             SideArgs::Server {
                 server_config,
@@ -3893,7 +3917,8 @@ pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
         server_name: String,
-        rtt_store: Option<Arc<dyn RttStore>>,
+        initial_rtt: Option<Duration>,
+        initial_rtt_cache: Option<Arc<dyn InitialRttCache>>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3903,6 +3928,13 @@ pub(crate) enum SideArgs {
 }
 
 impl SideArgs {
+    fn initial_rtt(&self) -> Option<Duration> {
+        match self {
+            Self::Client { initial_rtt, .. } => *initial_rtt,
+            Self::Server { .. } => None,
+        }
+    }
+
     pub(crate) fn pref_addr_cid(&self) -> Option<ConnectionId> {
         match *self {
             Self::Client { .. } => None,
