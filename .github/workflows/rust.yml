@@ -19,7 +19,7 @@ jobs:
     name: test on freebsd
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: test on freebsd
         uses: vmactions/freebsd-vm@v1
         with:
@@ -43,7 +43,7 @@ jobs:
     name: test on solaris
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: test on Solaris
         uses: vmactions/solaris-vm@v1
         with:
@@ -68,7 +68,7 @@ jobs:
     name: test on illumos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: test on Illumos
         uses: vmactions/omnios-vm@v1
         with:
@@ -81,6 +81,20 @@ jobs:
           run: |
             . "$HOME/.cargo/env"
             cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml
+
+  test-musl:
+    name: test on musl
+    runs-on: ubuntu-latest
+    env:
+      # `cc` looks for a target-prefixed compiler; point it at the one `musl-tools` installs.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
 
   test:
     strategy:
@@ -96,7 +110,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
@@ -110,7 +124,7 @@ jobs:
   test-aws-lc-rs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Prevent feature unification from selecting *ring* as the crypto provider
@@ -126,10 +140,10 @@ jobs:
     name: test wasm32-unknown-unknown
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: rustup target add wasm32-unknown-unknown
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - uses: bytecodealliance/actions/wasm-tools/setup@v1
@@ -148,22 +162,22 @@ jobs:
           ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/quic.wasm | grep 'import "env"'
 
       # Match the version of wasm-bindgen used in `Cargo.lock`
-      - run: cargo binstall wasm-bindgen-cli@0.2.114 --locked --no-confirm
+      - run: cargo binstall wasm-bindgen-cli@0.2.118 --locked --no-confirm
       - run: cargo test --locked -p quic-proto --target wasm32-unknown-unknown
 
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Note that we must also update the README when changing the MSRV
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --lib --all-features -p quic-proto -p quic
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -186,8 +200,8 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+    - uses: actions/checkout@v7
+    - uses: EmbarkStudios/cargo-deny-action@v2
 
   test-android:
     runs-on: ubuntu-latest
@@ -207,8 +221,8 @@ jobs:
       - name: Set API level environment variable
         run: echo "API_LEVEL=${{ matrix.api-level }}" >> $GITHUB_ENV
 
-      - name: Checkout code
-        uses: actions/checkout@v6
+    - name: Checkout code
+      uses: actions/checkout@v7
 
       - name: Install JDK
         uses: actions/setup-java@v5
@@ -261,7 +275,7 @@ jobs:
       # skip FIPS features outside of Linux
       SKIP_FEATURES: ${{ matrix.os != 'ubuntu-latest' && 'rustls-aws-lc-rs-fips,aws-lc-rs-fips,__rustls-post-quantum-test' || '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --feature-powerset --depth 3 --optional-deps --no-dev-deps --ignore-private --skip "${{env.SKIP_FEATURES}}"

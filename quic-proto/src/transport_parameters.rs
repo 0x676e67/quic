@@ -13,7 +13,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut};
-use rand::{Rng as _, RngCore, seq::SliceRandom as _};
+use rand::{Rng, RngExt, seq::SliceRandom as _};
 use thiserror::Error;
 
 use crate::{
@@ -258,9 +258,9 @@ pub(crate) enum WriteEntry {
 ///
 /// Format: `0xXaXaXaXa` — each byte has its low nibble forced to `0x0a` and
 /// its high nibble randomised (RFC 9368 §3).
-fn grease_quic_version(rng: &mut impl RngCore) -> u32 {
+fn grease_quic_version(rng: &mut impl Rng) -> u32 {
     let mut bytes = [0u8; 4];
-    rng.fill_bytes(&mut bytes);
+    rng.fill(&mut bytes);
     u32::from_be_bytes(bytes.map(|b| (b & 0xf0) | 0x0a))
 }
 
@@ -273,7 +273,7 @@ impl TransportParameters {
         cid_gen: &dyn ConnectionIdGenerator,
         initial_src_cid: ConnectionId,
         server_config: Option<&ServerConfig>,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> Self {
         let write_entries = match &config.transport_parameter_config {
             Some(tp_config) => {
@@ -771,7 +771,7 @@ impl ReservedTransportParameter {
     /// The implementation is inspired by quic-go and quiche:
     /// 1. <https://github.com/quic-go/quic-go/blob/3e0a67b2476e1819752f04d75968de042b197b56/internal/wire/transport_parameters.go#L338-L344>
     /// 2. <https://github.com/google/quiche/blob/cb1090b20c40e2f0815107857324e99acf6ec567/quiche/quic/core/crypto/transport_parameters.cc#L843-L860>
-    fn random(rng: &mut impl RngCore) -> Self {
+    fn random(rng: &mut impl Rng) -> Self {
         let id = Self::generate_reserved_id(rng);
 
         let payload_len = rng.random_range(0..Self::MAX_PAYLOAD_LEN);
@@ -799,7 +799,7 @@ impl ReservedTransportParameter {
     /// Reserved transport parameter identifiers are used to test compliance with the requirement
     /// that unknown transport parameters must be ignored by peers.
     /// See: <https://www.rfc-editor.org/rfc/rfc9000.html#section-18.1> and <https://www.rfc-editor.org/rfc/rfc9000.html#section-22.3>
-    fn generate_reserved_id(rng: &mut impl RngCore) -> VarInt {
+    fn generate_reserved_id(rng: &mut impl Rng) -> VarInt {
         let id = {
             let rand = rng.random_range(0u64..(1 << 62) - 27);
             let n = rand / 31;
@@ -899,7 +899,7 @@ impl TransportParameterId {
     ];
 }
 
-impl std::cmp::PartialEq<u64> for TransportParameterId {
+impl PartialEq<u64> for TransportParameterId {
     fn eq(&self, other: &u64) -> bool {
         *other == (*self as u64)
     }
@@ -952,6 +952,10 @@ fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) ->
 
 #[cfg(test)]
 mod test {
+    use std::convert::Infallible;
+
+    use rand::TryRng;
+
     use super::*;
 
     #[test]
@@ -1015,21 +1019,22 @@ mod test {
 
     struct StepRng(u64);
 
-    impl RngCore for StepRng {
+    impl TryRng for StepRng {
+        type Error = Infallible;
+
         #[inline]
-        fn next_u32(&mut self) -> u32 {
-            self.next_u64() as u32
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.next_u64() as u32)
         }
 
         #[inline]
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             let res = self.0;
             self.0 = self.0.wrapping_add(1);
-            res
+            Ok(res)
         }
 
-        #[inline]
-        fn fill_bytes(&mut self, dst: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             let mut left = dst;
             while left.len() >= 8 {
                 let (l, r) = left.split_at_mut(8);
@@ -1040,6 +1045,8 @@ mod test {
             if n > 0 {
                 left.copy_from_slice(&self.next_u32().to_le_bytes()[..n]);
             }
+
+            Ok(())
         }
     }
 
@@ -1107,7 +1114,7 @@ mod test {
     // -- Tests for deterministic transport parameter ordering --
 
     /// Helper: build TransportParameters via `new()` with a given config.
-    fn build_tp(config: &crate::config::TransportConfig) -> TransportParameters {
+    fn build_tp(config: &TransportConfig) -> TransportParameters {
         use crate::cid_generator::ConnectionIdGenerator;
         struct FixedLen;
         impl ConnectionIdGenerator for FixedLen {
@@ -1121,7 +1128,7 @@ mod test {
                 None
             }
         }
-        let ep = crate::config::EndpointConfig::default();
+        let ep = EndpointConfig::default();
         let mut rng = StepRng(42);
         TransportParameters::new(
             config,
@@ -1135,7 +1142,7 @@ mod test {
 
     #[test]
     fn default_config_has_shuffled_entries_with_grease() {
-        let config = crate::config::TransportConfig::default();
+        let config = TransportConfig::default();
         let tp = build_tp(&config);
         let entries = tp.write_entries.as_ref().unwrap();
 
@@ -1153,7 +1160,7 @@ mod test {
 
     #[test]
     fn deterministic_order_matches_config() {
-        let mut config = crate::config::TransportConfig::default();
+        let mut config = TransportConfig::default();
         let order = vec![
             TransportParameterKind::Known(TransportParameterId::InitialMaxData),
             TransportParameterKind::Grease,
@@ -1188,7 +1195,7 @@ mod test {
 
     #[test]
     fn shuffled_config_entries_all_present() {
-        let mut config = crate::config::TransportConfig::default();
+        let mut config = TransportConfig::default();
         let order = vec![
             TransportParameterKind::Known(TransportParameterId::InitialMaxData),
             TransportParameterKind::Grease,
@@ -1225,7 +1232,7 @@ mod test {
 
     #[test]
     fn custom_entry_wire_format() {
-        let mut config = crate::config::TransportConfig::default();
+        let mut config = TransportConfig::default();
         config.transport_parameter_config(TransportParameterConfig::new(
             vec![TransportParameterKind::Custom {
                 id: 0x3127,
@@ -1247,7 +1254,7 @@ mod test {
 
     #[test]
     fn deterministic_order_roundtrip() {
-        let mut config = crate::config::TransportConfig::default();
+        let mut config = TransportConfig::default();
         config.transport_parameter_config(TransportParameterConfig::new(
             vec![
                 TransportParameterKind::Known(TransportParameterId::InitialMaxStreamDataBidiLocal),
@@ -1277,7 +1284,7 @@ mod test {
 
     #[test]
     fn empty_config_writes_nothing() {
-        let mut config = crate::config::TransportConfig::default();
+        let mut config = TransportConfig::default();
         config.transport_parameter_config(TransportParameterConfig::new(vec![], false));
         let tp = build_tp(&config);
 
@@ -1288,7 +1295,7 @@ mod test {
 
     #[test]
     fn deterministic_grease_has_valid_id() {
-        let mut config = crate::config::TransportConfig::default();
+        let mut config = TransportConfig::default();
         config.transport_parameter_config(TransportParameterConfig::new(
             vec![
                 TransportParameterKind::Grease,
@@ -1363,7 +1370,7 @@ mod test {
     /// the correct structure when resolved through TransportParameterKind.
     #[test]
     fn version_information_kind_resolution() {
-        use crate::config::TransportConfig;
+        use TransportConfig;
 
         let vi = VersionInformation {
             chosen_version: 1,
@@ -1390,7 +1397,7 @@ mod test {
                 None
             }
         }
-        let ep_config = crate::config::EndpointConfig::default();
+        let ep_config = EndpointConfig::default();
         let tp = TransportParameters::new(
             &transport,
             &ep_config,

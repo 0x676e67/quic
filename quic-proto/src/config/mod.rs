@@ -78,11 +78,11 @@ impl EndpointConfig {
     /// information in local connection IDs, e.g. to support stateless packet-level load balancers.
     ///
     /// Defaults to [`HashedConnectionIdGenerator`].
-    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
+    pub fn cid_generator(
         &mut self,
-        factory: F,
+        factory: Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
     ) -> &mut Self {
-        self.connection_id_generator_factory = Arc::new(factory);
+        self.connection_id_generator_factory = factory;
         self
     }
 
@@ -183,7 +183,7 @@ impl Default for EndpointConfig {
     fn default() -> Self {
         #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
         use aws_lc_rs::hmac;
-        use rand::RngCore;
+        use rand::Rng;
         #[cfg(feature = "ring")]
         use ring::hmac;
 
@@ -400,7 +400,7 @@ impl ServerConfig {
     pub fn with_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
         #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
         use aws_lc_rs::hkdf;
-        use rand::RngCore;
+        use rand::Rng;
         #[cfg(feature = "ring")]
         use ring::hkdf;
 
