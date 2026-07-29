@@ -342,7 +342,7 @@ pub struct Retransmits {
     /// It is true that a QUIC endpoint will only want to effectively have NEW_TOKEN frames
     /// enqueued for its current path at a given point in time. Based on that, we could conceivably
     /// change this from a vector to an `Option<(SocketAddr, usize)>` or just a `usize` or
-    /// something. However, due to the architecture of Quinn, it is considerably simpler to not do
+    /// something. However, due to the architecture of this implementation, it is considerably simpler to not do
     /// that; consider what such a change would mean for implementing `BitOrAssign` on Self.
     pub(super) new_tokens: Vec<SocketAddr>,
 }
@@ -775,7 +775,7 @@ impl PendingAcks {
     pub(super) fn insert_one(&mut self, packet: u64, now: Instant) {
         self.ranges.insert_one(packet);
 
-        if self.largest_packet.map_or(true, |(pn, _)| packet > pn) {
+        if self.largest_packet.is_none_or(|(pn, _)| packet > pn) {
             self.largest_packet = Some((packet, now));
         }
 

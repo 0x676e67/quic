@@ -1,6 +1,7 @@
 [package]
-name = "quic-rs"
-version = "0.12.0"
+name = "quic"
+version = "0.11.0"
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Versatile QUIC transport protocol implementation"
@@ -57,7 +58,7 @@ bytes = { workspace = true }
 futures-io = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
-proto = { package = "quic-proto-rs", path = "../quic-proto", version = "0.12.0", default-features = false }
+proto = { package = "quic-proto", path = "../quic-proto", version = "0.11.16", default-features = false }
 rustls = { workspace = true, optional = true }
 smol = { workspace = true, optional = true }
 thiserror = { workspace = true }

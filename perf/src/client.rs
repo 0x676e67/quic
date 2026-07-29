@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quic_rs::{TokioRuntime, crypto::rustls::QuicClientConfig};
+use quic::{TokioRuntime, crypto::rustls::QuicClientConfig};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
@@ -99,10 +99,10 @@ pub async fn run(opt: Opt) -> Result<()> {
 
     let socket = opt.common.bind_socket(bind_addr)?;
 
-    let mut endpoint_cfg = quic_rs::EndpointConfig::default();
+    let mut endpoint_cfg = quic::EndpointConfig::default();
     endpoint_cfg.max_udp_payload_size(opt.common.max_udp_payload_size)?;
 
-    let endpoint = quic_rs::Endpoint::new(endpoint_cfg, None, socket, Arc::new(TokioRuntime))?;
+    let endpoint = quic::Endpoint::new(endpoint_cfg, None, socket, Arc::new(TokioRuntime))?;
 
     let default_provider = rustls::crypto::ring::default_provider();
     let provider = Arc::new(rustls::crypto::CryptoProvider {
@@ -128,7 +128,7 @@ pub async fn run(opt: Opt) -> Result<()> {
     )?;
 
     let crypto = Arc::new(QuicClientConfig::try_from(crypto)?);
-    let mut config = quic_rs::ClientConfig::new(match opt.common.no_protection {
+    let mut config = quic::ClientConfig::new(match opt.common.no_protection {
         true => Arc::new(NoProtectionClientConfig::new(crypto)),
         false => crypto,
     });
@@ -213,7 +213,7 @@ pub async fn run(opt: Opt) -> Result<()> {
 }
 
 async fn drain_stream(
-    mut stream: quic_rs::RecvStream,
+    mut stream: quic::RecvStream,
     download: u64,
     stream_stats: OpenStreamStats,
 ) -> Result<()> {
@@ -256,7 +256,7 @@ async fn drain_stream(
 }
 
 async fn drive_uni(
-    connection: quic_rs::Connection,
+    connection: quic::Connection,
     stream_stats: OpenStreamStats,
     concurrency: u64,
     upload: u64,
@@ -286,8 +286,8 @@ async fn drive_uni(
 }
 
 async fn request_uni(
-    send: quic_rs::SendStream,
-    conn: quic_rs::Connection,
+    send: quic::SendStream,
+    conn: quic::Connection,
     upload: u64,
     download: u64,
     stream_stats: OpenStreamStats,
@@ -299,7 +299,7 @@ async fn request_uni(
 }
 
 async fn request(
-    mut send: quic_rs::SendStream,
+    mut send: quic::SendStream,
     mut upload: u64,
     download: u64,
     stream_stats: OpenStreamStats,
@@ -332,7 +332,7 @@ async fn request(
 }
 
 async fn drive_bi(
-    connection: quic_rs::Connection,
+    connection: quic::Connection,
     stream_stats: OpenStreamStats,
     concurrency: u64,
     upload: u64,
@@ -361,8 +361,8 @@ async fn drive_bi(
 }
 
 async fn request_bi(
-    send: quic_rs::SendStream,
-    recv: quic_rs::RecvStream,
+    send: quic::SendStream,
+    recv: quic::RecvStream,
     upload: u64,
     download: u64,
     stream_stats: OpenStreamStats,

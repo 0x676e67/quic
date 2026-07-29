@@ -13,7 +13,7 @@ use crate::{
 ///
 /// Due to packet number encryption, it is impossible to fully decode a header
 /// (which includes a variable-length packet number) without crypto context.
-/// The crypto context (represented by the `Crypto` type in Quinn) is usually
+/// The crypto context (represented by the `Crypto` type in this implementation) is usually
 /// part of the `Connection`, or can be derived from the destination CID for
 /// Initial packets.
 ///

@@ -1225,7 +1225,7 @@ impl IncomingImproperDropWarner {
 impl Drop for IncomingImproperDropWarner {
     fn drop(&mut self) {
         warn!(
-            "quic_proto_rs::Incoming dropped without passing to Endpoint::accept/refuse/retry/ignore \
+            "quic_proto::Incoming dropped without passing to Endpoint::accept/refuse/retry/ignore \
                (may cause memory leak and eventual inability to accept new connections)"
         );
     }

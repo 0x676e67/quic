@@ -416,10 +416,7 @@ fn reject_self_signed_server_cert() {
     // the client is trusting (in which case we'd get a different error).
     let mut cert = rcgen::CertificateParams::new(["localhost".into()]).unwrap();
     let mut issuer = rcgen::DistinguishedName::new();
-    issuer.push(
-        rcgen::DnType::OrganizationName,
-        "Crazy Quinn's House of Certificates",
-    );
+    issuer.push(rcgen::DnType::OrganizationName, "quic test certificate");
     cert.distinguished_name = issuer;
     let cert = cert
         .self_signed(&rcgen::KeyPair::generate().unwrap())
