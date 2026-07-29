@@ -17,6 +17,9 @@ use crate::{
     transport_parameters::TransportParameters,
 };
 
+/// TLS interface based on btls/BoringSSL
+#[cfg(feature = "btls")]
+pub mod btls;
 /// Cryptography interface based on *ring*
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub(crate) mod ring_like;
