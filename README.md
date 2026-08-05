@@ -1,51 +1,58 @@
 # quic
 
+A [Sans-I/O][sans-io] aware, QUIC implementation for Rust.
+
 [![CI](https://github.com/0x676e67/quic/actions/workflows/rust.yml/badge.svg)](https://github.com/0x676e67/quic/actions/workflows/rust.yml)
-![Crates.io License](https://img.shields.io/crates/l/quic)
+[![GitHub License](https://img.shields.io/github/license/0x676e67/quic)](https://github.com/0x676e67/quic/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
-**quic** is a pure-Rust, async-compatible [quinn](https://github.com/quinn-rs/quinn) fork implementing selected [QUIC][quic] extensions, including those unlikely to be merged upstream.
+More information about this crate can be found in the [crate documentation](https://docs.rs/quic).
 
 ## Features
 
-- Simultaneous client/server operation
-- Ordered and unordered stream reads for improved performance
-- Works on stable Rust, tested on Linux, macOS and Windows
-- Pluggable cryptography, with a standard implementation backed by
-  [rustls][rustls] and [*ring*][ring]
-- Application-layer datagrams for small, unreliable messages
-- Future-based async API
-- Minimum supported Rust version of 1.85.0
+- QUIC version 1 ([RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)), secured with TLS ([RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)).
+- Loss detection and congestion control based on [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html).
+- Ordered and unordered streams, plus unreliable datagrams ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
+- 0-RTT data for resumed connections.
+- Connection migration and path MTU discovery based on [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html).
+- Async APIs for Linux, macOS and Windows; pluggable cryptography with [rustls][rustls] and [*ring*][ring].
+- Minimum supported Rust version: 1.88.0.
 
-## Example
+## Usage
 
-```sh
-$ cargo run --example server ./
-$ cargo run --example client https://localhost:4433/Cargo.toml
+Add `quic` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+quic = "0.11"
 ```
 
-This launches an HTTP 0.9 server on the loopback address serving the current
-working directory, with the client fetching `./Cargo.toml`. By default, the
-server generates a self-signed certificate and stores it to disk, where the
-client will automatically find and trust it.
+Then import the types needed to create an endpoint:
+
+```rust
+use quic::{ClientConfig, Endpoint};
+
+fn main() {
+    // ...
+}
+```
+
+See the [examples] for complete client and server implementations.
 
 ## License
 
-This project is licensed under either of
-
- * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-   http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or
-   http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under either of Apache License, Version 2.0 ([LICENSE](LICENSE) or
+http://www.apache.org/licenses/LICENSE-2.0).
 
 ## Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in this project by you, as defined in the
-Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the [Apache-2.0](LICENSE) license,
+shall be licensed as above, without any additional terms or conditions.
+
+## Accolades
+
+The project is based on a fork of [quinn](https://github.com/quinn-rs/quinn).
 
 [quic]: https://quicwg.github.io/
 [issues]: https://github.com/0x676e67/quic/issues
