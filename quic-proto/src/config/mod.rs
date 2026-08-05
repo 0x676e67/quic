@@ -22,7 +22,7 @@ use crate::{
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
-    initial_rtt::InitialRttCache,
+    initial_rtt::{ServerRttMemoryCache, ServerRttStore},
     shared::ConnectionId,
 };
 
@@ -565,11 +565,11 @@ pub struct ClientConfig {
     /// Validation token store to use
     pub(crate) token_store: Arc<dyn TokenStore>,
 
-    /// Per-server cache for the `initial_rtt` transport parameter (ID `0x3127`).
+    /// Per-server-endpoint cache for the `initial_rtt` transport parameter (ID `0x3127`).
     ///
     /// A measured SRTT is cached when a client connection closes and reused by subsequent
-    /// connections to the same server.
-    pub(crate) initial_rtt_cache: Option<Arc<dyn InitialRttCache>>,
+    /// connections to the same server endpoint.
+    pub(crate) server_rtt_store: Arc<dyn ServerRttStore>,
 
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
@@ -585,11 +585,11 @@ impl ClientConfig {
             transport: Default::default(),
             crypto,
             token_store: Arc::new(TokenMemoryCache::default()),
+            server_rtt_store: Arc::new(ServerRttMemoryCache::default()),
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
             version: 1,
-            initial_rtt_cache: None,
         }
     }
 
@@ -623,13 +623,11 @@ impl ClientConfig {
         self
     }
 
-    /// Set an [`InitialRttCache`]
+    /// Set the store used by the `initial_rtt` transport parameter.
     ///
-    /// By default, no cache is configured and the `initial_rtt` transport parameter is disabled.
-    /// Use [`InitialRttMemoryCache`](crate::InitialRttMemoryCache) to keep the latest measured SRTT
-    /// per server name for the lifetime of the process.
-    pub fn initial_rtt_cache(&mut self, cache: Arc<dyn InitialRttCache>) -> &mut Self {
-        self.initial_rtt_cache = Some(cache);
+    /// This does not enable the extension. Use [`TransportConfig::enable_initial_rtt`] to enable it.
+    pub fn server_rtt_store(&mut self, store: Arc<dyn ServerRttStore>) -> &mut Self {
+        self.server_rtt_store = store;
         self
     }
 
