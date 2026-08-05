@@ -22,7 +22,7 @@ use crate::{
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
-    initial_rtt::{ServerRttMemoryCache, ServerRttStore},
+    server_rtt::{ServerRttMemoryCache, ServerRttStore},
     shared::ConnectionId,
 };
 
