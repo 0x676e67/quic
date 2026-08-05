@@ -24,13 +24,21 @@ const MAX_INITIAL_RTT: Duration = Duration::from_secs(1);
 /// avoid blocking and must not panic. Slow persistence should be queued for separate processing.
 pub trait ServerRttStore: Send + Sync {
     /// Store the latest measured SRTT for a server endpoint.
+    ///
+    /// This is called when a client connection closes after obtaining a usable 1-RTT sample.
+    /// An existing value for the same server name and port should be replaced.
     fn insert(&self, server_name: &str, server_port: u16, smoothed_rtt: Duration);
 
     /// Get the latest measured SRTT for a server endpoint.
+    ///
+    /// This is called once while opening a client connection when the extension is enabled.
+    /// Returning `None` makes the connection use its configured initial RTT.
     fn get(&self, server_name: &str, server_port: u16) -> Option<Duration>;
 
     /// Remove the measured SRTT for a server endpoint after a connection fails without a usable
     /// RTT sample.
+    ///
+    /// Removing a missing entry should have no effect.
     fn remove(&self, server_name: &str, server_port: u16);
 }
 
@@ -84,6 +92,10 @@ impl Default for ServerRttMemoryCache {
     }
 }
 
+/// Mutable state protected by [`ServerRttMemoryCache`]'s mutex.
+///
+/// Every endpoint in `lookup` points to a live entry in `lru`. Updates and removals must keep both
+/// collections in sync while the mutex is held.
 #[derive(Debug)]
 struct CacheState {
     max_server_endpoints: u32,
@@ -94,7 +106,9 @@ struct CacheState {
 }
 
 impl CacheState {
+    /// Insert or replace an endpoint and mark it as most recently used.
     fn insert(&mut self, server_name: &str, server_port: u16, rtt: Duration) {
+        // A zero-capacity cache is valid and never allocates storage.
         if self.max_server_endpoints == 0 {
             return;
         }
@@ -114,10 +128,12 @@ impl CacheState {
             let Some(slab_key) = self.lru.lru() else {
                 return;
             };
+            // Remove the lookup index immediately after taking ownership of the evicted entry.
             let evicted = self.lru.remove(slab_key);
             self.remove_lookup(&evicted.server_name, evicted.server_port);
         }
 
+        // Share one server-name allocation between the lookup index and the slab entry.
         let server_name = Arc::<str>::from(server_name);
         let slab_key = self.lru.insert(CacheEntry {
             server_name: Arc::clone(&server_name),
@@ -130,11 +146,13 @@ impl CacheState {
             .insert(server_port, slab_key);
     }
 
+    /// Return an endpoint's RTT and promote the corresponding slab entry to most recently used.
     fn get(&mut self, server_name: &str, server_port: u16) -> Option<Duration> {
         let slab_key = self.lookup.get(server_name)?.get(&server_port).copied()?;
         Some(self.lru.get_mut(slab_key).rtt)
     }
 
+    /// Remove an endpoint from both the lookup index and the LRU slab.
     fn remove(&mut self, server_name: &str, server_port: u16) {
         if let Some(slab_key) = self.remove_lookup(server_name, server_port) {
             self.lru.remove(slab_key);
@@ -142,6 +160,9 @@ impl CacheState {
     }
 
     /// Remove an endpoint from the lookup index while keeping sibling ports intact.
+    ///
+    /// The returned slab key lets the caller remove the matching owned entry without another
+    /// lookup.
     fn remove_lookup(&mut self, server_name: &str, server_port: u16) -> Option<u32> {
         let (slab_key, remove_server_name) = {
             let ports = self.lookup.get_mut(server_name)?;
