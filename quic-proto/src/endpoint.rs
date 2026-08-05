@@ -25,11 +25,12 @@ use crate::{
     config::{ClientConfig, EndpointConfig, ServerConfig},
     connection::{Connection, ConnectionError, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
-    frame, initial_rtt,
+    frame,
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
         PacketNumber, PartialDecode, ProtectedInitialHeader,
     },
+    server_rtt,
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner, IssuedCid,
@@ -358,7 +359,7 @@ impl Endpoint {
             config
                 .server_rtt_store
                 .get(server_name, remote.port())
-                .and_then(initial_rtt::encode)
+                .and_then(server_rtt::encode)
         } else {
             None
         };
