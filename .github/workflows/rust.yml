@@ -37,7 +37,7 @@ jobs:
             echo "===== freebsd-version ====="
             freebsd-version
 
-            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml
+            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress
 
   test-solaris:
     name: test on solaris
@@ -62,7 +62,7 @@ jobs:
             export PATH=$HOME/.rust_solaris/bin:$PATH
             # Workaround for https://github.com/quinn-rs/quinn/issues/2218
             export CARGO_HTTP_MULTIPLEXING=false
-            cargo build --locked --all-targets && cargo test --locked --manifest-path fuzz/Cargo.toml
+            cargo build --locked --all-targets
 
   test-illumos:
     name: test on illumos
@@ -80,7 +80,7 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           run: |
             . "$HOME/.cargo/env"
-            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress && cargo test --locked --manifest-path fuzz/Cargo.toml
+            cargo build --locked --all-targets && cargo test --locked && cargo test --locked -- --ignored stress
 
   test-musl:
     name: test on musl
@@ -118,7 +118,11 @@ jobs:
       - run: cargo build --locked --all-targets
       - run: cargo test --locked
       - run: cargo test --locked -- --ignored stress
-      - run: cargo test --locked --manifest-path fuzz/Cargo.toml
+      - name: check fuzz targets
+        run: cargo check --locked --all-targets
+        working-directory: fuzz
+        env:
+          RUSTFLAGS: --cfg fuzzing
         if: ${{ matrix.rust == 'stable' }}
 
   test-aws-lc-rs:
@@ -193,9 +197,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -Dwarnings
       - name: lint fuzz
-        run: |
-          cd fuzz
-          cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked -- -D warnings
+        working-directory: fuzz
+        env:
+          RUSTFLAGS: --cfg fuzzing
 
   audit:
     runs-on: ubuntu-latest
