@@ -25,12 +25,12 @@ use crate::{
     connection::spaces::LostPacket,
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
-    initial_rtt,
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
         PacketNumber, PartialDecode, SpaceId,
     },
     range_set::ArrayRangeSet,
+    server_rtt,
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner,
@@ -3550,7 +3550,7 @@ impl Connection {
             ));
         }
         if self.side.is_server() {
-            if let Some(initial_rtt) = params.initial_rtt_tp.and_then(initial_rtt::decode) {
+            if let Some(initial_rtt) = params.initial_rtt_tp.and_then(server_rtt::decode) {
                 self.path.set_initial_rtt(initial_rtt, now);
             }
         }

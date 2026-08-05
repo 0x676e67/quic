@@ -102,7 +102,6 @@ pub use token::{NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenSt
 mod token_memory_cache;
 pub use token_memory_cache::TokenMemoryCache;
 
-mod initial_rtt;
 mod server_rtt;
 pub use server_rtt::{ServerRttMemoryCache, ServerRttStore};
 
