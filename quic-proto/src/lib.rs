@@ -103,7 +103,7 @@ mod token_memory_cache;
 pub use token_memory_cache::TokenMemoryCache;
 
 mod initial_rtt;
-pub use initial_rtt::{InitialRttCache, InitialRttMemoryCache};
+pub use initial_rtt::{ServerRttMemoryCache, ServerRttStore};
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;

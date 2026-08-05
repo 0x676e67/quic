@@ -353,11 +353,15 @@ impl Endpoint {
             &mut self.rng,
         );
 
-        let cached_initial_rtt = config
-            .initial_rtt_cache
-            .as_ref()
-            .and_then(|cache| cache.get(server_name))
-            .and_then(initial_rtt::encode);
+        let enable_initial_rtt = config.transport.enable_initial_rtt;
+        let cached_initial_rtt = if enable_initial_rtt {
+            config
+                .server_rtt_store
+                .get(server_name, remote.port())
+                .and_then(initial_rtt::encode)
+        } else {
+            None
+        };
         params.initial_rtt_tp = cached_initial_rtt.map(|(_, value)| value);
 
         let tls = config
@@ -380,8 +384,9 @@ impl Endpoint {
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
+                server_port: remote.port(),
                 initial_rtt: cached_initial_rtt.map(|(rtt, _)| rtt),
-                initial_rtt_cache: config.initial_rtt_cache,
+                server_rtt_store: enable_initial_rtt.then_some(config.server_rtt_store),
             },
         );
         Ok((ch, conn))

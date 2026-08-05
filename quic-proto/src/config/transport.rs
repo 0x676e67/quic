@@ -36,6 +36,7 @@ pub struct TransportConfig {
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
+    pub(crate) enable_initial_rtt: bool,
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
@@ -177,6 +178,15 @@ impl TransportConfig {
     /// The RTT used before an RTT sample is taken
     pub fn initial_rtt(&mut self, value: Duration) -> &mut Self {
         self.initial_rtt = value;
+        self
+    }
+
+    /// Enable or disable the `initial_rtt` transport parameter.
+    ///
+    /// When enabled, clients cache measured RTTs for server endpoints and reuse them for subsequent
+    /// connections. This setting does not affect servers and is disabled by default.
+    pub fn enable_initial_rtt(&mut self, enabled: bool) -> &mut Self {
+        self.enable_initial_rtt = enabled;
         self
     }
 
@@ -400,6 +410,7 @@ impl Default for TransportConfig {
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
+            enable_initial_rtt: false,
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
@@ -440,6 +451,7 @@ impl fmt::Debug for TransportConfig {
             packet_threshold,
             time_threshold,
             initial_rtt,
+            enable_initial_rtt,
             initial_mtu,
             min_mtu,
             mtu_discovery_config,
@@ -471,6 +483,7 @@ impl fmt::Debug for TransportConfig {
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
+            .field("enable_initial_rtt", enable_initial_rtt)
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)

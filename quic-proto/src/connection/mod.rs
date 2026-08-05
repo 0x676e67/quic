@@ -15,8 +15,8 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, InitialRttCache, Instant, MAX_CID_SIZE,
-    MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
+    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    MIN_INITIAL_SIZE, ServerRttStore, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
     TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
@@ -3493,26 +3493,33 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
-        self.save_rtt();
+        self.update_server_rtt();
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
         }
     }
 
-    fn save_rtt(&self) {
-        if self.highest_space != SpaceId::Data {
-            return;
-        }
-        let Some(rtt) = self.path.rtt.smoothed() else {
-            return;
-        };
+    fn update_server_rtt(&self) {
         if let ConnectionSide::Client {
-            initial_rtt_cache: Some(initial_rtt_cache),
+            server_rtt_store: Some(server_rtt_store),
             server_name,
+            server_port,
             ..
         } = &self.side
         {
-            initial_rtt_cache.insert(server_name, rtt);
+            let rtt = if self.highest_space == SpaceId::Data {
+                self.path.rtt.smoothed()
+            } else {
+                None
+            };
+
+            // Do not reuse an estimate after a connection closes without obtaining a usable
+            // 1-RTT sample. A later connection should fall back to its configured initial RTT.
+            if let Some(rtt) = rtt {
+                server_rtt_store.insert(server_name, *server_port, rtt);
+            } else {
+                server_rtt_store.remove(server_name, *server_port);
+            }
         }
     }
 
@@ -3858,7 +3865,8 @@ enum ConnectionSide {
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
         server_name: String,
-        initial_rtt_cache: Option<Arc<dyn InitialRttCache>>,
+        server_port: u16,
+        server_rtt_store: Option<Arc<dyn ServerRttStore>>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3895,13 +3903,15 @@ impl From<SideArgs> for ConnectionSide {
             SideArgs::Client {
                 token_store,
                 server_name,
+                server_port,
                 initial_rtt: _,
-                initial_rtt_cache,
+                server_rtt_store,
             } => Self::Client {
                 token: token_store.take(&server_name).unwrap_or_default(),
                 token_store,
                 server_name,
-                initial_rtt_cache,
+                server_port,
+                server_rtt_store,
             },
             SideArgs::Server {
                 server_config,
@@ -3917,8 +3927,9 @@ pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        server_port: u16,
         initial_rtt: Option<Duration>,
-        initial_rtt_cache: Option<Arc<dyn InitialRttCache>>,
+        server_rtt_store: Option<Arc<dyn ServerRttStore>>,
     },
     Server {
         server_config: Arc<ServerConfig>,
