@@ -277,13 +277,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_reuses_server_name_allocation_across_ports() {
-        let cache = ServerRttMemoryCache::default();
+    fn memory_store_reuses_server_name_allocation_across_ports() {
+        let store = ServerRttMemoryStore::default();
         let rtt = Duration::from_millis(20);
-        cache.insert("example.com", 443, rtt);
-        cache.insert("example.com", 8443, rtt);
+        store.insert("example.com", 443, rtt);
+        store.insert("example.com", 8443, rtt);
 
-        let mut state = cache.0.lock().unwrap();
+        let mut state = store.0.lock().unwrap();
         let (lookup_name, first_key, second_key) = {
             let (server_name, ports) = state.lookup.get_key_value("example.com").unwrap();
             (Arc::clone(server_name), ports[&443], ports[&8443])
