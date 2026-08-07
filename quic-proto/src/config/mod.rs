@@ -625,6 +625,8 @@ impl ClientConfig {
 
     /// Set the store used by the `initial_rtt` transport parameter.
     ///
+    /// Defaults to [`ServerRttMemoryCache`].
+    ///
     /// This does not enable the extension. Use [`TransportConfig::enable_initial_rtt`] to enable it.
     pub fn server_rtt_store(&mut self, store: Arc<dyn ServerRttStore>) -> &mut Self {
         self.server_rtt_store = store;

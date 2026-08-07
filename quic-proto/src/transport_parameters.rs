@@ -603,7 +603,7 @@ impl TransportParameters {
                     w.write(x);
                 }
             }
-            TransportParameterId::InitialRTT => {
+            TransportParameterId::InitialRtt => {
                 if let Some(x) = self.initial_rtt_tp {
                     w.write_var(id as u64);
                     w.write_var(x.size() as u64);
@@ -705,7 +705,7 @@ impl TransportParameters {
                     _ => return Err(Error::Malformed),
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
-                TransportParameterId::InitialRTT => {
+                TransportParameterId::InitialRtt => {
                     let value = r.get::<VarInt>()?;
                     if side.is_client() || len != value.size() || params.initial_rtt_tp.is_some() {
                         return Err(Error::Malformed);
@@ -893,7 +893,7 @@ pub enum TransportParameterId {
     MinAckDelayDraft07 = 0xFF04DE1B,
 
     /// A client-side transport parameter to send a cached SRTT hint to the server.
-    InitialRTT = 0x3127,
+    InitialRtt = 0x3127,
 }
 
 impl TransportParameterId {
@@ -920,7 +920,7 @@ impl TransportParameterId {
         Self::RetrySourceConnectionId,
         Self::GreaseQuicBit,
         Self::MinAckDelayDraft07,
-        Self::InitialRTT,
+        Self::InitialRtt,
     ];
 }
 
@@ -960,7 +960,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::RetrySourceConnectionId == id => Self::RetrySourceConnectionId,
             id if Self::GreaseQuicBit == id => Self::GreaseQuicBit,
             id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
-            id if Self::InitialRTT == id => Self::InitialRTT,
+            id if Self::InitialRtt == id => Self::InitialRtt,
             _ => return Err(()),
         };
         Ok(param)

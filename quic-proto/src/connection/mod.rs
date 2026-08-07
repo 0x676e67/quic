@@ -3499,6 +3499,7 @@ impl Connection {
         }
     }
 
+    /// Store a measured SRTT, or invalidate the previous value when the connection closes early.
     fn update_server_rtt(&self) {
         if let ConnectionSide::Client {
             server_rtt_store: Some(server_rtt_store),
@@ -3508,13 +3509,13 @@ impl Connection {
         } = &self.side
         {
             let rtt = if self.highest_space == SpaceId::Data {
-                self.path.rtt.smoothed()
+                self.path.rtt.smoothed().filter(|rtt| !rtt.is_zero())
             } else {
                 None
             };
 
-            // Do not reuse an estimate after a connection closes without obtaining a usable
-            // 1-RTT sample. A later connection should fall back to its configured initial RTT.
+            // Persist only positive SRTTs. Keep this policy at the persistence boundary so
+            // synthetic zero-duration samples do not alter Quinn's RTT estimator.
             if let Some(rtt) = rtt {
                 server_rtt_store.insert(server_name, *server_port, rtt);
             } else {

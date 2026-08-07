@@ -113,16 +113,18 @@ impl CacheState {
             return;
         }
 
-        if let Some(slab_key) = self
-            .lookup
-            .get(server_name)
-            .and_then(|ports| ports.get(&server_port))
-            .copied()
-        {
-            // Updating an existing endpoint also promotes it to most recently used.
-            self.lru.get_mut(slab_key).rtt = rtt;
-            return;
-        }
+        // Reuse the lookup key when adding another port for the same server name.
+        let server_name = match self.lookup.get_key_value(server_name) {
+            Some((stored_server_name, ports)) => {
+                if let Some(slab_key) = ports.get(&server_port).copied() {
+                    // Updating an existing endpoint also promotes it to most recently used.
+                    self.lru.get_mut(slab_key).rtt = rtt;
+                    return;
+                }
+                Arc::clone(stored_server_name)
+            }
+            None => Arc::<str>::from(server_name),
+        };
 
         if self.lru.len() >= self.max_server_endpoints {
             let Some(slab_key) = self.lru.lru() else {
@@ -133,8 +135,7 @@ impl CacheState {
             self.remove_lookup(&evicted.server_name, evicted.server_port);
         }
 
-        // Share one server-name allocation between the lookup index and the slab entry.
-        let server_name = Arc::<str>::from(server_name);
+        // The lookup key and slab entry share the same server-name allocation.
         let slab_key = self.lru.insert(CacheEntry {
             server_name: Arc::clone(&server_name),
             server_port,
@@ -273,5 +274,24 @@ mod tests {
 
         assert_eq!(cache.get("example.com", 443), None);
         assert_eq!(cache.get("example.com", 8443), Some(rtt));
+    }
+
+    #[test]
+    fn cache_reuses_server_name_allocation_across_ports() {
+        let cache = ServerRttMemoryCache::default();
+        let rtt = Duration::from_millis(20);
+        cache.insert("example.com", 443, rtt);
+        cache.insert("example.com", 8443, rtt);
+
+        let mut state = cache.0.lock().unwrap();
+        let (lookup_name, first_key, second_key) = {
+            let (server_name, ports) = state.lookup.get_key_value("example.com").unwrap();
+            (Arc::clone(server_name), ports[&443], ports[&8443])
+        };
+        let first_name = Arc::clone(&state.lru.get_mut(first_key).server_name);
+        let second_name = Arc::clone(&state.lru.get_mut(second_key).server_name);
+
+        assert!(Arc::ptr_eq(&lookup_name, &first_name));
+        assert!(Arc::ptr_eq(&lookup_name, &second_name));
     }
 }
