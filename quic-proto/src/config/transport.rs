@@ -184,7 +184,7 @@ impl TransportConfig {
     /// Enable or disable the `initial_rtt` transport parameter.
     ///
     /// When enabled, clients cache measured RTTs for server endpoints and reuse them for subsequent
-    /// connections. This setting does not affect servers and is disabled by default.
+    /// connections. Servers process received hints regardless of this setting. Disabled by default.
     pub fn enable_initial_rtt(&mut self, enabled: bool) -> &mut Self {
         self.enable_initial_rtt = enabled;
         self

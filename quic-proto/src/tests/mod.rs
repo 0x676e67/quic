@@ -26,7 +26,7 @@ use tracing::info;
 
 use super::*;
 use crate::{
-    Duration, Instant,
+    Duration, Instant, ServerRttStore,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
@@ -44,6 +44,48 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
 // #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[derive(Default)]
+struct RecordingServerRttStore(Mutex<RecordingServerRttStoreState>);
+
+#[derive(Default)]
+struct RecordingServerRttStoreState {
+    value: Option<Duration>,
+    gets: Vec<(String, u16)>,
+    inserts: Vec<(String, u16, Duration)>,
+    removes: Vec<(String, u16)>,
+}
+
+impl RecordingServerRttStore {
+    fn with_rtt(rtt: Duration) -> Self {
+        Self(Mutex::new(RecordingServerRttStoreState {
+            value: Some(rtt),
+            ..Default::default()
+        }))
+    }
+}
+
+impl ServerRttStore for RecordingServerRttStore {
+    fn insert(&self, server_name: &str, server_port: u16, smoothed_rtt: Duration) {
+        let mut state = self.0.lock().unwrap();
+        state.value = Some(smoothed_rtt);
+        state
+            .inserts
+            .push((server_name.to_owned(), server_port, smoothed_rtt));
+    }
+
+    fn get(&self, server_name: &str, server_port: u16) -> Option<Duration> {
+        let mut state = self.0.lock().unwrap();
+        state.gets.push((server_name.to_owned(), server_port));
+        state.value
+    }
+
+    fn remove(&self, server_name: &str, server_port: u16) {
+        let mut state = self.0.lock().unwrap();
+        state.value = None;
+        state.removes.push((server_name.to_owned(), server_port));
+    }
+}
 
 #[test]
 fn version_negotiate_server() {
@@ -143,6 +185,94 @@ fn lifecycle() {
     assert_eq!(pair.client.known_cids(), 0);
     assert_eq!(pair.server.known_connections(), 0);
     assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn initial_rtt_store_is_not_used_when_disabled() {
+    let _guard = subscribe();
+    let store = Arc::new(RecordingServerRttStore::with_rtt(Duration::from_millis(20)));
+    let mut config = client_config();
+    config.server_rtt_store(store.clone());
+
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt::from_u32(0),
+        [][..].into(),
+    );
+    pair.drive();
+
+    let state = store.0.lock().unwrap();
+    assert!(state.gets.is_empty());
+    assert!(state.inserts.is_empty());
+    assert!(state.removes.is_empty());
+}
+
+#[test]
+fn initial_rtt_store_is_used_for_connection_lifecycle() {
+    let _guard = subscribe();
+    let cached_rtt = Duration::from_millis(20);
+    let store = Arc::new(RecordingServerRttStore::with_rtt(cached_rtt));
+    let mut transport = TransportConfig::default();
+    transport.enable_initial_rtt(true);
+    let mut config = client_config();
+    config
+        .transport_config(Arc::new(transport))
+        .server_rtt_store(store.clone());
+
+    let mut pair = Pair::default();
+    pair.latency = Duration::from_millis(1);
+    let server_port = pair.server.addr.port();
+    let client_ch = pair.begin_connect(config);
+
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.rtt, cached_rtt);
+    assert_eq!(
+        store.0.lock().unwrap().gets,
+        [("localhost".to_owned(), server_port)]
+    );
+
+    pair.drive();
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt::from_u32(0),
+        [][..].into(),
+    );
+    pair.drive();
+
+    let state = store.0.lock().unwrap();
+    assert_eq!(state.inserts.len(), 1);
+    assert_eq!(state.inserts[0].0, "localhost");
+    assert_eq!(state.inserts[0].1, server_port);
+    assert!(!state.inserts[0].2.is_zero());
+    assert!(state.removes.is_empty());
+}
+
+#[test]
+fn initial_rtt_store_removes_value_without_valid_rtt_sample() {
+    let _guard = subscribe();
+    let store = Arc::new(RecordingServerRttStore::with_rtt(Duration::from_millis(20)));
+    let mut transport = TransportConfig::default();
+    transport.enable_initial_rtt(true);
+    let mut config = client_config();
+    config
+        .transport_config(Arc::new(transport))
+        .server_rtt_store(store.clone());
+
+    let mut pair = Pair::default();
+    let server_port = pair.server.addr.port();
+    let client_ch = pair.begin_connect(config);
+    pair.drive();
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt::from_u32(0),
+        [][..].into(),
+    );
+    pair.drive();
+
+    let state = store.0.lock().unwrap();
+    assert!(state.inserts.is_empty());
+    assert_eq!(state.removes, [("localhost".to_owned(), server_port)]);
 }
 
 #[test]
