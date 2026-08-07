@@ -22,7 +22,7 @@ use crate::{
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
-    server_rtt::{ServerRttMemoryCache, ServerRttStore},
+    server_rtt::{ServerRttMemoryStore, ServerRttStore},
     shared::ConnectionId,
 };
 
@@ -585,7 +585,7 @@ impl ClientConfig {
             transport: Default::default(),
             crypto,
             token_store: Arc::new(TokenMemoryCache::default()),
-            server_rtt_store: Arc::new(ServerRttMemoryCache::default()),
+            server_rtt_store: Arc::new(ServerRttMemoryStore::default()),
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
