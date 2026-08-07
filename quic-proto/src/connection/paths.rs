@@ -62,6 +62,7 @@ impl PathData {
         generation: u64,
         now: Instant,
         config: &TransportConfig,
+        initial_rtt: Duration,
     ) -> Self {
         let congestion = config
             .congestion_controller_factory
@@ -69,10 +70,10 @@ impl PathData {
             .build(now, config.get_initial_mtu());
         Self {
             remote,
-            rtt: RttEstimator::new(config.initial_rtt),
+            rtt: RttEstimator::new(initial_rtt),
             sending_ecn: true,
             pacing: Pacer::new(
-                config.initial_rtt,
+                initial_rtt,
                 congestion.initial_window(),
                 config.get_initial_mtu(),
                 config.max_outgoing_bytes_per_second,
@@ -153,6 +154,22 @@ impl PathData {
             .clone()
             .build(now, config.get_initial_mtu());
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
+    }
+
+    pub(super) fn set_initial_rtt(&mut self, initial_rtt: Duration, now: Instant) {
+        if !self.rtt.set_initial_rtt(initial_rtt) {
+            return;
+        }
+
+        let window = self.congestion.window();
+        let mtu = self.current_mtu();
+        self.pacing = Pacer::new(
+            initial_rtt,
+            window,
+            mtu,
+            self.pacing.max_bytes_per_second(),
+            now,
+        );
     }
 
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
@@ -325,6 +342,19 @@ impl RttEstimator {
         self.smoothed.unwrap_or(self.latest)
     }
 
+    pub(crate) fn smoothed(&self) -> Option<Duration> {
+        self.smoothed
+    }
+
+    fn set_initial_rtt(&mut self, initial_rtt: Duration) -> bool {
+        if self.smoothed.is_some() {
+            return false;
+        }
+
+        *self = Self::new(initial_rtt);
+        true
+    }
+
     /// Conservative estimate of RTT
     ///
     /// Takes the maximum of smoothed and latest RTT, as recommended
@@ -362,6 +392,26 @@ impl RttEstimator {
             self.var = self.latest / 2;
             self.min = self.latest;
         }
+    }
+}
+
+#[cfg(test)]
+mod rtt_estimator_tests {
+    use super::*;
+
+    #[test]
+    fn initial_rtt_only_changes_before_first_sample() {
+        let mut rtt = RttEstimator::new(Duration::from_millis(333));
+
+        assert!(rtt.set_initial_rtt(Duration::from_millis(20)));
+        assert_eq!(rtt.get(), Duration::from_millis(20));
+        assert_eq!(rtt.var, Duration::from_millis(10));
+        assert_eq!(rtt.min, Duration::from_millis(20));
+
+        rtt.update(Duration::ZERO, Duration::from_millis(30));
+        assert!(!rtt.set_initial_rtt(Duration::from_millis(40)));
+        assert_eq!(rtt.get(), Duration::from_millis(30));
+        assert_eq!(rtt.min, Duration::from_millis(30));
     }
 }
 

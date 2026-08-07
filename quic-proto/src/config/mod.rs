@@ -22,6 +22,7 @@ use crate::{
     TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
+    server_rtt::{ServerRttMemoryStore, ServerRttStore},
     shared::ConnectionId,
 };
 
@@ -564,6 +565,12 @@ pub struct ClientConfig {
     /// Validation token store to use
     pub(crate) token_store: Arc<dyn TokenStore>,
 
+    /// Per-server-endpoint cache for the `initial_rtt` transport parameter (ID `0x3127`).
+    ///
+    /// A measured SRTT is cached when a client connection closes and reused by subsequent
+    /// connections to the same server endpoint.
+    pub(crate) server_rtt_store: Arc<dyn ServerRttStore>,
+
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
 
@@ -578,6 +585,7 @@ impl ClientConfig {
             transport: Default::default(),
             crypto,
             token_store: Arc::new(TokenMemoryCache::default()),
+            server_rtt_store: Arc::new(ServerRttMemoryStore::default()),
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
@@ -612,6 +620,14 @@ impl ClientConfig {
     /// Defaults to [`TokenMemoryCache`], which is suitable for most internet applications.
     pub fn token_store(&mut self, store: Arc<dyn TokenStore>) -> &mut Self {
         self.token_store = store;
+        self
+    }
+
+    /// Set the store used by the `initial_rtt` transport parameter.
+    ///
+    /// This does not enable the extension. Use [`TransportConfig::enable_initial_rtt`] to enable it.
+    pub fn server_rtt_store(&mut self, store: Arc<dyn ServerRttStore>) -> &mut Self {
+        self.server_rtt_store = store;
         self
     }
 
