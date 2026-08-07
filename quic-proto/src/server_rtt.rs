@@ -18,7 +18,7 @@ const MIN_INITIAL_RTT: Duration = Duration::from_millis(10);
 /// Maximum accepted value for an initial RTT.
 const MAX_INITIAL_RTT: Duration = Duration::from_secs(1);
 
-/// Cache for measured SRTTs used by subsequent client connections.
+/// Storage for measured SRTTs used by subsequent client connections.
 ///
 /// Methods are called synchronously while opening or closing connections. Implementations should
 /// avoid blocking and must not panic. Slow persistence should be queued for separate processing.
@@ -45,14 +45,14 @@ pub trait ServerRttStore: Send + Sync {
 /// Bounded in-memory [`ServerRttStore`].
 ///
 /// The default capacity is 500 server endpoints.
-/// A mutex is used because cache hits update LRU order, so lookups require exclusive access.
+/// A mutex is used because reads update LRU order, so lookups require exclusive access.
 #[derive(Debug)]
-pub struct ServerRttMemoryCache(Mutex<CacheState>);
+pub(crate) struct ServerRttMemoryStore(Mutex<State>);
 
-impl ServerRttMemoryCache {
-    /// Construct an empty cache for up to `max_server_endpoints` server endpoints.
-    pub fn new(max_server_endpoints: u32) -> Self {
-        Self(Mutex::new(CacheState {
+impl ServerRttMemoryStore {
+    /// Construct an empty store for up to `max_server_endpoints` server endpoints.
+    fn new(max_server_endpoints: u32) -> Self {
+        Self(Mutex::new(State {
             max_server_endpoints,
             lookup: HashMap::new(),
             lru: LruSlab::default(),
@@ -60,7 +60,7 @@ impl ServerRttMemoryCache {
     }
 }
 
-impl ServerRttStore for ServerRttMemoryCache {
+impl ServerRttStore for ServerRttMemoryStore {
     #[inline]
     fn insert(&self, server_name: &str, server_port: u16, smoothed_rtt: Duration) {
         self.0
@@ -86,18 +86,18 @@ impl ServerRttStore for ServerRttMemoryCache {
     }
 }
 
-impl Default for ServerRttMemoryCache {
+impl Default for ServerRttMemoryStore {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_SERVER_ENDPOINTS)
     }
 }
 
-/// Mutable state protected by [`ServerRttMemoryCache`]'s mutex.
+/// Mutable state protected by [`ServerRttMemoryStore`]'s mutex.
 ///
 /// Every endpoint in `lookup` points to a live entry in `lru`. Updates and removals must keep both
 /// collections in sync while the mutex is held.
 #[derive(Debug)]
-struct CacheState {
+struct State {
     max_server_endpoints: u32,
     // Maps a borrowed server name and port to the entry owned by `lru` without allocating on reads.
     lookup: HashMap<Arc<str>, HashMap<u16, u32>>,
@@ -105,7 +105,7 @@ struct CacheState {
     lru: LruSlab<CacheEntry>,
 }
 
-impl CacheState {
+impl State {
     /// Insert or replace an endpoint and mark it as most recently used.
     fn insert(&mut self, server_name: &str, server_port: u16, rtt: Duration) {
         // A zero-capacity cache is valid and never allocates storage.
@@ -225,55 +225,55 @@ mod tests {
     }
 
     #[test]
-    fn cache_keeps_latest_srtt_per_server_endpoint() {
-        let cache = ServerRttMemoryCache::default();
-        assert_eq!(cache.get("example.com", 443), None);
+    fn memory_store_keeps_latest_srtt_per_server_endpoint() {
+        let store = ServerRttMemoryStore::default();
+        assert_eq!(store.get("example.com", 443), None);
 
-        cache.insert("example.com", 443, Duration::from_millis(20));
-        cache.insert("example.com", 443, Duration::from_millis(30));
+        store.insert("example.com", 443, Duration::from_millis(20));
+        store.insert("example.com", 443, Duration::from_millis(30));
 
         assert_eq!(
-            cache.get("example.com", 443),
+            store.get("example.com", 443),
             Some(Duration::from_millis(30))
         );
-        assert_eq!(cache.get("example.com", 8443), None);
+        assert_eq!(store.get("example.com", 8443), None);
     }
 
     #[test]
-    fn cache_evicts_least_recently_used_endpoint() {
-        let cache = ServerRttMemoryCache::new(2);
+    fn memory_store_evicts_least_recently_used_endpoint() {
+        let store = ServerRttMemoryStore::new(2);
         let rtt = Duration::from_millis(20);
 
-        cache.insert("first.example", 443, rtt);
-        cache.insert("second.example", 443, rtt);
-        assert_eq!(cache.get("first.example", 443), Some(rtt));
+        store.insert("first.example", 443, rtt);
+        store.insert("second.example", 443, rtt);
+        assert_eq!(store.get("first.example", 443), Some(rtt));
 
-        cache.insert("third.example", 443, rtt);
+        store.insert("third.example", 443, rtt);
 
-        assert_eq!(cache.get("first.example", 443), Some(rtt));
-        assert_eq!(cache.get("second.example", 443), None);
-        assert_eq!(cache.get("third.example", 443), Some(rtt));
+        assert_eq!(store.get("first.example", 443), Some(rtt));
+        assert_eq!(store.get("second.example", 443), None);
+        assert_eq!(store.get("third.example", 443), Some(rtt));
     }
 
     #[test]
-    fn zero_capacity_cache_stays_empty() {
-        let cache = ServerRttMemoryCache::new(0);
-        cache.insert("example.com", 443, Duration::from_millis(20));
-        assert_eq!(cache.get("example.com", 443), None);
+    fn zero_capacity_memory_store_stays_empty() {
+        let store = ServerRttMemoryStore::new(0);
+        store.insert("example.com", 443, Duration::from_millis(20));
+        assert_eq!(store.get("example.com", 443), None);
     }
 
     #[test]
-    fn cache_removes_only_the_selected_endpoint() {
-        let cache = ServerRttMemoryCache::default();
+    fn memory_store_removes_only_the_selected_endpoint() {
+        let store = ServerRttMemoryStore::default();
         let rtt = Duration::from_millis(20);
-        cache.insert("example.com", 443, rtt);
-        cache.insert("example.com", 8443, rtt);
+        store.insert("example.com", 443, rtt);
+        store.insert("example.com", 8443, rtt);
 
-        cache.remove("example.com", 443);
-        cache.remove("example.com", 443);
+        store.remove("example.com", 443);
+        store.remove("example.com", 443);
 
-        assert_eq!(cache.get("example.com", 443), None);
-        assert_eq!(cache.get("example.com", 8443), Some(rtt));
+        assert_eq!(store.get("example.com", 443), None);
+        assert_eq!(store.get("example.com", 8443), Some(rtt));
     }
 
     #[test]
