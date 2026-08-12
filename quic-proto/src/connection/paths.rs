@@ -156,6 +156,7 @@ impl PathData {
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
     }
 
+    /// Replace the initial RTT before the first sample and rebuild the pacer with the new estimate.
     pub(super) fn set_initial_rtt(&mut self, initial_rtt: Duration, now: Instant) {
         if !self.rtt.set_initial_rtt(initial_rtt) {
             return;
@@ -342,10 +343,12 @@ impl RttEstimator {
         self.smoothed.unwrap_or(self.latest)
     }
 
+    /// Return the measured SRTT, or `None` before the first RTT sample.
     pub(crate) fn smoothed(&self) -> Option<Duration> {
         self.smoothed
     }
 
+    /// Replace the initial estimate unless an RTT sample has already been recorded.
     fn set_initial_rtt(&mut self, initial_rtt: Duration) -> bool {
         if self.smoothed.is_some() {
             return false;
