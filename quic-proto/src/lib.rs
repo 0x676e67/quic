@@ -102,6 +102,9 @@ pub use token::{NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenSt
 mod token_memory_cache;
 pub use token_memory_cache::TokenMemoryCache;
 
+mod server_rtt;
+pub use server_rtt::ServerRttStore;
+
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
 
