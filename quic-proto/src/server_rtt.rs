@@ -20,8 +20,17 @@ const MAX_INITIAL_RTT: Duration = Duration::from_secs(1);
 
 /// Storage for measured SRTTs used by subsequent client connections.
 ///
-/// Methods are called synchronously while opening or closing connections. Implementations should
-/// avoid blocking and must not panic. Slow persistence should be queued for separate processing.
+/// These methods run synchronously on connection lifecycle paths: [`ServerRttStore::get`] is
+/// called when opening a client connection, while [`ServerRttStore::insert`] and
+/// [`ServerRttStore::remove_if_eq`] are called when it closes. They are not called for individual
+/// application requests or when an existing connection is reused.
+///
+/// Implementations must return promptly, must not panic, and should not perform blocking file,
+/// database, or network I/O. A persistent implementation should keep an in-memory front cache and
+/// send durable updates through a bounded, non-blocking queue to another execution context. The
+/// background writer should preserve per-endpoint ordering or coalesce updates so an older write
+/// cannot replace a newer RTT. Data needed by [`ServerRttStore::get`] should be loaded before the
+/// store is installed; returning `None` is preferable to blocking while data is loaded.
 pub trait ServerRttStore: Send + Sync {
     /// Store the latest measured SRTT for a server endpoint.
     ///
