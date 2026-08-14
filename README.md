@@ -20,14 +20,14 @@ More information about this crate can be found in the [crate documentation](http
 
 ## Usage
 
-Add `quic` to your `Cargo.toml`:
+To use `quic`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 quic = "0.11"
 ```
 
-Then import the types needed to create an endpoint:
+Next, add this to your crate:
 
 ```rust
 use quic::{ClientConfig, Endpoint};
@@ -36,8 +36,6 @@ fn main() {
     // ...
 }
 ```
-
-See the [examples] for complete client and server implementations.
 
 ## License
 
