@@ -355,14 +355,12 @@ impl Endpoint {
         );
 
         let enable_initial_rtt = config.transport.enable_initial_rtt;
-        let cached_initial_rtt = if enable_initial_rtt {
-            config
-                .server_rtt_store
-                .get(server_name, remote.port())
-                .and_then(server_rtt::encode)
+        let cached_server_rtt = if enable_initial_rtt {
+            config.server_rtt_store.get(server_name, remote.port())
         } else {
             None
         };
+        let cached_initial_rtt = cached_server_rtt.and_then(server_rtt::encode);
         params.initial_rtt_tp = cached_initial_rtt.map(|(_, value)| value);
 
         let tls = config
@@ -387,6 +385,7 @@ impl Endpoint {
                 server_name: server_name.into(),
                 server_port: remote.port(),
                 initial_rtt: cached_initial_rtt.map(|(rtt, _)| rtt),
+                cached_server_rtt,
                 server_rtt_store: enable_initial_rtt.then_some(config.server_rtt_store),
             },
         );
