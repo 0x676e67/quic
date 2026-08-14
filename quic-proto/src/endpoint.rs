@@ -30,6 +30,7 @@ use crate::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
         PacketNumber, PartialDecode, ProtectedInitialHeader,
     },
+    server_rtt,
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner, IssuedCid,
@@ -344,7 +345,7 @@ impl Endpoint {
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);
-        let params = TransportParameters::new(
+        let mut params = TransportParameters::new(
             &config.transport,
             &self.config,
             self.local_cid_generator.as_ref(),
@@ -352,6 +353,18 @@ impl Endpoint {
             None,
             &mut self.rng,
         );
+
+        let enable_initial_rtt = config.transport.enable_initial_rtt;
+        let cached_initial_rtt = if enable_initial_rtt {
+            config
+                .server_rtt_store
+                .get(server_name, remote.port())
+                .and_then(server_rtt::encode)
+        } else {
+            None
+        };
+        params.initial_rtt_tp = cached_initial_rtt.map(|(_, value)| value);
+
         let tls = config
             .crypto
             .start_session(config.version, server_name, &params)?;
@@ -372,6 +385,9 @@ impl Endpoint {
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
+                server_port: remote.port(),
+                initial_rtt: cached_initial_rtt.map(|(rtt, _)| rtt),
+                server_rtt_store: enable_initial_rtt.then_some(config.server_rtt_store),
             },
         );
         Ok((ch, conn))
