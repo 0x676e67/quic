@@ -10,9 +10,9 @@ More information about this crate can be found in the [crate documentation](http
 
 ## Features
 
-- QUIC version 1 ([RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)), secured with TLS ([RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)).
+- QUIC version 1 per [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html), secured with TLS per [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html).
 - Loss detection and congestion control based on [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html).
-- Ordered and unordered streams, plus unreliable datagrams ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
+- Ordered and unordered streams, plus unreliable datagrams per [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html).
 - 0-RTT data for resumed connections.
 - Connection migration and path MTU discovery based on [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html).
 - Async APIs for Linux, macOS and Windows; pluggable cryptography with [rustls][rustls] and [*ring*][ring].
