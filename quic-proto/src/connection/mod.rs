@@ -3505,6 +3505,7 @@ impl Connection {
             server_rtt_store: Some(server_rtt_store),
             server_name,
             server_port,
+            cached_server_rtt,
             ..
         } = &self.side
         {
@@ -3518,8 +3519,10 @@ impl Connection {
             // synthetic zero-duration samples do not alter Quinn's RTT estimator.
             if let Some(rtt) = rtt {
                 server_rtt_store.insert(server_name, *server_port, rtt);
-            } else {
-                server_rtt_store.remove(server_name, *server_port);
+            } else if let Some(cached_server_rtt) = cached_server_rtt {
+                // Only invalidate an unchanged value. A different sample written by a concurrent
+                // connection is preserved.
+                server_rtt_store.remove_if_eq(server_name, *server_port, *cached_server_rtt);
             }
         }
     }
@@ -3868,6 +3871,8 @@ enum ConnectionSide {
         server_name: String,
         server_port: u16,
         server_rtt_store: Option<Arc<dyn ServerRttStore>>,
+        /// Exact value returned by the store when this connection was opened.
+        cached_server_rtt: Option<Duration>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3906,6 +3911,7 @@ impl From<SideArgs> for ConnectionSide {
                 server_name,
                 server_port,
                 initial_rtt: _,
+                cached_server_rtt,
                 server_rtt_store,
             } => Self::Client {
                 token: token_store.take(&server_name).unwrap_or_default(),
@@ -3913,6 +3919,7 @@ impl From<SideArgs> for ConnectionSide {
                 server_name,
                 server_port,
                 server_rtt_store,
+                cached_server_rtt,
             },
             SideArgs::Server {
                 server_config,
@@ -3930,6 +3937,7 @@ pub(crate) enum SideArgs {
         server_name: String,
         server_port: u16,
         initial_rtt: Option<Duration>,
+        cached_server_rtt: Option<Duration>,
         server_rtt_store: Option<Arc<dyn ServerRttStore>>,
     },
     Server {

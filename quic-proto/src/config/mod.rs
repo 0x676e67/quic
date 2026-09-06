@@ -565,9 +565,9 @@ pub struct ClientConfig {
     /// Validation token store to use
     pub(crate) token_store: Arc<dyn TokenStore>,
 
-    /// Per-server-endpoint cache for the `initial_rtt` transport parameter (ID `0x3127`).
+    /// Per-server-endpoint store for the `initial_rtt` transport parameter (ID `0x3127`).
     ///
-    /// A measured SRTT is cached when a client connection closes and reused by subsequent
+    /// A measured SRTT is stored when a client connection closes and reused by subsequent
     /// connections to the same server endpoint.
     pub(crate) server_rtt_store: Arc<dyn ServerRttStore>,
 

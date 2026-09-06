@@ -53,7 +53,7 @@ struct RecordingServerRttStoreState {
     value: Option<Duration>,
     gets: Vec<(String, u16)>,
     inserts: Vec<(String, u16, Duration)>,
-    removes: Vec<(String, u16)>,
+    removes: Vec<(String, u16, Duration)>,
 }
 
 impl RecordingServerRttStore {
@@ -80,10 +80,14 @@ impl ServerRttStore for RecordingServerRttStore {
         state.value
     }
 
-    fn remove(&self, server_name: &str, server_port: u16) {
+    fn remove_if_eq(&self, server_name: &str, server_port: u16, expected_rtt: Duration) {
         let mut state = self.0.lock().unwrap();
-        state.value = None;
-        state.removes.push((server_name.to_owned(), server_port));
+        state
+            .removes
+            .push((server_name.to_owned(), server_port, expected_rtt));
+        if state.value == Some(expected_rtt) {
+            state.value = None;
+        }
     }
 }
 
@@ -249,9 +253,10 @@ fn initial_rtt_store_is_used_for_connection_lifecycle() {
 }
 
 #[test]
-fn initial_rtt_store_removes_value_without_valid_rtt_sample() {
+fn initial_rtt_store_removes_matching_value_without_valid_rtt_sample() {
     let _guard = subscribe();
-    let store = Arc::new(RecordingServerRttStore::with_rtt(Duration::from_millis(20)));
+    let cached_rtt = Duration::from_millis(20);
+    let store = Arc::new(RecordingServerRttStore::with_rtt(cached_rtt));
     let mut transport = TransportConfig::default();
     transport.enable_initial_rtt(true);
     let mut config = client_config();
@@ -272,7 +277,38 @@ fn initial_rtt_store_removes_value_without_valid_rtt_sample() {
 
     let state = store.0.lock().unwrap();
     assert!(state.inserts.is_empty());
-    assert_eq!(state.removes, [("localhost".to_owned(), server_port)]);
+    assert_eq!(
+        state.removes,
+        [("localhost".to_owned(), server_port, cached_rtt)]
+    );
+}
+
+#[test]
+fn initial_rtt_store_is_not_modified_after_cache_miss() {
+    let _guard = subscribe();
+    let store = Arc::new(RecordingServerRttStore::default());
+    let mut transport = TransportConfig::default();
+    transport.enable_initial_rtt(true);
+    let mut config = client_config();
+    config
+        .transport_config(Arc::new(transport))
+        .server_rtt_store(store.clone());
+
+    let mut pair = Pair::default();
+    let server_port = pair.server.addr.port();
+    let client_ch = pair.begin_connect(config);
+    pair.drive();
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt::from_u32(0),
+        [][..].into(),
+    );
+    pair.drive();
+
+    let state = store.0.lock().unwrap();
+    assert_eq!(state.gets, [("localhost".to_owned(), server_port)]);
+    assert!(state.inserts.is_empty());
+    assert!(state.removes.is_empty());
 }
 
 #[test]
