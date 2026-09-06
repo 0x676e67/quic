@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::sync::{
     Notify,
     futures::{Notified, OwnedNotified},
-    mpsc, oneshot,
+    mpsc, oneshot, watch,
 };
 use tracing::{Instrument, Span, debug_span};
 
@@ -69,7 +69,7 @@ impl Connecting {
         }));
         let connected = Box::pin(conn.shared.connected.clone().notified_owned());
 
-        let driver = ConnectionDriver(conn.clone());
+        let driver = ConnectionDriver::new(conn.clone());
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -232,19 +232,31 @@ impl Future for Connecting {
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
-struct ConnectionDriver(ConnectionRef);
+struct ConnectionDriver {
+    conn: ConnectionRef,
+    span: Span,
+}
+
+impl ConnectionDriver {
+    fn new(conn: ConnectionRef) -> Self {
+        let span = {
+            let conn = &mut conn.state.lock("poll");
+            debug_span!("drive", id = conn.handle.0)
+        };
+
+        Self { conn, span }
+    }
+}
 
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let conn = &mut *self.0.state.lock("poll");
+        let conn = &mut *self.conn.state.lock("poll");
+        let _guard = self.span.enter();
 
-        let span = debug_span!("drive", id = conn.handle.0);
-        let _guard = span.enter();
-
-        if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
+        if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+            conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
         let mut keep_going = conn.drive_transmit(cx)?;
@@ -252,7 +264,7 @@ impl Future for ConnectionDriver {
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
-        conn.forward_app_events(&self.0.shared);
+        conn.forward_app_events(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -559,6 +571,21 @@ impl Connection {
         self.0.state.lock("remote_address").inner.remote_address()
     }
 
+    /// Watch the peer's UDP address.
+    ///
+    /// If `ServerConfig::migration` is `true`, clients may change addresses at will, e.g. when
+    /// switching to a cellular internet connection.
+    pub fn watch_remote_address(&self) -> RemoteAddressWatcher {
+        let receiver = self
+            .0
+            .state
+            .lock("watch_remote_address")
+            .remote_address
+            .subscribe();
+
+        RemoteAddressWatcher { receiver }
+    }
+
     /// The local IP address which was used when the peer established
     /// the connection
     ///
@@ -575,6 +602,11 @@ impl Connection {
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self) -> Duration {
         self.0.state.lock("rtt").inner.rtt()
+    }
+
+    /// Minimum RTT seen on this path, ignoring ack delay
+    pub fn min_rtt(&self) -> Duration {
+        self.0.state.lock("min_rtt").inner.min_rtt()
     }
 
     /// Returns connection statistics
@@ -944,6 +976,25 @@ impl Future for SendDatagram<'_> {
     }
 }
 
+/// Watcher produced by [`Connection::watch_remote_address`]
+pub struct RemoteAddressWatcher {
+    receiver: watch::Receiver<SocketAddr>,
+}
+
+impl RemoteAddressWatcher {
+    /// Wait for an address change, mark it as seen and return the address.
+    ///
+    /// If multiple migrations occur between calls to `wait` or polls of the resulting future,
+    /// the last observed address will be returned, skipping intermediate updates.
+    pub async fn wait(&mut self) -> Option<SocketAddr> {
+        if self.receiver.changed().await.is_err() {
+            return None;
+        }
+
+        Some(*self.receiver.borrow())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ConnectionRef(Arc<ConnectionInner>);
 
@@ -1028,6 +1079,7 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    remote_address: watch::Sender<SocketAddr>,
 }
 
 impl State {
@@ -1041,6 +1093,8 @@ impl State {
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let remote_address = inner.remote_address();
+
         Self {
             inner,
             driver: None,
@@ -1060,6 +1114,7 @@ impl State {
             runtime,
             send_buffer: Vec::new(),
             buffered_transmit: None,
+            remote_address: watch::Sender::new(remote_address),
         }
     }
 
@@ -1209,6 +1264,14 @@ impl State {
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
                 }
+                PathUpdated => {
+                    // Using `send_replace` since `send` does not update the value
+                    // when there are no subscribed receivers.
+                    let _ = self
+                        .remote_address
+                        .send_replace(self.inner.remote_address());
+                }
+                _ => {}
             }
         }
     }
