@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "quic"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "async-io",
@@ -1871,12 +1871,12 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "web-time",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "quic-proto"
-version = "0.11.16"
+version = "0.12.0"
 dependencies = [
  "arbitrary",
  "assert_matches",
