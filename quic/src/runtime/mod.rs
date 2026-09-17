@@ -215,7 +215,7 @@ fn log_sendmsg_error(
 ) {
     #[cfg(unix)]
     // Unix `EMSGSIZE` is expected for MTU probes.
-    if udp::is_msg_size_err(error) {
+    if error.raw_os_error() == Some(libc::EMSGSIZE) {
         return;
     }
 
@@ -309,6 +309,33 @@ mod tests {
 
         assert!(matches!(result, Poll::Ready(Ok(()))));
         assert!(sender.last_send_error.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtu_probe_error_does_not_throttle_other_send_errors() {
+        let transmit = Transmit {
+            destination: SocketAddr::from(([127, 0, 0, 1], 4433)),
+            ecn: None,
+            contents: &[],
+            segment_size: None,
+            src_ip: None,
+        };
+        let mut last_send_error = None;
+
+        log_sendmsg_error(
+            &mut last_send_error,
+            &io::Error::from_raw_os_error(libc::EMSGSIZE),
+            &transmit,
+        );
+        assert!(last_send_error.is_none());
+
+        log_sendmsg_error(
+            &mut last_send_error,
+            &io::ErrorKind::PermissionDenied.into(),
+            &transmit,
+        );
+        assert!(last_send_error.is_some());
     }
 
     #[derive(Debug)]
