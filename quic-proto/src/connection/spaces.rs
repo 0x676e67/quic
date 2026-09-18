@@ -370,7 +370,7 @@ impl Retransmits {
 
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         !self.max_data
-            && !(self.data_blocked && streams.can_send_data_blocked())
+            && (!self.data_blocked || !streams.can_send_data_blocked())
             && !self.max_stream_id.into_iter().any(|x| x)
             && !self.streams_blocked.into_iter().any(|x| x)
             && self.reset_stream.is_empty()

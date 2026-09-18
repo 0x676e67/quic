@@ -3632,10 +3632,10 @@ impl Connection {
                 "server sent initial_rtt",
             ));
         }
-        if self.side.is_server() {
-            if let Some(initial_rtt) = params.initial_rtt_tp.and_then(server_rtt::decode) {
-                self.path.set_initial_rtt(initial_rtt, now);
-            }
+        if self.side.is_server()
+            && let Some(initial_rtt) = params.initial_rtt_tp.and_then(server_rtt::decode)
+        {
+            self.path.set_initial_rtt(initial_rtt, now);
         }
 
         self.set_peer_params(params);
