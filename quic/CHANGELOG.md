@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/0x676e67/quic/compare/quic-v0.12.1...quic-v0.12.2) - 2026-09-18
+
+### Other
+
+- release v0.12.1 ([#39](https://github.com/0x676e67/quic/pull/39))
+
 ## [0.12.1](https://github.com/0x676e67/quic/compare/quic-v0.12.0...quic-v0.12.1) - 2026-09-18
 
 ### Other
