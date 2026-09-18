@@ -13,17 +13,17 @@ use std::{
 };
 
 use bytes::{Buf, BufMut};
-use rand::{seq::SliceRandom as _, Rng, RngExt};
+use rand::{Rng, RngExt, seq::SliceRandom as _};
 use thiserror::Error;
 
 use crate::{
+    LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
+    TIMER_GRANULARITY, TransportError, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::{BufExt, BufMutExt, UnexpectedEnd},
     config::{EndpointConfig, ServerConfig, TransportConfig},
     shared::ConnectionId,
-    ResetToken, Side, TransportError, VarInt, LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    RESET_TOKEN_SIZE, TIMER_GRANULARITY,
 };
 
 /// A single entry in a user-specified transport parameter list.
@@ -1326,17 +1326,23 @@ mod test {
 
         // Order is shuffled per-connection; assert the set, not the sequence.
         assert_eq!(entries.len(), 4);
-        assert!(entries
-            .iter()
-            .any(|e| matches!(e, WriteEntry::Known(TransportParameterId::InitialMaxData))));
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, WriteEntry::Known(TransportParameterId::InitialMaxData)))
+        );
         assert!(entries.iter().any(|e| matches!(e, WriteEntry::Grease(_))));
-        assert!(entries
-            .iter()
-            .any(|e| matches!(e, WriteEntry::Known(TransportParameterId::MaxIdleTimeout))));
-        assert!(entries
-            .iter()
-            .any(|e| matches!(e, WriteEntry::Custom { id, value }
-            if *id == 0x3127 && value == &[0xAB, 0xCD])));
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, WriteEntry::Known(TransportParameterId::MaxIdleTimeout)))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, WriteEntry::Custom { id, value }
+            if *id == 0x3127 && value == &[0xAB, 0xCD]))
+        );
     }
 
     #[test]

@@ -247,7 +247,7 @@ mod json {
     use crate::stats;
     use crate::stats::{Stats, StreamIntervalStats};
     use quic::StreamId;
-    use serde::{self, ser::SerializeStruct, Serialize, Serializer};
+    use serde::{self, Serialize, Serializer, ser::SerializeStruct};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 

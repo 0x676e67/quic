@@ -10,16 +10,16 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quic::{crypto::rustls::QuicClientConfig, TokioRuntime};
+use quic::{TokioRuntime, crypto::rustls::QuicClientConfig};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use crate::{
+    CommonOpt, PERF_CIPHER_SUITES,
     noprotection::NoProtectionClientConfig,
     parse_byte_size,
     stats::{OpenStreamStats, Stats},
-    CommonOpt, PERF_CIPHER_SUITES,
 };
 
 /// Connects to a QUIC perf server and maintains a specified pattern of requests until interrupted
