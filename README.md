@@ -24,7 +24,7 @@ To use `quic`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-quic = "0.11"
+quic = "0.12"
 ```
 
 Next, add this to your crate:
