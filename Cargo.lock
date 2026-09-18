@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "quic"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-io",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "quic-proto"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arbitrary",
  "assert_matches",
