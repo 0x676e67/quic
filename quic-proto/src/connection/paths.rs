@@ -537,7 +537,7 @@ mod tests {
         let now = Instant::now();
         let config = TransportConfig::default();
         let remote = "203.0.113.1:4433".parse().unwrap();
-        let mut path = PathData::new(remote, true, None, 0, now, &config);
+        let mut path = PathData::new(remote, true, None, 0, now, &config, config.initial_rtt);
         let mtu = path.current_mtu();
         let window = path.congestion.window();
 
