@@ -10,6 +10,8 @@ jobs:
     name: Release-plz release
     runs-on: ubuntu-latest
     if: ${{ github.repository == '0x676e67/quic' }}
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
     permissions:
       contents: write
       id-token: write
@@ -25,7 +27,17 @@ jobs:
       - &install-rust
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      # A crates.io publish cannot be undone, and `release-plz release` uploads
+      # the workspace one crate at a time. A manifest error found partway
+      # through leaves the earlier crate published at the new version and the
+      # other behind, which can only be resolved by burning another version.
+      # Package both publishable crates first so that class of error fails the
+      # job before anything is uploaded. Sibling versions resolve from the
+      # workspace here, so this works even though neither is published yet.
+      - name: Verify publishable crates
+        run: cargo package -p quic -p quic-proto --no-verify --locked
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release
@@ -34,8 +46,19 @@ jobs:
 
   release-plz-pr:
     name: Release-plz PR
+    # Serialised behind the release job. Run in parallel, this job can open the
+    # version bump and changelog pull request while the release job is already
+    # publishing, so a release gets built from a commit whose changelog entry
+    # has not landed yet. Skipped entirely when the release job published
+    # something: the next push to main opens the pull request.
+    needs: release-plz-release
     runs-on: ubuntu-latest
-    if: ${{ github.repository == '0x676e67/quic' }}
+    if: >-
+      ${{
+        github.repository == '0x676e67/quic' &&
+        needs.release-plz-release.result == 'success' &&
+        needs.release-plz-release.outputs.releases_created == 'false'
+      }}
     permissions:
       pull-requests: write
       contents: write
