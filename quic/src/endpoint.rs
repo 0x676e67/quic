@@ -99,10 +99,10 @@ impl Endpoint {
     ))]
     pub fn client(addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                tracing::debug!(%e, "unable to make socket dual-stack");
-            }
+        if addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            tracing::debug!(%e, "unable to make socket dual-stack");
         }
         socket.bind(&addr.into())?;
         let runtime =
@@ -141,10 +141,10 @@ impl Endpoint {
     ))]
     pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                tracing::debug!(%e, "unable to make socket dual-stack");
-            }
+        if addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            tracing::debug!(%e, "unable to make socket dual-stack");
         }
         socket.bind(&addr.into())?;
         let runtime =
@@ -295,6 +295,7 @@ impl Endpoint {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        inner.sender = inner.socket.create_sender();
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
@@ -409,8 +410,9 @@ impl Future for EndpointDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut endpoint = self.0.state.lock().unwrap();
-        if endpoint.driver.is_none() {
-            endpoint.driver = Some(cx.waker().clone());
+        match endpoint.driver.as_mut() {
+            Some(old_waker) => old_waker.clone_from(cx.waker()),
+            None => endpoint.driver = Some(cx.waker().clone()),
         }
 
         let now = endpoint.runtime.now();
@@ -693,9 +695,9 @@ impl ConnectionSet {
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
-        if let Some((error_code, ref reason)) = self.close {
+        if let Some((error_code, reason)) = &self.close {
             send.send(ConnectionEvent::Close {
-                error_code,
+                error_code: *error_code,
                 reason: reason.clone(),
             })
             .unwrap();
@@ -941,14 +943,14 @@ impl RecvState {
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
                     continue;
                 }
                 // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
                 // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
                 // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
                 // it anyways.
-                Poll::Ready(Err(ref e)) if is_msg_size_err(e) => {
+                Poll::Ready(Err(e)) if is_msg_size_err(&e) => {
                     continue;
                 }
                 Poll::Ready(Err(e)) => {

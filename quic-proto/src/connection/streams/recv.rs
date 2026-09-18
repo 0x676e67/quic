@@ -57,21 +57,22 @@ impl Recv {
             ));
         }
 
-        if let Some(final_offset) = self.final_offset() {
-            if end > final_offset || (frame.fin && end != final_offset) {
-                debug!(end, final_offset, "final size error");
-                return Err(TransportError::FINAL_SIZE_ERROR(""));
-            }
+        if let Some(final_offset) = self.final_offset()
+            && (end > final_offset || (frame.fin && end != final_offset))
+        {
+            debug!(end, final_offset, "final size error");
+            return Err(TransportError::FINAL_SIZE_ERROR(""));
         }
 
         let new_bytes = self.credit_consumed_by(end, received, max_data)?;
 
         // Stopped streams don't need to wait for the actual data, they just need to know
         // how much there was.
-        if frame.fin && !self.stopped {
-            if let RecvState::Recv { ref mut size } = self.state {
-                *size = Some(end);
-            }
+        if frame.fin
+            && !self.stopped
+            && let RecvState::Recv { size } = &mut self.state
+        {
+            *size = Some(end);
         }
 
         self.end = self.end.max(end);
@@ -286,10 +287,10 @@ impl<'a> Chunks<'a> {
     ///
     /// Should call finalize() when done calling this.
     pub fn next(&mut self, max_length: usize) -> Result<Option<Chunk>, ReadError> {
-        let rs = match self.state {
-            ChunksState::Readable(ref mut rs) => rs,
+        let rs = match &mut self.state {
+            ChunksState::Readable(rs) => rs,
             ChunksState::Reset(error_code) => {
-                return Err(ReadError::Reset(error_code));
+                return Err(ReadError::Reset(*error_code));
             }
             ChunksState::Finished => {
                 return Ok(None);

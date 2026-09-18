@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto,
-    mem,
+    iter, mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
@@ -90,6 +90,71 @@ impl ServerRttStore for RecordingServerRttStore {
             state.value = None;
         }
     }
+}
+
+#[test]
+fn pending_incoming_survives_server_config_change() {
+    let _guard = subscribe();
+    let replacement = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+        "replacement-only".into(),
+    ])));
+    for replacement in [None, Some(Arc::new(replacement))] {
+        let mut pair = Pair::default();
+        let client_ch = pair.begin_connect(client_config());
+        pair.drive_client();
+        let (received, ecn, data) = pair.server.inbound.pop_front().unwrap();
+        let mut response = Vec::new();
+        let Some(DatagramEvent::NewConnection(incoming)) = pair.server.handle(
+            received,
+            pair.client.addr,
+            None,
+            ecn,
+            data.clone(),
+            &mut response,
+        ) else {
+            panic!("expected an incoming connection");
+        };
+
+        pair.server.set_server_config(replacement);
+        // Retransmitted Initials must still be buffered after the configuration changes.
+        assert!(
+            pair.server
+                .handle(received, pair.client.addr, None, ecn, data, &mut response)
+                .is_none()
+        );
+        let server_ch = pair.server.try_accept(incoming, pair.time).unwrap();
+        pair.drive();
+        for (endpoint, ch) in [(&mut pair.client, client_ch), (&mut pair.server, server_ch)] {
+            let conn = endpoint.connections.get_mut(&ch).unwrap();
+            assert!(iter::from_fn(|| conn.poll()).any(|event| matches!(event, Event::Connected)));
+        }
+    }
+}
+
+#[test]
+fn pending_incoming_can_retry_after_disabling_server() {
+    let _guard = subscribe();
+    let config = server_config();
+    let mut pair = Pair::new(Default::default(), config.clone());
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.server.drive_incoming(pair.time, pair.client.addr);
+    let incoming = pair.server.waiting_incoming.pop().unwrap();
+
+    pair.server.set_server_config(None);
+    pair.server.retry(incoming);
+    pair.server.set_server_config(Some(Arc::new(config)));
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        IncomingConnectionBehavior::Accept
+    });
+    pair.drive();
+    pair.server.assert_accept();
+    assert!(
+        iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
+            .any(|event| matches!(event, Event::Connected))
+    );
 }
 
 #[test]
@@ -185,7 +250,7 @@ fn lifecycle() {
     pair.drive();
     assert_matches!(pair.server_conn_mut(server_ch).poll(),
                     Some(Event::ConnectionLost { reason: ConnectionError::ApplicationClosed(
-                        ApplicationClose { error_code: VarInt(42), ref reason }
+                        ApplicationClose { error_code: VarInt(42), reason }
                     )}) if reason == REASON);
     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
     assert_eq!(pair.client.known_connections(), 0);
@@ -409,7 +474,7 @@ fn draft_version_compat() {
     pair.drive();
     assert_matches!(pair.server_conn_mut(server_ch).poll(),
                     Some(Event::ConnectionLost { reason: ConnectionError::ApplicationClosed(
-                        ApplicationClose { error_code: VarInt(42), ref reason }
+                        ApplicationClose { error_code: VarInt(42), reason }
                     )}) if reason == REASON);
     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
     assert_eq!(pair.client.known_connections(), 0);
@@ -672,7 +737,7 @@ fn reject_self_signed_server_cert() {
     pair.drive();
 
     assert_matches!(pair.client_conn_mut(client_ch).poll(),
-                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error)})
+                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(error)})
                     if error.code == TransportErrorCode::crypto(AlertDescription::UnknownCA.into()));
 }
 
@@ -720,7 +785,7 @@ fn reject_missing_client_cert() {
         Some(Event::Connected)
     );
     assert_matches!(pair.client_conn_mut(client_ch).poll(),
-                    Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(ref close)})
+                    Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(close)})
                     if close.error_code == TransportErrorCode::crypto(AlertDescription::CertificateRequired.into()));
 
     // The server never completes the connection
@@ -730,7 +795,7 @@ fn reject_missing_client_cert() {
         Some(Event::HandshakeDataReady)
     );
     assert_matches!(pair.server_conn_mut(server_ch).poll(),
-                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error)})
+                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(error)})
                     if error.code == TransportErrorCode::crypto(AlertDescription::CertificateRequired.into()));
 }
 
@@ -926,6 +991,8 @@ fn zero_rtt_rejection() {
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_conn_mut(client_ch)
+        .set_send_window(MSG.len() as u64);
     pair.client_send(client_ch, s).write(MSG).unwrap();
     pair.drive();
     assert!(!pair.client_conn_mut(client_ch).accepted_0rtt());
@@ -951,6 +1018,19 @@ fn zero_rtt_rejection() {
     assert_eq!(chunks.next(usize::MAX), Err(ReadError::Blocked));
     let _ = chunks.finalize();
     assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+
+    // Rejecting early data must release the entire send window for 1-RTT traffic.
+    assert_eq!(
+        pair.client_send(client_ch, s2).write(MSG).unwrap(),
+        MSG.len()
+    );
+    pair.client_send(client_ch, s2).finish().unwrap();
+    pair.drive();
+    let mut recv = pair.server_recv(server_ch, s2);
+    let mut chunks = recv.read(false).unwrap();
+    assert_eq!(chunks.next(usize::MAX).unwrap().unwrap().bytes, MSG);
+    assert_eq!(chunks.next(usize::MAX).unwrap(), None);
+    let _ = chunks.finalize();
 }
 
 fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: F) {
@@ -1332,6 +1412,326 @@ fn streams_blocked_not_sent_under_limit() {
 }
 
 #[test]
+fn data_blocked() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    // Fill the connection-level window, then run into the limit
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        1
+    );
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .data_blocked,
+        1
+    );
+
+    // Being refused again at the same limit does not repeat the frame
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        1
+    );
+
+    // Running into the raised limit is reported again
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
+    let _ = chunks.finalize();
+    pair.drive();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.data_blocked, 2);
+    assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+}
+
+#[test]
+fn stream_data_blocked() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            stream_receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    // Fill the stream-level window, then run into the limit
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .stream_data_blocked,
+        1
+    );
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .stream_data_blocked,
+        1
+    );
+
+    // Being refused again at the same limit does not repeat the frame
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .stream_data_blocked,
+        1
+    );
+
+    // Running into the raised limit is reported again
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
+    let _ = chunks.finalize();
+    pair.drive();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.stream_data_blocked, 2);
+    assert_eq!(stats.frame_tx.data_blocked, 0);
+}
+
+#[test]
+fn data_blocked_not_sent_under_limit() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _server_ch) = pair.connect();
+
+    // Default windows are far larger than this write, so nothing is blocked
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"hi").unwrap();
+    pair.drive();
+
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.data_blocked, 0);
+    assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+}
+
+#[test]
+fn data_blocked_not_sent_for_local_send_window() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _server_ch) = pair.connect();
+
+    // Running out of our own send window is not the peer's flow control limit
+    pair.client_conn_mut(client_ch).set_send_window(5);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s).write(b"0123456789").unwrap(),
+        5
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"x"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        0
+    );
+}
+
+#[test]
+fn data_blocked_dropped_when_limit_raised() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+
+    // The peer raises the limit before the queued frame gets transmitted
+    pair.server_conn_mut(server_ch)
+        .set_receive_window(100u32.into());
+    pair.drive_server();
+    pair.drive();
+
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        0
+    );
+}
+
+#[test]
+fn stream_data_blocked_not_sent_after_reset() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            stream_receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, _server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+
+    // Resetting the stream before the queued frame gets transmitted discards it
+    pair.client_send(client_ch, s).reset(0u32.into()).unwrap();
+    pair.drive();
+
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+    assert_eq!(stats.frame_tx.reset_stream, 1);
+}
+
+#[test]
+fn data_blocked_retransmit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive_client();
+    pair.server.inbound.clear(); // Lose the packet carrying the frame
+    pair.drive();
+
+    // Still blocked at the same limit, so the frame is sent again. A PTO may send several probes,
+    // each carrying the frame, so only check that it was repeated and got through.
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked
+            > 1
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .data_blocked
+            > 0
+    );
+}
+
+#[test]
 fn key_update_simple() {
     let _guard = subscribe();
     let mut pair = Pair::default();
@@ -1552,10 +1952,10 @@ fn idle_timeout() {
     while !pair.client_conn_mut(client_ch).is_closed()
         || !pair.server_conn_mut(server_ch).is_closed()
     {
-        if !pair.step() {
-            if let Some(t) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
-                pair.time = t;
-            }
+        if !pair.step()
+            && let Some(t) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+        {
+            pair.time = t;
         }
         pair.client.inbound.clear(); // Simulate total S->C packet loss
     }
@@ -1643,7 +2043,7 @@ fn connection_close_while_congestion_blocked() {
     }
     let (reason, delivered_at) = result.expect("server never learned of the close");
     assert_matches!(reason, ConnectionError::ApplicationClosed(
-        ApplicationClose { error_code: VarInt(42), ref reason }
+        ApplicationClose { error_code: VarInt(42), reason }
     ) if reason == REASON);
     // Close packets aren't congestion controlled and the test link has no latency, so the close
     // should arrive the moment it was issued — any delay means a timer had to rescue it
@@ -1941,10 +2341,10 @@ fn keep_alive() {
     // Run a good while longer than the idle timeout
     let end = pair.time + Duration::from_millis(20 * IDLE_TIMEOUT);
     while pair.time < end {
-        if !pair.step() {
-            if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
-                pair.time = time;
-            }
+        if !pair.step()
+            && let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+        {
+            pair.time = time;
         }
         assert!(!pair.client_conn_mut(client_ch).is_closed());
         assert!(!pair.server_conn_mut(server_ch).is_closed());
@@ -1988,10 +2388,10 @@ fn cid_rotation() {
         stop += CID_TIMEOUT;
         // Run a while until PushNewCID timer fires
         while pair.time < stop {
-            if !pair.step() {
-                if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
-                    pair.time = time;
-                }
+            if !pair.step()
+                && let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+            {
+                pair.time = time;
             }
         }
         info!(
@@ -3921,6 +4321,74 @@ fn ack_bundled_with_datagrams() {
         pair.server_conn_mut(server_ch).stats().frame_tx.acks,
         "server should not sent ACK frames"
     );
+}
+
+#[test]
+fn path_changes_unblock_oversized_datagrams() {
+    let _guard = subscribe();
+    for migrate in [false, true] {
+        let mut pair = Pair::default();
+        let (client_ch, server_ch) = pair.connect();
+        pair.drive();
+        let old_max = pair.server_datagrams(server_ch).max_size().unwrap();
+        assert!(old_max > 1200);
+        let empty_space = pair.server_datagrams(server_ch).send_buffer_space();
+        let data = Bytes::from(vec![42; old_max]);
+        loop {
+            match pair.server_datagrams(server_ch).send(data.clone(), false) {
+                Ok(()) => {}
+                Err(SendDatagramError::Blocked(_)) => break,
+                Err(error) => panic!("unexpected send error: {error}"),
+            }
+        }
+        while pair.server_conn_mut(server_ch).poll().is_some() {}
+
+        pair.mtu = 1200;
+        if migrate {
+            pair.client
+                .addr
+                .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+            pair.client_conn_mut(client_ch).ping();
+            pair.drive_client();
+            // Process migration without transmitting, so sends cannot free the buffer first.
+            let mut buf = Vec::new();
+            while let Some((received, ecn, packet)) = pair.server.inbound.pop_front() {
+                let Some(DatagramEvent::ConnectionEvent(ch, event)) =
+                    pair.server
+                        .handle(received, pair.client.addr, None, ecn, packet, &mut buf)
+                else {
+                    panic!("expected a connection event");
+                };
+                assert_eq!(ch, server_ch);
+                pair.server_conn_mut(ch).handle_event(event);
+            }
+            assert_eq!(
+                pair.server_conn_mut(server_ch).remote_address(),
+                pair.client.addr
+            );
+        } else {
+            let now = pair.time;
+            pair.server_conn_mut(server_ch).path_changed(now);
+        }
+
+        assert!(pair.server_datagrams(server_ch).max_size().unwrap() < old_max);
+        assert_eq!(
+            pair.server_datagrams(server_ch).send_buffer_space(),
+            empty_space
+        );
+        assert!(
+            iter::from_fn(|| pair.server_conn_mut(server_ch).poll())
+                .any(|event| matches!(event, Event::DatagramsUnblocked))
+        );
+
+        let small = Bytes::from_static(b"small");
+        pair.server_datagrams(server_ch)
+            .send(small.clone(), false)
+            .unwrap();
+        pair.drive();
+        assert_eq!(pair.client_datagrams(client_ch).recv(), Some(small));
+        assert_eq!(pair.client_datagrams(client_ch).recv(), None);
+    }
 }
 
 /// Verify that dropping oversized datagrams will trigger a DatagramsUnblocked event.
