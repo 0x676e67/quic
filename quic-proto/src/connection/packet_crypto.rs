@@ -22,7 +22,7 @@ pub(super) fn unprotect_header(
             return None;
         }
     } else if let Some(space) = partial_decode.space() {
-        if let Some(ref crypto) = spaces[space].crypto {
+        if let Some(crypto) = &spaces[space].crypto {
             Some(&*crypto.header.remote)
         } else {
             debug!(
@@ -118,10 +118,11 @@ pub(super) fn decrypt_packet_body(
     }
 
     let mut outgoing_key_update_acked = false;
-    if let Some(prev) = prev_crypto {
-        if prev.end_packet.is_none() && packet_key_phase == conn_key_phase {
-            outgoing_key_update_acked = true;
-        }
+    if let Some(prev) = prev_crypto
+        && prev.end_packet.is_none()
+        && packet_key_phase == conn_key_phase
+    {
+        outgoing_key_update_acked = true;
     }
 
     if crypto_update {

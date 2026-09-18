@@ -689,6 +689,36 @@ fn rt_threaded() -> Runtime {
 }
 
 #[tokio::test]
+async fn retry_after_rebind() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let client = factory.endpoint();
+    server
+        .rebind(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+        .unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let incoming = server.accept().await.unwrap();
+        assert!(!incoming.remote_address_validated());
+        incoming.retry().unwrap();
+
+        let incoming = server.accept().await.unwrap();
+        assert!(incoming.remote_address_validated());
+        let (accepted, connected) = join!(incoming, connecting);
+        let _server_connection = accepted.unwrap();
+        let _client_connection = connected.unwrap();
+        server.close(0u32.into(), b"done");
+        client.close(0u32.into(), b"done");
+    })
+    .await
+    .expect("retried handshake must complete using the rebound socket");
+}
+
+#[tokio::test]
 async fn rebind_recv() {
     let _guard = subscribe();
 
@@ -1193,24 +1223,28 @@ static VTABLE: RawWakerVTable =
     RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref_waker, drop_waker);
 
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
-    let arc = Arc::<WakeCounter>::from_raw(data as *const WakeCounter);
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    let arc = unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) };
     let cloned = arc.clone();
     std::mem::forget(arc);
     raw_waker(cloned)
 }
 
 unsafe fn wake_waker(data: *const ()) {
-    let arc = Arc::<WakeCounter>::from_raw(data as *const WakeCounter);
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    let arc = unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) };
     arc.wakes.fetch_add(1, Ordering::SeqCst);
     // arc drops here
 }
 
 unsafe fn wake_by_ref_waker(data: *const ()) {
-    let arc = Arc::<WakeCounter>::from_raw(data as *const WakeCounter);
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    let arc = unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) };
     arc.wakes.fetch_add(1, Ordering::SeqCst);
     std::mem::forget(arc);
 }
 
 unsafe fn drop_waker(data: *const ()) {
-    drop(Arc::<WakeCounter>::from_raw(data as *const WakeCounter));
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    drop(unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) });
 }

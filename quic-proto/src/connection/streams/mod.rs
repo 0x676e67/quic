@@ -244,8 +244,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(|opt| opt.get_or_insert_with(|| Send::new(max_send_data)))
-            .ok_or(WriteError::ClosedStream)?;
+            .ok_or(WriteError::ClosedStream)?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         if limit == 0 {
             trace!(
@@ -256,13 +256,30 @@ impl<'a> SendStream<'a> {
                 stream.connection_blocked = true;
                 self.state.connection_blocked.push(self.id);
             }
+            // Only report blocking on the peer's limit, not on our own send window
+            if self.state.data_sent == self.state.max_data
+                && self.state.data_blocked_limit != Some(self.state.max_data)
+            {
+                self.state.data_blocked_limit = Some(self.state.max_data);
+                self.pending.data_blocked = true;
+            }
             return Err(WriteError::Blocked);
         }
 
         let was_pending = stream.is_pending();
-        let written = stream.write(source, limit)?;
+        let written = match stream.write(source, limit) {
+            Ok(written) => written,
+            Err(WriteError::Blocked) => {
+                if stream.data_blocked_limit != Some(stream.max_data) {
+                    stream.data_blocked_limit = Some(stream.max_data);
+                    self.pending.stream_data_blocked.insert(self.id);
+                }
+                return Err(WriteError::Blocked);
+            }
+            Err(e) => return Err(e),
+        };
         self.state.data_sent += written.bytes as u64;
-        self.state.unacked_data += written.bytes as u64;
+        self.state.buffered_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
@@ -290,8 +307,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(|opt| opt.get_or_insert_with(|| Send::new(max_send_data)))
-            .ok_or(FinishError::ClosedStream)?;
+            .ok_or(FinishError::ClosedStream)?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         let was_pending = stream.is_pending();
         stream.finish()?;
@@ -312,8 +329,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(|opt| opt.get_or_insert_with(|| Send::new(max_send_data)))
-            .ok_or(ClosedStream { _private: () })?;
+            .ok_or(ClosedStream { _private: () })?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         if matches!(stream.state, SendState::ResetSent) {
             // Redundant reset call
@@ -323,7 +340,7 @@ impl<'a> SendStream<'a> {
         // Restore the portion of the send window consumed by the data that we aren't about to
         // send. We leave flow control alone because the peer's responsible for issuing additional
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
-        self.state.unacked_data -= stream.pending.unacked();
+        self.state.buffered_data -= stream.pending.buffered();
         stream.reset();
         self.pending.reset_stream.push((self.id, error_code));
 
@@ -341,8 +358,8 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(|opt| opt.get_or_insert_with(|| Send::new(max_send_data)))
-            .ok_or(ClosedStream { _private: () })?;
+            .ok_or(ClosedStream { _private: () })?
+            .get_or_insert_with(|| Send::new(max_send_data));
 
         stream.priority = priority;
         Ok(())
