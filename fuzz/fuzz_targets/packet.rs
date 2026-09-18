@@ -3,11 +3,9 @@
 #[cfg(not(fuzzing))]
 fn main() {}
 
-use libfuzzer_sys::fuzz_target;
-use proto::{
-    fuzzing::{PacketParams, PartialDecode},
-    FixedLengthConnectionIdParser, DEFAULT_SUPPORTED_VERSIONS,
-};
+#[cfg(fuzzing)]
+mod target {
+    extern crate proto;
 
     use libfuzzer_sys::fuzz_target;
     use proto::{
