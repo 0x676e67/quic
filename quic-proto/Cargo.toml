@@ -22,6 +22,10 @@ aws-lc-rs-fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
 # Enables BloomTokenLog, and uses it by default
 bloom = ["dep:fastbloom"]
 
+# Enable btls/BoringSSL crypto support
+btls = ["dep:btls", "dep:btls-sys", "dep:foreign-types-shared", "dep:lru"]
+btls-prefix-symbols = ["btls", "btls?/prefix-symbols"]
+
 # For backwards compatibility, `rustls` forwards to `rustls-ring`
 rustls = ["rustls-ring"]
 
@@ -55,8 +59,12 @@ __rustls-post-quantum-test =  []
 [dependencies]
 arbitrary = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true, optional = true }
+btls = { workspace = true, optional = true }
+btls-sys = { workspace = true, optional = true }
 bytes = { workspace = true }
 fastbloom = { workspace = true, optional = true }
+foreign-types-shared = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
 lru-slab = { workspace = true }
 qlog = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
