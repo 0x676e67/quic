@@ -1025,6 +1025,49 @@ async fn stream_stopped() {
 }
 
 #[tokio::test]
+async fn stopped_stream_without_connection_credit() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let mut transport = TransportConfig::default();
+    transport.receive_window(0u32.into());
+    let client = factory.endpoint_with_config(transport);
+
+    timeout(Duration::from_secs(5), async {
+        let (client_conn, server_conn) = tokio::join!(
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap(),
+            async { server.accept().await.unwrap().await },
+        );
+        let client_conn = client_conn.unwrap();
+        let server_conn = server_conn.unwrap();
+        let (mut request, mut response) = client_conn.open_bi().await.unwrap();
+        request.write_all(b"request").await.unwrap();
+        request.finish().unwrap();
+        let (mut send, mut recv) = server_conn.accept_bi().await.unwrap();
+        assert_eq!(recv.read_to_end(7).await.unwrap(), b"request");
+
+        let stopped = send.stopped();
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut write = pin!(send.write(b"response"));
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        let wakes = counter.wakes();
+
+        response.stop(42u32.into()).unwrap();
+        assert_eq!(stopped.await.unwrap(), Some(42u32.into()));
+        assert!(counter.wakes() > wakes, "STOP_SENDING must wake the writer");
+        assert!(matches!(
+            write.as_mut().poll(&mut cx),
+            Poll::Ready(Err(crate::WriteError::Stopped(code))) if code == 42u32.into()
+        ));
+    })
+    .await
+    .expect("stopped write must resolve without new connection credit");
+}
+
+#[tokio::test]
 async fn stream_stopped_2() {
     let _guard = subscribe();
     let endpoint = endpoint();
