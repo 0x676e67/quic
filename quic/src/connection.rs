@@ -320,10 +320,7 @@ impl Connection {
     /// consequence, the peer won't be notified that a stream has been opened until the stream is
     /// actually used.
     pub fn open_uni(&self) -> OpenUni<'_> {
-        OpenUni {
-            conn: &self.0,
-            notify: self.0.shared.stream_budget_available[Dir::Uni as usize].notified(),
-        }
+        OpenUni { conn: self }
     }
 
     /// Initiate a new outgoing bidirectional stream.
@@ -337,10 +334,7 @@ impl Connection {
     /// [`SendStream`]: crate::SendStream
     /// [`RecvStream`]: crate::RecvStream
     pub fn open_bi(&self) -> OpenBi<'_> {
-        OpenBi {
-            conn: &self.0,
-            notify: self.0.shared.stream_budget_available[Dir::Bi as usize].notified(),
-        }
+        OpenBi { conn: self }
     }
 
     /// Accept the next incoming uni-directional stream
@@ -349,10 +343,7 @@ impl Connection {
     ///
     /// This method is cancellation safe. If this does not resolve, no streams were consumed.
     pub fn accept_uni(&self) -> AcceptUni<'_> {
-        AcceptUni {
-            conn: &self.0,
-            notify: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
-        }
+        AcceptUni { conn: self }
     }
 
     /// Accept the next incoming bidirectional stream
@@ -370,10 +361,54 @@ impl Connection {
     ///
     /// This method is cancellation safe. If this does not resolve, no streams were consumed.
     pub fn accept_bi(&self) -> AcceptBi<'_> {
-        AcceptBi {
-            conn: &self.0,
-            notify: self.0.shared.stream_incoming[Dir::Bi as usize].notified(),
-        }
+        AcceptBi { conn: self }
+    }
+
+    /// Polls to open a unidirectional stream without holding a future.
+    ///
+    /// `Pending` registers the current task to be woken when stream credit arrives or the
+    /// connection closes. The next call resumes the same open; a successful call transfers
+    /// exactly one stream.
+    pub fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<SendStream, ConnectionError>> {
+        let (conn, id, is_0rtt) = ready!(poll_open(cx, &self.0, Dir::Uni))?;
+        Poll::Ready(Ok(SendStream::new(conn, id, is_0rtt)))
+    }
+
+    /// Polls to open a bidirectional stream; see [`poll_open_uni()`](Self::poll_open_uni).
+    pub fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), ConnectionError>> {
+        let (conn, id, is_0rtt) = ready!(poll_open(cx, &self.0, Dir::Bi))?;
+        Poll::Ready(Ok((
+            SendStream::new(conn.clone(), id, is_0rtt),
+            RecvStream::new(conn, id, is_0rtt),
+        )))
+    }
+
+    /// Polls for the next incoming unidirectional stream without holding a future.
+    ///
+    /// `Pending` registers the current task to be woken when the peer opens a stream or the
+    /// connection closes. No stream is consumed unless `Ready` is returned.
+    pub fn poll_accept_uni(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<RecvStream, ConnectionError>> {
+        let (conn, id, is_0rtt) = ready!(poll_accept(cx, &self.0, Dir::Uni))?;
+        Poll::Ready(Ok(RecvStream::new(conn, id, is_0rtt)))
+    }
+
+    /// Polls for the next incoming bidirectional stream; see
+    /// [`poll_accept_uni()`](Self::poll_accept_uni).
+    pub fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), ConnectionError>> {
+        let (conn, id, is_0rtt) = ready!(poll_accept(cx, &self.0, Dir::Bi))?;
+        Poll::Ready(Ok((
+            SendStream::new(conn.clone(), id, is_0rtt),
+            RecvStream::new(conn, id, is_0rtt),
+        )))
     }
 
     /// Receive an application datagram
@@ -382,10 +417,25 @@ impl Connection {
     ///
     /// This method is cancellation safe. If this does not resolve, no datagrams were consumed.
     pub fn read_datagram(&self) -> ReadDatagram<'_> {
-        ReadDatagram {
-            conn: &self.0,
-            notify: self.0.shared.datagram_received.notified(),
+        ReadDatagram { conn: self }
+    }
+
+    /// Polls for an application datagram without holding a future.
+    ///
+    /// `Pending` registers the current task to be woken when a datagram arrives or the
+    /// connection closes. No datagram is consumed unless `Ready` is returned.
+    pub fn poll_read_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, ConnectionError>> {
+        let mut state = self.0.state.lock("poll_read_datagram");
+        // Check for buffered datagrams before checking `state.error` so that already-received
+        // datagrams, which are necessarily finite, can be drained from a closed connection.
+        if let Some(x) = state.inner.datagrams().recv() {
+            return Poll::Ready(Ok(x));
+        } else if let Some(e) = &state.error {
+            return Poll::Ready(Err(e.clone()));
         }
+        // `state` lock ensures registration cannot race with readiness
+        register(&mut state.datagram_waiters, cx);
+        Poll::Pending
     }
 
     /// Wait for the connection to be closed for any reason
@@ -772,50 +822,33 @@ impl Connection {
     }
 }
 
-pin_project! {
-    /// Future produced by [`Connection::open_uni`]
-    pub struct OpenUni<'a> {
-        conn: &'a ConnectionRef,
-        #[pin]
-        notify: Notified<'a>,
-    }
+/// Future produced by [`Connection::open_uni`]
+pub struct OpenUni<'a> {
+    conn: &'a Connection,
 }
 
 impl Future for OpenUni<'_> {
     type Output = Result<SendStream, ConnectionError>;
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let (conn, id, is_0rtt) = ready!(poll_open(ctx, this.conn, this.notify, Dir::Uni))?;
-        Poll::Ready(Ok(SendStream::new(conn, id, is_0rtt)))
+        self.conn.poll_open_uni(ctx)
     }
 }
 
-pin_project! {
-    /// Future produced by [`Connection::open_bi`]
-    pub struct OpenBi<'a> {
-        conn: &'a ConnectionRef,
-        #[pin]
-        notify: Notified<'a>,
-    }
+/// Future produced by [`Connection::open_bi`]
+pub struct OpenBi<'a> {
+    conn: &'a Connection,
 }
 
 impl Future for OpenBi<'_> {
     type Output = Result<(SendStream, RecvStream), ConnectionError>;
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let (conn, id, is_0rtt) = ready!(poll_open(ctx, this.conn, this.notify, Dir::Bi))?;
-
-        Poll::Ready(Ok((
-            SendStream::new(conn.clone(), id, is_0rtt),
-            RecvStream::new(conn, id, is_0rtt),
-        )))
+        self.conn.poll_open_bi(ctx)
     }
 }
 
-fn poll_open<'a>(
+fn poll_open(
     ctx: &mut Context<'_>,
-    conn: &'a ConnectionRef,
-    mut notify: Pin<&mut Notified<'a>>,
+    conn: &ConnectionRef,
     dir: Dir,
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
     let mut state = conn.state.lock("poll_open");
@@ -826,63 +859,40 @@ fn poll_open<'a>(
         drop(state); // Release the lock so clone can take it
         return Poll::Ready(Ok((conn.clone(), id, is_0rtt)));
     }
-    loop {
-        match notify.as_mut().poll(ctx) {
-            // `state` lock ensures we didn't race with readiness
-            Poll::Pending => return Poll::Pending,
-            // Spurious wakeup, get a new future
-            Poll::Ready(()) => {
-                notify.set(conn.shared.stream_budget_available[dir as usize].notified())
-            }
-        }
-    }
+    // `state` lock ensures registration cannot race with readiness
+    register(&mut state.stream_budget_waiters[dir as usize], ctx);
+    Poll::Pending
 }
 
-pin_project! {
-    /// Future produced by [`Connection::accept_uni`]
-    pub struct AcceptUni<'a> {
-        conn: &'a ConnectionRef,
-        #[pin]
-        notify: Notified<'a>,
-    }
+/// Future produced by [`Connection::accept_uni`]
+pub struct AcceptUni<'a> {
+    conn: &'a Connection,
 }
 
 impl Future for AcceptUni<'_> {
     type Output = Result<RecvStream, ConnectionError>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Uni))?;
-        Poll::Ready(Ok(RecvStream::new(conn, id, is_0rtt)))
+        self.conn.poll_accept_uni(ctx)
     }
 }
 
-pin_project! {
-    /// Future produced by [`Connection::accept_bi`]
-    pub struct AcceptBi<'a> {
-        conn: &'a ConnectionRef,
-        #[pin]
-        notify: Notified<'a>,
-    }
+/// Future produced by [`Connection::accept_bi`]
+pub struct AcceptBi<'a> {
+    conn: &'a Connection,
 }
 
 impl Future for AcceptBi<'_> {
     type Output = Result<(SendStream, RecvStream), ConnectionError>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Bi))?;
-        Poll::Ready(Ok((
-            SendStream::new(conn.clone(), id, is_0rtt),
-            RecvStream::new(conn, id, is_0rtt),
-        )))
+        self.conn.poll_accept_bi(ctx)
     }
 }
 
-fn poll_accept<'a>(
+fn poll_accept(
     ctx: &mut Context<'_>,
-    conn: &'a ConnectionRef,
-    mut notify: Pin<&mut Notified<'a>>,
+    conn: &ConnectionRef,
     dir: Dir,
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
     let mut state = conn.state.lock("poll_accept");
@@ -896,47 +906,20 @@ fn poll_accept<'a>(
     } else if let Some(e) = &state.error {
         return Poll::Ready(Err(e.clone()));
     }
-    loop {
-        match notify.as_mut().poll(ctx) {
-            // `state` lock ensures we didn't race with readiness
-            Poll::Pending => return Poll::Pending,
-            // Spurious wakeup, get a new future
-            Poll::Ready(()) => notify.set(conn.shared.stream_incoming[dir as usize].notified()),
-        }
-    }
+    // `state` lock ensures registration cannot race with readiness
+    register(&mut state.stream_incoming_waiters[dir as usize], ctx);
+    Poll::Pending
 }
 
-pin_project! {
-    /// Future produced by [`Connection::read_datagram`]
-    pub struct ReadDatagram<'a> {
-        conn: &'a ConnectionRef,
-        #[pin]
-        notify: Notified<'a>,
-    }
+/// Future produced by [`Connection::read_datagram`]
+pub struct ReadDatagram<'a> {
+    conn: &'a Connection,
 }
 
 impl Future for ReadDatagram<'_> {
     type Output = Result<Bytes, ConnectionError>;
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        let mut state = this.conn.state.lock("ReadDatagram::poll");
-        // Check for buffered datagrams before checking `state.error` so that already-received
-        // datagrams, which are necessarily finite, can be drained from a closed connection.
-        if let Some(x) = state.inner.datagrams().recv() {
-            return Poll::Ready(Ok(x));
-        } else if let Some(e) = &state.error {
-            return Poll::Ready(Err(e.clone()));
-        }
-        loop {
-            match this.notify.as_mut().poll(ctx) {
-                // `state` lock ensures we didn't race with readiness
-                Poll::Pending => return Poll::Pending,
-                // Spurious wakeup, get a new future
-                Poll::Ready(()) => this
-                    .notify
-                    .set(this.conn.shared.datagram_received.notified()),
-            }
-        }
+        self.conn.poll_read_datagram(ctx)
     }
 }
 
@@ -1058,12 +1041,6 @@ pub(crate) struct ConnectionInner {
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     handshake_confirmed: Notify,
-    /// Notified when new streams may be locally initiated due to an increase in stream ID flow
-    /// control budget
-    stream_budget_available: [Notify; 2],
-    /// Notified when the peer has initiated a new stream
-    stream_incoming: [Notify; 2],
-    datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
     connected: Arc<Notify>,
@@ -1084,7 +1061,14 @@ pub(crate) struct State {
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
-    pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
+    pub(crate) stopped: FxHashMap<StreamId, Waiters>,
+    /// Woken when new streams may be locally initiated due to an increase in stream ID flow
+    /// control budget
+    stream_budget_waiters: [Vec<Waker>; 2],
+    /// Woken when the peer has initiated a new stream
+    stream_incoming_waiters: [Vec<Waker>; 2],
+    /// Woken when an application datagram has been received
+    datagram_waiters: Vec<Waker>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
     sender: Pin<Box<dyn UdpSender>>,
@@ -1122,6 +1106,9 @@ impl State {
             blocked_writers: FxHashMap::default(),
             blocked_readers: FxHashMap::default(),
             stopped: FxHashMap::default(),
+            stream_budget_waiters: Default::default(),
+            stream_incoming_waiters: Default::default(),
+            datagram_waiters: Vec::new(),
             error: None,
             sender,
             runtime,
@@ -1244,7 +1231,7 @@ impl State {
                         // `ZeroRttRejected` errors.
                         wake_all(&mut self.blocked_writers);
                         wake_all(&mut self.blocked_readers);
-                        wake_all_notify(&mut self.stopped);
+                        wake_all_waiters(&mut self.stopped);
                     }
                 }
                 HandshakeConfirmed => {
@@ -1255,26 +1242,21 @@ impl State {
                     self.terminate(reason, shared);
                 }
                 Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut self.blocked_writers),
-                Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
-                    shared.stream_incoming[Dir::Uni as usize].notify_waiters();
+                Stream(StreamEvent::Opened { dir }) => {
+                    wake_waiters(&mut self.stream_incoming_waiters[dir as usize]);
                 }
-                Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
-                    shared.stream_incoming[Dir::Bi as usize].notify_waiters();
-                }
-                DatagramReceived => {
-                    shared.datagram_received.notify_waiters();
-                }
+                DatagramReceived => wake_waiters(&mut self.datagram_waiters),
                 DatagramsUnblocked => {
                     shared.datagrams_unblocked.notify_waiters();
                 }
                 Stream(StreamEvent::Readable { id }) => wake_stream(id, &mut self.blocked_readers),
                 Stream(StreamEvent::Available { dir }) => {
                     // Might mean any number of streams are ready, so we wake up everyone
-                    shared.stream_budget_available[dir as usize].notify_waiters();
+                    wake_waiters(&mut self.stream_budget_waiters[dir as usize]);
                 }
-                Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
+                Stream(StreamEvent::Finished { id }) => wake_stream_waiters(id, &mut self.stopped),
                 Stream(StreamEvent::Stopped { id, .. }) => {
-                    wake_stream_notify(id, &mut self.stopped);
+                    wake_stream_waiters(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
                 }
                 PathUpdated => {
@@ -1347,14 +1329,14 @@ impl State {
         }
         wake_all(&mut self.blocked_writers);
         wake_all(&mut self.blocked_readers);
-        shared.stream_budget_available[Dir::Uni as usize].notify_waiters();
-        shared.stream_budget_available[Dir::Bi as usize].notify_waiters();
-        shared.stream_incoming[Dir::Uni as usize].notify_waiters();
-        shared.stream_incoming[Dir::Bi as usize].notify_waiters();
-        shared.datagram_received.notify_waiters();
+        self.stream_budget_waiters.iter_mut().for_each(wake_waiters);
+        self.stream_incoming_waiters
+            .iter_mut()
+            .for_each(wake_waiters);
+        wake_waiters(&mut self.datagram_waiters);
         shared.datagrams_unblocked.notify_waiters();
         shared.handshake_confirmed.notify_waiters();
-        wake_all_notify(&mut self.stopped);
+        wake_all_waiters(&mut self.stopped);
         shared.closed.notify_waiters();
         shared.connected.notify_waiters();
     }
@@ -1409,16 +1391,56 @@ fn wake_all(wakers: &mut FxHashMap<StreamId, Waker>) {
     wakers.drain().for_each(|(_, waker)| waker.wake())
 }
 
-fn wake_stream_notify(stream_id: StreamId, wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
-    if let Some(notify) = wakers.remove(&stream_id) {
-        notify.notify_waiters()
+/// Registers the current task once; a task that is already registered is not duplicated.
+fn register(wakers: &mut Vec<Waker>, cx: &Context<'_>) {
+    if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+        wakers.push(cx.waker().clone());
     }
 }
 
-fn wake_all_notify(wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
-    wakers
-        .drain()
-        .for_each(|(_, notify)| notify.notify_waiters())
+fn wake_waiters(wakers: &mut Vec<Waker>) {
+    wakers.drain(..).for_each(Waker::wake)
+}
+
+/// Tasks waiting on one stream's stop or acknowledgment; a single waiter is the common case.
+#[derive(Debug)]
+pub(crate) enum Waiters {
+    One(Waker),
+    Many(Vec<Waker>),
+}
+
+impl Waiters {
+    pub(crate) fn new(cx: &Context<'_>) -> Self {
+        Self::One(cx.waker().clone())
+    }
+
+    pub(crate) fn register(&mut self, cx: &Context<'_>) {
+        match self {
+            Self::One(waker) if waker.will_wake(cx.waker()) => {}
+            Self::One(waker) => {
+                let first = waker.clone();
+                *self = Self::Many(vec![first, cx.waker().clone()]);
+            }
+            Self::Many(wakers) => register(wakers, cx),
+        }
+    }
+
+    fn wake(self) {
+        match self {
+            Self::One(waker) => waker.wake(),
+            Self::Many(wakers) => wakers.into_iter().for_each(Waker::wake),
+        }
+    }
+}
+
+fn wake_stream_waiters(stream_id: StreamId, waiters: &mut FxHashMap<StreamId, Waiters>) {
+    if let Some(waiters) = waiters.remove(&stream_id) {
+        waiters.wake();
+    }
+}
+
+fn wake_all_waiters(waiters: &mut FxHashMap<StreamId, Waiters>) {
+    waiters.drain().for_each(|(_, waiters)| waiters.wake())
 }
 
 /// Errors that can arise when sending a datagram

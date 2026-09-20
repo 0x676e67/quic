@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     VarInt,
-    connection::{ConnectionRef, State},
+    connection::{ConnectionRef, State, Waiters},
 };
 
 /// A stream that can only be used to send data
@@ -252,27 +252,18 @@ impl SendStream {
         let conn = self.conn.clone();
         let stream = self.stream;
         let is_0rtt = self.is_0rtt;
-        async move {
-            loop {
-                // The `Notify::notified` future needs to be created while the lock is being held,
-                // otherwise a wakeup could be missed if triggered inbetween releasing the lock
-                // and creating the future.
-                // The lock may only be held in a block without `await`s, otherwise the future
-                // becomes `!Send`. `Notify::notified` is lifetime-bound to `Notify`, therefore
-                // we need to declare `notify` outside of the block, and initialize it inside.
-                let notify;
-                {
-                    let mut conn = conn.state.lock("SendStream::stopped");
-                    if let Some(output) = send_stream_stopped(&mut conn, stream, is_0rtt) {
-                        return output;
-                    }
+        poll_fn(move |cx| poll_stopped(cx, &conn, stream, is_0rtt))
+    }
 
-                    notify = conn.stopped.entry(stream).or_default().clone();
-                    notify.notified()
-                }
-                .await
-            }
-        }
+    /// Polls for the peer stopping the stream or acknowledging all of its data.
+    ///
+    /// Resolves like [`stopped()`](Self::stopped). `Pending` registers the current task, and
+    /// every task registered for the stream is woken.
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<VarInt>, StoppedError>> {
+        poll_stopped(cx, &self.conn, self.stream, self.is_0rtt)
     }
 
     /// Get the identity of this stream
@@ -294,6 +285,25 @@ impl SendStream {
     ) -> Poll<Result<usize, WriteError>> {
         pin!(self.get_mut().write(buf)).as_mut().poll(cx)
     }
+}
+
+fn poll_stopped(
+    cx: &mut Context<'_>,
+    conn: &ConnectionRef,
+    stream: StreamId,
+    is_0rtt: bool,
+) -> Poll<Result<Option<VarInt>, StoppedError>> {
+    let mut state = conn.state.lock("SendStream::poll_stopped");
+    if let Some(output) = send_stream_stopped(&mut state, stream, is_0rtt) {
+        return Poll::Ready(output);
+    }
+    // `state` lock ensures registration cannot race with the stream event
+    state
+        .stopped
+        .entry(stream)
+        .and_modify(|waiters| waiters.register(cx))
+        .or_insert_with(|| Waiters::new(cx));
+    Poll::Pending
 }
 
 /// Check if a send stream is stopped.
