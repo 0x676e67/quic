@@ -685,6 +685,38 @@ fn reset_stream() {
 }
 
 #[test]
+fn closed_stream_without_connection_credit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 0u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, _) = pair.connect();
+
+    for reset in [false, true] {
+        let id = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+        let mut stream = pair.client_send(client_ch, id);
+        assert_matches!(stream.write(b"data"), Err(WriteError::Blocked));
+        if reset {
+            stream.reset(42u32.into()).unwrap();
+        } else {
+            stream.finish().unwrap();
+        }
+        assert_matches!(stream.write(b"data"), Err(WriteError::ClosedStream));
+        let mut chunks = [Bytes::from_static(b"data")];
+        assert_matches!(
+            stream.write_chunks(&mut chunks),
+            Err(WriteError::ClosedStream)
+        );
+        assert_eq!(chunks[0], b"data"[..]);
+    }
+}
+
+#[test]
 fn stop_stream() {
     let _guard = subscribe();
     let mut pair = Pair::default();

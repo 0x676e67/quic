@@ -247,6 +247,14 @@ impl<'a> SendStream<'a> {
             .ok_or(WriteError::ClosedStream)?
             .get_or_insert_with(|| Send::new(max_send_data));
 
+        // Terminal stream state must remain observable without connection credit.
+        if !stream.is_writable() {
+            return Err(WriteError::ClosedStream);
+        }
+        if let Some(error_code) = stream.stop_reason {
+            return Err(WriteError::Stopped(error_code));
+        }
+
         if limit == 0 {
             trace!(
                 stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
