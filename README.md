@@ -14,7 +14,7 @@ A [Sans-I/O][sans-io] aware, QUIC implementation for Rust.
 - 0-RTT data for resumed connections.
 - Connection migration and path MTU discovery based on [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html).
 - Async APIs for Linux, macOS and Windows; pluggable cryptography with [rustls][rustls] and [*ring*][ring].
-- Carries forward [quinn]'s implementation.
+- Continues the [quinn] codebase, tracking upstream changes.
 
 ## Usage
 
