@@ -276,17 +276,24 @@ impl SessionState {
     pub(crate) fn check_ssl_error(&mut self, ssl_err: SslError) -> StdResult<(), TransportError> {
         match ssl_err.value() {
             bffi::SSL_ERROR_NONE => Ok(()),
-            bffi::SSL_ERROR_WANT_READ
-            | bffi::SSL_ERROR_WANT_WRITE
-            | bffi::SSL_ERROR_PENDING_SESSION
+            bffi::SSL_ERROR_WANT_READ => {
+                // Not an error - retry when we get more data from the peer.
+                trace!("SSL:{}", ssl_err.get_description());
+                Ok(())
+            }
+            bffi::SSL_ERROR_PENDING_SESSION
             | bffi::SSL_ERROR_PENDING_CERTIFICATE
             | bffi::SSL_ERROR_PENDING_TICKET
             | bffi::SSL_ERROR_WANT_X509_LOOKUP
             | bffi::SSL_ERROR_WANT_PRIVATE_KEY_OPERATION
             | bffi::SSL_ERROR_WANT_CERTIFICATE_VERIFY => {
-                // Not an error - retry when we get more data from the peer.
-                trace!("SSL:{}", ssl_err.get_description());
-                Ok(())
+                // An asynchronous callback is pending. The session only advances the handshake
+                // when the peer sends more data, and the peer waits for this side, so the
+                // handshake would stall until the idle timeout.
+                Err(TransportError::new(
+                    Alert::internal_error().into(),
+                    format!("unsupported asynchronous operation: {ssl_err}"),
+                ))
             }
             bffi::SSL_ERROR_EARLY_DATA_REJECTED => {
                 // Reset the state to allow retry with 1-RTT.

@@ -10,6 +10,7 @@ use quic::{
     TransportErrorCode,
     btls::{
         pkey::{PKey, Private},
+        ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode},
         x509::X509,
     },
     crypto::btls::{HandshakeData, QuicClientConfig, QuicServerConfig, QuicSslContext},
@@ -109,6 +110,30 @@ async fn peer_identity_with_client_auth() {
 
     client.wait_idle().await;
 }
+
+/// Asynchronous certificate verification needs someone to resume the handshake once it is
+/// done, which the session cannot do, so the connection fails instead of stalling.
+#[tokio::test]
+async fn async_verification_fails_handshake() {
+    let pki = Pki::new();
+    let server = serve(server_endpoint(&pki, &pki.issue("localhost"), false));
+    let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+    builder.set_custom_verify_callback(SslVerifyMode::PEER, |_| Err(SslVerifyError::Retry));
+    let crypto = QuicClientConfig::from_builder(builder).unwrap();
+    let client = Endpoint::client(localhost()).unwrap();
+
+    let connecting = client
+        .connect_with(ClientConfig::new(Arc::new(crypto)), server, "localhost")
+        .unwrap();
+    let err = connecting.await.unwrap_err();
+    assert!(
+        matches!(&err, ConnectionError::TransportError(e) if e.code == TransportErrorCode::crypto(INTERNAL_ERROR)),
+        "{err:?}"
+    );
+}
+
+/// The TLS alert for a local failure (https://www.rfc-editor.org/rfc/rfc8446#section-6.2).
+const INTERNAL_ERROR: u8 = 80;
 
 /// Returns whether `code` carries a TLS alert
 /// (https://www.rfc-editor.org/rfc/rfc9001#section-4.8).
