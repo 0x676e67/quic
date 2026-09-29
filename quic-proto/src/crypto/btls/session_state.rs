@@ -8,6 +8,7 @@ use crate::{
 };
 use btls::error::ErrorStack;
 use btls::ssl::{NameType, Ssl};
+use btls::x509::X509;
 use btls_sys as bffi;
 use bytes::{Buf, BytesMut};
 use foreign_types_shared::ForeignType;
@@ -197,7 +198,21 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        None
+        // BoringSSL leaves the leaf out of the chain a server receives, so add it back to return
+        // the whole chain, leaf first, on both sides.
+        let leaf = match self.side {
+            Side::Server => self.ssl.peer_certificate(),
+            Side::Client => None,
+        };
+        let chain = self.ssl.peer_cert_chain().into_iter().flatten();
+        let certs: Vec<X509> = leaf
+            .into_iter()
+            .chain(chain.map(ToOwned::to_owned))
+            .collect();
+        if certs.is_empty() {
+            return None;
+        }
+        Some(Box::new(certs))
     }
 
     #[inline]

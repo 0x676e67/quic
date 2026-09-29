@@ -684,7 +684,8 @@ impl Connection {
     ///
     /// The dynamic type returned is determined by the configured
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
-    /// be [`downcast`](Box::downcast) to a <code>Vec<[rustls::pki_types::CertificateDer]></code>
+    /// be [`downcast`](Box::downcast) to a <code>Vec<[rustls::pki_types::CertificateDer]></code>.
+    /// For the `btls` session, it is a `Vec<btls::x509::X509>`, leaf certificate first.
     pub fn peer_identity(&self) -> Option<Box<dyn Any>> {
         self.0
             .state
