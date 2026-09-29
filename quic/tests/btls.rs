@@ -7,7 +7,7 @@ use std::{
 
 use quic::{
     ClientConfig, Connection, ConnectionError, Endpoint, ReadError, ReadToEndError, ServerConfig,
-    TransportErrorCode,
+    TransportConfig, TransportErrorCode,
     btls::{
         pkey::{PKey, Private},
         ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode},
@@ -84,6 +84,46 @@ async fn handshake_resumption_and_early_data() {
         matches!(&err, ConnectionError::TransportError(e) if is_tls_alert(e.code)),
         "{err:?}"
     );
+
+    client.wait_idle().await;
+}
+
+#[tokio::test]
+async fn early_data_rejected_after_transport_change() {
+    let pki = Pki::new();
+    let crypto = Arc::new(server_crypto(&pki, &pki.issue("localhost"), false));
+    // Both servers share the ticket keys of `crypto`, and only differ in a stream limit.
+    let config = ServerConfig::with_crypto(crypto.clone());
+    let server = serve(Endpoint::server(config, localhost()).unwrap());
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_bidi_streams(10u32.into());
+    let mut config = ServerConfig::with_crypto(crypto);
+    config.transport_config(Arc::new(transport));
+    let limited_server = serve(Endpoint::server(config, localhost()).unwrap());
+    let client = client_endpoint(&pki, None);
+
+    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+    request(&conn, b"1-rtt").await.unwrap();
+    conn.close(0u32.into(), b"done");
+
+    // The limited server resumes the session, but rejects the 0-RTT stream: the client
+    // remembers a higher stream limit than the server now grants.
+    let connecting = client.connect(limited_server, "localhost").unwrap();
+    let conn = connecting.into_0rtt().expect("resumable ticket");
+    assert!(matches!(
+        request(&conn, b"0-rtt").await,
+        Err(ReadToEndError::Read(ReadError::ZeroRttRejected))
+    ));
+    let response = request(&conn, b"retry").await.unwrap();
+    check_response(&conn, b"retry", &response, &[]);
+    conn.close(0u32.into(), b"done");
+
+    // A ticket of the limited server matches its limits, so it accepts 0-RTT.
+    let connecting = client.connect(limited_server, "localhost").unwrap();
+    let conn = connecting.into_0rtt().expect("resumable ticket");
+    let response = request(&conn, b"0-rtt").await.unwrap();
+    check_response(&conn, b"0-rtt", &response, &[]);
+    conn.close(0u32.into(), b"done");
 
     client.wait_idle().await;
 }
@@ -207,6 +247,11 @@ fn peer_chain(conn: &Connection) -> Vec<Vec<u8>> {
 }
 
 fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
+    let config = ServerConfig::with_crypto(Arc::new(server_crypto(pki, leaf, client_auth)));
+    Endpoint::server(config, localhost()).unwrap()
+}
+
+fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig {
     let mut crypto = QuicServerConfig::new().unwrap();
     let ctx = crypto.ctx_mut();
     ctx.set_certificate(leaf.cert.clone()).unwrap();
@@ -216,8 +261,7 @@ fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
         ctx.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
         crypto.verify_peer(true);
     }
-    let config = ServerConfig::with_crypto(Arc::new(crypto));
-    Endpoint::server(config, localhost()).unwrap()
+    crypto
 }
 
 fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {

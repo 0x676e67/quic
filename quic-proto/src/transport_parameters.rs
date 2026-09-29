@@ -382,6 +382,35 @@ impl TransportParameters {
         Ok(())
     }
 
+    /// Encodes the parameters that [`Self::validate_resumption_from`] checks, for a TLS stack
+    /// that rejects 0-RTT when a ticket was issued under a different context
+    /// (https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1).
+    #[cfg(feature = "btls")]
+    pub(crate) fn early_data_context(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        for value in [
+            self.active_connection_id_limit,
+            self.initial_max_data,
+            self.initial_max_stream_data_bidi_local,
+            self.initial_max_stream_data_bidi_remote,
+            self.initial_max_stream_data_uni,
+            self.initial_max_streams_bidi,
+            self.initial_max_streams_uni,
+        ] {
+            out.write(value);
+        }
+        // Tag the optional value, so that no two sets of parameters share an encoding.
+        match self.max_datagram_frame_size {
+            Some(size) => {
+                out.put_u8(1);
+                out.write(size);
+            }
+            None => out.put_u8(0),
+        }
+        out.put_u8(self.grease_quic_bit.into());
+        out
+    }
+
     /// Maximum number of CIDs to issue to this peer
     ///
     /// Consider both a) the active_connection_id_limit from the other end; and
@@ -1224,6 +1253,43 @@ mod test {
         };
         high_limit.validate_resumption_from(&low_limit).unwrap();
         low_limit.validate_resumption_from(&high_limit).unwrap_err();
+    }
+
+    #[cfg(feature = "btls")]
+    #[test]
+    fn early_data_context() {
+        let params = TransportParameters {
+            initial_max_streams_uni: 16u32.into(),
+            ..TransportParameters::default()
+        };
+        // Parameters that differ per connection leave the context unchanged.
+        let other_connection = TransportParameters {
+            initial_src_cid: Some(ConnectionId::new(&[1; 8])),
+            original_dst_cid: Some(ConnectionId::new(&[2; 8])),
+            stateless_reset_token: Some([3; RESET_TOKEN_SIZE].into()),
+            ..params.clone()
+        };
+        assert_eq!(
+            params.early_data_context(),
+            other_connection.early_data_context()
+        );
+
+        for changed in [
+            TransportParameters {
+                initial_max_streams_uni: 32u32.into(),
+                ..params.clone()
+            },
+            TransportParameters {
+                max_datagram_frame_size: Some(0u32.into()),
+                ..params.clone()
+            },
+            TransportParameters {
+                grease_quic_bit: true,
+                ..params.clone()
+            },
+        ] {
+            assert_ne!(params.early_data_context(), changed.early_data_context());
+        }
     }
 
     // -- Tests for deterministic transport parameter ordering --

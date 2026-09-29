@@ -151,8 +151,10 @@ impl Session {
         ssl.set_quic_transport_params(&encode_params(params))
             .unwrap();
 
-        // Need to se
-        ssl.set_quic_early_data_context(b"quinn-boring").unwrap();
+        // BoringSSL accepts 0-RTT only under the context of the ticket, so 0-RTT is rejected
+        // once the limits that a client remembers change.
+        ssl.set_quic_early_data_context(&params.early_data_context())
+            .unwrap();
 
         let index = ALPN_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
         ssl.set_ex_data(index, cfg.alpn_protocols.clone());
