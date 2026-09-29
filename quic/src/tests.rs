@@ -689,6 +689,36 @@ fn rt_threaded() -> Runtime {
 }
 
 #[tokio::test]
+async fn retry_after_rebind() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let client = factory.endpoint();
+    server
+        .rebind(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+        .unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let incoming = server.accept().await.unwrap();
+        assert!(!incoming.remote_address_validated());
+        incoming.retry().unwrap();
+
+        let incoming = server.accept().await.unwrap();
+        assert!(incoming.remote_address_validated());
+        let (accepted, connected) = join!(incoming, connecting);
+        let _server_connection = accepted.unwrap();
+        let _client_connection = connected.unwrap();
+        server.close(0u32.into(), b"done");
+        client.close(0u32.into(), b"done");
+    })
+    .await
+    .expect("retried handshake must complete using the rebound socket");
+}
+
+#[tokio::test]
 async fn rebind_recv() {
     let _guard = subscribe();
 
@@ -756,6 +786,67 @@ async fn rebind_recv() {
     let mut stream = connection.accept_uni().await.unwrap();
     assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_address_monitoring() {
+    let _guard = subscribe();
+
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let server_addr = server.local_addr().unwrap();
+    let client = factory.endpoint();
+
+    let trigger_migration = Arc::new(tokio::sync::Notify::new());
+    let trigger_migration_clone = trigger_migration.clone();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let old_remote = conn.remote_address();
+        let mut addr_watch = conn.watch_remote_address();
+
+        trigger_migration_clone.notify_one();
+
+        let addr_a = addr_watch.wait().await.unwrap();
+        assert_eq!(addr_a.port(), 23_001);
+        assert_ne!(old_remote, addr_a);
+
+        trigger_migration_clone.notify_one();
+
+        let addr_b = addr_watch.wait().await.unwrap();
+        assert_eq!(addr_b.port(), 23_003);
+        assert_ne!(addr_a, addr_b);
+    });
+
+    let client_conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+
+    let mut port = 23_000;
+    let mut migrate = async || {
+        port += 1;
+        client
+            .rebind(
+                UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).unwrap(),
+            )
+            .unwrap();
+
+        // send data from the new socket to trigger migration on the server
+        let mut stream = client_conn.open_uni().await.unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        stream.finish().unwrap();
+    };
+
+    trigger_migration.notified().await;
+    migrate().await;
+    trigger_migration.notified().await;
+    migrate().await;
+    migrate().await;
+
+    server_task.await.unwrap();
+    client_conn.close(0u32.into(), b"done");
 }
 
 #[tokio::test]
@@ -931,6 +1022,49 @@ async fn stream_stopped() {
     let (client, conn) = tokio::join!(client, server);
     client.expect("timeout");
     drop(conn);
+}
+
+#[tokio::test]
+async fn stopped_stream_without_connection_credit() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let mut transport = TransportConfig::default();
+    transport.receive_window(0u32.into());
+    let client = factory.endpoint_with_config(transport);
+
+    timeout(Duration::from_secs(5), async {
+        let (client_conn, server_conn) = tokio::join!(
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap(),
+            async { server.accept().await.unwrap().await },
+        );
+        let client_conn = client_conn.unwrap();
+        let server_conn = server_conn.unwrap();
+        let (mut request, mut response) = client_conn.open_bi().await.unwrap();
+        request.write_all(b"request").await.unwrap();
+        request.finish().unwrap();
+        let (mut send, mut recv) = server_conn.accept_bi().await.unwrap();
+        assert_eq!(recv.read_to_end(7).await.unwrap(), b"request");
+
+        let stopped = send.stopped();
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut write = pin!(send.write(b"response"));
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        let wakes = counter.wakes();
+
+        response.stop(42u32.into()).unwrap();
+        assert_eq!(stopped.await.unwrap(), Some(42u32.into()));
+        assert!(counter.wakes() > wakes, "STOP_SENDING must wake the writer");
+        assert!(matches!(
+            write.as_mut().poll(&mut cx),
+            Poll::Ready(Err(crate::WriteError::Stopped(code))) if code == 42u32.into()
+        ));
+    })
+    .await
+    .expect("stopped write must resolve without new connection credit");
 }
 
 #[tokio::test]
@@ -1132,24 +1266,28 @@ static VTABLE: RawWakerVTable =
     RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref_waker, drop_waker);
 
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
-    let arc = Arc::<WakeCounter>::from_raw(data as *const WakeCounter);
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    let arc = unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) };
     let cloned = arc.clone();
     std::mem::forget(arc);
     raw_waker(cloned)
 }
 
 unsafe fn wake_waker(data: *const ()) {
-    let arc = Arc::<WakeCounter>::from_raw(data as *const WakeCounter);
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    let arc = unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) };
     arc.wakes.fetch_add(1, Ordering::SeqCst);
     // arc drops here
 }
 
 unsafe fn wake_by_ref_waker(data: *const ()) {
-    let arc = Arc::<WakeCounter>::from_raw(data as *const WakeCounter);
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    let arc = unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) };
     arc.wakes.fetch_add(1, Ordering::SeqCst);
     std::mem::forget(arc);
 }
 
 unsafe fn drop_waker(data: *const ()) {
-    drop(Arc::<WakeCounter>::from_raw(data as *const WakeCounter));
+    // SAFETY: pointer always comes from `Arc::into_raw()` (see `raw_waker()`)
+    drop(unsafe { Arc::<WakeCounter>::from_raw(data as *const WakeCounter) });
 }

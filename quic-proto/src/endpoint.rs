@@ -91,6 +91,8 @@ impl Endpoint {
     }
 
     /// Replace the server configuration, affecting new incoming connections only
+    ///
+    /// Pending incoming connections retain the configuration active when they first arrived.
     pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
         self.server_config = server_config;
     }
@@ -173,6 +175,13 @@ impl Endpoint {
                     debug!("dropping packet with unsupported version");
                     return None;
                 }
+                // RFC 9000 §5.2.2: "Servers MUST drop smaller packets that specify unsupported
+                // versions." Responding to short packets would let a spoofed source elicit a
+                // Version Negotiation packet larger than the datagram that triggered it.
+                if datagram_len < MIN_INITIAL_SIZE as usize {
+                    debug!("dropping short packet with unsupported version");
+                    return None;
+                }
                 trace!("sending version negotiation");
                 // Negotiate versions
                 Header::VersionNegotiate {
@@ -211,7 +220,7 @@ impl Endpoint {
             match route_to {
                 RouteDatagramTo::Incoming(incoming_idx) => {
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
-                    let config = &self.server_config.as_ref().unwrap();
+                    let config = &incoming_buffer.server_config;
 
                     if incoming_buffer
                         .total_bytes
@@ -344,7 +353,7 @@ impl Endpoint {
         trace!(initial_dcid = %remote_id);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
-        let loc_cid = self.new_cid(ch);
+        let loc_cid = self.new_cid(RouteDatagramTo::Connection(ch));
         let mut params = TransportParameters::new(
             &config.transport,
             &self.config,
@@ -355,14 +364,12 @@ impl Endpoint {
         );
 
         let enable_initial_rtt = config.transport.enable_initial_rtt;
-        let cached_initial_rtt = if enable_initial_rtt {
-            config
-                .server_rtt_store
-                .get(server_name, remote.port())
-                .and_then(server_rtt::encode)
+        let cached_server_rtt = if enable_initial_rtt {
+            config.server_rtt_store.get(server_name, remote.port())
         } else {
             None
         };
+        let cached_initial_rtt = cached_server_rtt.and_then(server_rtt::encode);
         params.initial_rtt_tp = cached_initial_rtt.map(|(_, value)| value);
 
         let tls = config
@@ -387,6 +394,7 @@ impl Endpoint {
                 server_name: server_name.into(),
                 server_port: remote.port(),
                 initial_rtt: cached_initial_rtt.map(|(rtt, _)| rtt),
+                cached_server_rtt,
                 server_rtt_store: enable_initial_rtt.then_some(config.server_rtt_store),
             },
         );
@@ -401,7 +409,7 @@ impl Endpoint {
     ) -> ConnectionEvent {
         let mut ids = vec![];
         for _ in 0..num {
-            let id = self.new_cid(ch);
+            let id = self.new_cid(RouteDatagramTo::Connection(ch));
             let meta = &mut self.connections[ch];
             let sequence = meta.cids_issued;
             meta.cids_issued += 1;
@@ -415,8 +423,8 @@ impl Endpoint {
         ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids, now))
     }
 
-    /// Generate a connection ID for `ch`
-    fn new_cid(&mut self, ch: ConnectionHandle) -> ConnectionId {
+    /// Generate and reserve a local connection ID
+    fn new_cid(&mut self, route_to: RouteDatagramTo) -> ConnectionId {
         loop {
             let cid = self.local_cid_generator.generate_cid();
             if cid.is_empty() {
@@ -425,7 +433,7 @@ impl Endpoint {
                 return cid;
             }
             if let hash_map::Entry::Vacant(e) = self.index.connection_ids.entry(cid) {
-                e.insert(ch);
+                e.insert(route_to);
                 break cid;
             }
         }
@@ -521,7 +529,11 @@ impl Endpoint {
             }
         };
 
-        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer::default());
+        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
+            server_config,
+            datagrams: Vec::new(),
+            total_bytes: 0,
+        });
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
@@ -552,9 +564,6 @@ impl Endpoint {
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<(ConnectionHandle, Connection), Box<AcceptError>> {
         let remote_address_validated = incoming.remote_address_validated();
-        incoming.improper_drop_warner.dismiss();
-        let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
-        self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
 
         let packet_number = incoming.packet.header.number.expand(0);
         let InitialHeader {
@@ -563,8 +572,11 @@ impl Endpoint {
             version,
             ..
         } = incoming.packet.header;
-        let server_config =
-            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+        let server_config = server_config.unwrap_or_else(|| {
+            self.incoming_buffers[incoming.incoming_idx]
+                .server_config
+                .clone()
+        });
 
         if server_config
             .transport
@@ -574,7 +586,7 @@ impl Endpoint {
             })
         {
             debug!("abandoning accept of stale initial");
-            self.index.remove_initial(dst_cid);
+            self.ignore(incoming);
             return Err(Box::new(AcceptError {
                 cause: ConnectionError::TimedOut,
                 response: None,
@@ -583,17 +595,18 @@ impl Endpoint {
 
         if self.cids_exhausted() {
             debug!("refusing connection");
-            self.index.remove_initial(dst_cid);
+            let response = self.initial_close(
+                version,
+                incoming.addresses,
+                &incoming.crypto,
+                src_cid,
+                TransportError::CONNECTION_REFUSED(""),
+                buf,
+            );
+            self.ignore(incoming);
             return Err(Box::new(AcceptError {
                 cause: ConnectionError::CidsExhausted,
-                response: Some(self.initial_close(
-                    version,
-                    incoming.addresses,
-                    &incoming.crypto,
-                    src_cid,
-                    TransportError::CONNECTION_REFUSED(""),
-                    buf,
-                )),
+                response: Some(response),
             }));
         }
 
@@ -609,15 +622,18 @@ impl Endpoint {
             .is_err()
         {
             debug!(packet_number, "failed to authenticate initial packet");
-            self.index.remove_initial(dst_cid);
+            self.ignore(incoming);
             return Err(Box::new(AcceptError {
                 cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
                 response: None,
             }));
         };
 
+        incoming.improper_drop_warner.dismiss();
+        let incoming_buffer = self.remove_incoming_buffer(incoming.incoming_idx);
+
         let ch = ConnectionHandle(self.connections.vacant_key());
-        let loc_cid = self.new_cid(ch);
+        let loc_cid = self.new_cid(RouteDatagramTo::Connection(ch));
         let mut params = TransportParameters::new(
             &server_config.transport,
             &self.config,
@@ -631,7 +647,7 @@ impl Endpoint {
         params.retry_src_cid = incoming.token.retry_src_cid;
         let mut pref_addr_cid = None;
         if server_config.has_preferred_address() {
-            let cid = self.new_cid(ch);
+            let cid = self.new_cid(RouteDatagramTo::Connection(ch));
             pref_addr_cid = Some(cid);
             params.preferred_address = Some(PreferredAddress {
                 address_v4: server_config.preferred_address_v4,
@@ -643,23 +659,38 @@ impl Endpoint {
 
         let tls = server_config.crypto.clone().start_session(version, &params);
         let transport_config = server_config.transport.clone();
-        let mut conn = self.add_connection(
-            ch,
-            version,
+        let mut rng_seed = [0; 32];
+        self.rng.fill_bytes(&mut rng_seed);
+        let mut conn = Connection::new(
+            self.config.clone(),
+            transport_config,
             dst_cid,
             loc_cid,
             src_cid,
-            incoming.addresses,
-            incoming.received_at,
+            incoming.addresses.remote,
+            incoming.addresses.local_ip,
             tls,
-            transport_config,
+            self.local_cid_generator.cid_len(),
+            self.local_cid_generator.cid_lifetime(),
+            incoming.received_at,
+            version,
+            self.allow_mtud,
+            rng_seed,
             SideArgs::Server {
                 server_config,
                 pref_addr_cid,
                 path_validated: remote_address_validated,
             },
         );
-        self.index.insert_initial(dst_cid, ch);
+
+        self.register_connection(
+            ch,
+            dst_cid,
+            loc_cid,
+            pref_addr_cid,
+            incoming.addresses,
+            Side::Server,
+        );
 
         match conn.handle_first_packet(
             incoming.received_at,
@@ -681,8 +712,8 @@ impl Endpoint {
             Err(e) => {
                 debug!("handshake failed: {}", e);
                 self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
-                let response = match e {
-                    ConnectionError::TransportError(ref e) => Some(self.initial_close(
+                let response = match &e {
+                    ConnectionError::TransportError(e) => Some(self.initial_close(
                         version,
                         incoming.addresses,
                         &incoming.crypto,
@@ -724,7 +755,7 @@ impl Endpoint {
 
     /// Reject this incoming connection attempt
     pub fn refuse(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Transmit {
-        self.clean_up_incoming(&incoming);
+        self.remove_incoming_state(&incoming);
         incoming.improper_drop_warner.dismiss();
 
         self.initial_close(
@@ -745,10 +776,11 @@ impl Endpoint {
             return Err(RetryError(Box::new(incoming)));
         }
 
-        self.clean_up_incoming(&incoming);
+        let server_config = self.incoming_buffers[incoming.incoming_idx]
+            .server_config
+            .clone();
+        self.remove_incoming_state(&incoming);
         incoming.improper_drop_warner.dismiss();
-
-        let server_config = self.server_config.as_ref().unwrap();
 
         // First Initial
         // The peer will use this as the DCID of its following Initials. Initial DCIDs are
@@ -794,15 +826,20 @@ impl Endpoint {
     /// Doing this actively, rather than merely dropping the [`Incoming`], is necessary to prevent
     /// memory leaks due to state within [`Endpoint`] tracking the incoming connection.
     pub fn ignore(&mut self, incoming: Incoming) {
-        self.clean_up_incoming(&incoming);
+        self.remove_incoming_state(&incoming);
         incoming.improper_drop_warner.dismiss();
     }
 
-    /// Clean up endpoint data structures associated with an `Incoming`.
-    fn clean_up_incoming(&mut self, incoming: &Incoming) {
+    /// Remove endpoint state associated with an `Incoming`.
+    fn remove_incoming_state(&mut self, incoming: &Incoming) {
         self.index.remove_initial(incoming.packet.header.dst_cid);
-        let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
+        self.remove_incoming_buffer(incoming.incoming_idx);
+    }
+
+    fn remove_incoming_buffer(&mut self, incoming_idx: usize) -> IncomingBuffer {
+        let incoming_buffer = self.incoming_buffers.remove(incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+        incoming_buffer
     }
 
     fn add_connection(
@@ -831,7 +868,8 @@ impl Endpoint {
             addresses.remote,
             addresses.local_ip,
             tls,
-            self.local_cid_generator.as_ref(),
+            self.local_cid_generator.cid_len(),
+            self.local_cid_generator.cid_lifetime(),
             now,
             version,
             self.allow_mtud,
@@ -839,6 +877,21 @@ impl Endpoint {
             side_args,
         );
 
+        self.register_connection(ch, init_cid, loc_cid, pref_addr_cid, addresses, side);
+
+        conn
+    }
+
+    /// Register endpoint-owned metadata and routes for an active connection.
+    fn register_connection(
+        &mut self,
+        ch: ConnectionHandle,
+        init_cid: ConnectionId,
+        loc_cid: ConnectionId,
+        pref_addr_cid: Option<ConnectionId>,
+        addresses: FourTuple,
+        side: Side,
+    ) {
         let mut cids_issued = 0;
         let mut loc_cids = FxHashMap::default();
 
@@ -861,9 +914,30 @@ impl Endpoint {
         });
         debug_assert_eq!(id, ch.0, "connection handle allocation out of sync");
 
-        self.index.insert_conn(addresses, loc_cid, ch, side);
-
-        conn
+        let conn_meta = &self.connections[ch];
+        if conn_meta.side.is_server() {
+            self.index.insert_initial(conn_meta.init_cid, ch);
+        }
+        for cid in conn_meta.loc_cids.values() {
+            if cid.is_empty() {
+                match conn_meta.side {
+                    Side::Server => {
+                        self.index
+                            .incoming_connection_remotes
+                            .insert(conn_meta.addresses, ch);
+                    }
+                    Side::Client => {
+                        self.index
+                            .outgoing_connection_remotes
+                            .insert(conn_meta.addresses.remote, ch);
+                    }
+                }
+            } else {
+                self.index
+                    .connection_ids
+                    .insert(*cid, RouteDatagramTo::Connection(ch));
+            }
+        }
     }
 
     fn initial_close(
@@ -975,8 +1049,8 @@ impl fmt::Debug for Endpoint {
 }
 
 /// Buffered Initial and 0-RTT messages for a pending incoming connection
-#[derive(Default)]
 struct IncomingBuffer {
+    server_config: Arc<ServerConfig>,
     datagrams: Vec<DatagramConnectionEvent>,
     total_bytes: u64,
 }
@@ -1000,7 +1074,7 @@ struct ConnectionIndex {
     /// Identifies connections based on locally created CIDs
     ///
     /// Uses a cheaper hash function since keys are locally created
-    connection_ids: FxHashMap<ConnectionId, ConnectionHandle>,
+    connection_ids: FxHashMap<ConnectionId, RouteDatagramTo>,
     /// Identifies incoming connections with zero-length CIDs
     ///
     /// Uses a standard `HashMap` to protect against hash collision attacks.
@@ -1049,32 +1123,6 @@ impl ConnectionIndex {
             .insert(dst_cid, RouteDatagramTo::Connection(connection));
     }
 
-    /// Associate a connection with its first locally-chosen destination CID if used, or otherwise
-    /// its current 4-tuple
-    fn insert_conn(
-        &mut self,
-        addresses: FourTuple,
-        dst_cid: ConnectionId,
-        connection: ConnectionHandle,
-        side: Side,
-    ) {
-        match dst_cid.len() {
-            0 => match side {
-                Side::Server => {
-                    self.incoming_connection_remotes
-                        .insert(addresses, connection);
-                }
-                Side::Client => {
-                    self.outgoing_connection_remotes
-                        .insert(addresses.remote, connection);
-                }
-            },
-            _ => {
-                self.connection_ids.insert(dst_cid, connection);
-            }
-        }
-    }
-
     /// Discard a connection ID
     fn retire(&mut self, dst_cid: ConnectionId) {
         self.connection_ids.remove(&dst_cid);
@@ -1098,15 +1146,15 @@ impl ConnectionIndex {
 
     /// Find the existing connection that `datagram` should be routed to, if any
     fn get(&self, addresses: &FourTuple, datagram: &PartialDecode) -> Option<RouteDatagramTo> {
-        if !datagram.dst_cid().is_empty() {
-            if let Some(&ch) = self.connection_ids.get(&datagram.dst_cid()) {
-                return Some(RouteDatagramTo::Connection(ch));
-            }
+        if !datagram.dst_cid().is_empty()
+            && let Some(&route) = self.connection_ids.get(&datagram.dst_cid())
+        {
+            return Some(route);
         }
-        if datagram.is_initial() || datagram.is_0rtt() {
-            if let Some(&ch) = self.connection_ids_initial.get(&datagram.dst_cid()) {
-                return Some(ch);
-            }
+        if (datagram.is_initial() || datagram.is_0rtt())
+            && let Some(&route) = self.connection_ids_initial.get(&datagram.dst_cid())
+        {
+            return Some(route);
         }
         if datagram.dst_cid().is_empty() {
             if let Some(&ch) = self.incoming_connection_remotes.get(addresses) {

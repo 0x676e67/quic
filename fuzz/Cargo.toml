@@ -3,7 +3,7 @@ name = "fuzz"
 version = "0.1.0"
 license.workspace = true
 authors.workspace = true
-edition = "2021"
+edition.workspace = true
 publish = false
 
 [package.metadata]

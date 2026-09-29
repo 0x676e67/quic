@@ -1,22 +1,20 @@
 # quic
 
-A [Sans-I/O][sans-io] aware, QUIC implementation for Rust.
-
 [![CI](https://github.com/0x676e67/quic/actions/workflows/rust.yml/badge.svg)](https://github.com/0x676e67/quic/actions/workflows/rust.yml)
 [![GitHub License](https://img.shields.io/github/license/0x676e67/quic)](https://github.com/0x676e67/quic/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/quic.svg)](https://crates.io/crates/quic)
 
-More information about this crate can be found in the [crate documentation](https://docs.rs/quic).
+A [Sans-I/O][sans-io] aware, QUIC implementation for Rust.
 
 ## Features
 
-- QUIC version 1 ([RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)), secured with TLS ([RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)).
+- QUIC version 1 per [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html), secured with TLS per [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html).
 - Loss detection and congestion control based on [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html).
-- Ordered and unordered streams, plus unreliable datagrams ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
+- Ordered and unordered streams, plus unreliable datagrams per [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html).
 - 0-RTT data for resumed connections.
 - Connection migration and path MTU discovery based on [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html).
 - Async APIs for Linux, macOS and Windows; pluggable cryptography with [rustls][rustls] and [*ring*][ring].
-- Minimum supported Rust version: 1.88.0.
+- Continues the [quinn] codebase, tracking upstream changes.
 
 ## Usage
 
@@ -24,7 +22,7 @@ To use `quic`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-quic = "0.11"
+quic = "0.12"
 ```
 
 Next, add this to your crate:
@@ -48,11 +46,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the [Apache-2.0](LICENSE) license,
 shall be licensed as above, without any additional terms or conditions.
 
-## Accolades
-
-The project is based on a fork of [quinn](https://github.com/quinn-rs/quinn).
-
 [quic]: https://quicwg.github.io/
+[quinn]: https://github.com/quinn-rs/quinn
 [issues]: https://github.com/0x676e67/quic/issues
 [rustls]: https://github.com/ctz/rustls
 [ring]: https://github.com/briansmith/ring
