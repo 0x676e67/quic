@@ -1,5 +1,5 @@
 use crate::crypto::btls::alert::Alert;
-use crate::crypto::btls::error::{Result, map_result};
+use crate::crypto::btls::error::Result;
 use crate::crypto::btls::secret::{Secret, Secrets, SecretsBuilder};
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::{Error, HandshakeData, Level, QuicSsl, QuicVersion, SslError, retry};
@@ -7,30 +7,30 @@ use crate::{
     ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
 };
 use btls::error::ErrorStack;
-use btls::ssl::{NameType, Ssl};
+use btls::ex_data::Index;
+use btls::ssl::{NameType, Ssl, SslRef};
 use btls::x509::X509;
 use btls_sys as bffi;
 use bytes::{Buf, BytesMut};
-use foreign_types_shared::ForeignType;
+use foreign_types_shared::ForeignTypeRef;
 use std::any::Any;
 use std::ffi::c_int;
 use std::io::Cursor;
 use std::result::Result as StdResult;
 use std::slice;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use tracing::{error, trace, warn};
 
 pub(crate) static QUIC_METHOD: bffi::SSL_QUIC_METHOD = bffi::SSL_QUIC_METHOD {
-    set_read_secret: Some(SessionState::set_read_secret_callback),
-    set_write_secret: Some(SessionState::set_write_secret_callback),
-    add_handshake_data: Some(SessionState::add_handshake_data_callback),
-    flush_flight: Some(SessionState::flush_flight_callback),
-    send_alert: Some(SessionState::send_alert_callback),
+    set_read_secret: Some(QuicState::set_read_secret_callback),
+    set_write_secret: Some(QuicState::set_write_secret_callback),
+    add_handshake_data: Some(QuicState::add_handshake_data_callback),
+    flush_flight: Some(QuicState::flush_flight_callback),
+    send_alert: Some(QuicState::send_alert_callback),
 };
 
-static SESSION_INDEX: LazyLock<c_int> = LazyLock::new(|| unsafe {
-    bffi::SSL_get_ex_new_index(0, std::ptr::null_mut(), std::ptr::null_mut(), None, None)
-});
+static QUIC_STATE_INDEX: LazyLock<Option<Index<Ssl, Arc<Mutex<QuicState>>>>> =
+    LazyLock::new(|| Ssl::new_ex_index().ok());
 
 pub(crate) struct SessionState {
     pub(crate) ssl: Ssl,
@@ -40,56 +40,37 @@ pub(crate) struct SessionState {
     pub(crate) early_data_rejected: bool,
 
     side: Side,
-    /// The first fatal error of the handshake: a TLS alert, or a failed BoringSSL callback.
-    error: Option<TransportError>,
+    /// The state the `SSL_QUIC_METHOD` callbacks write to. It is shared with the ex_data of
+    /// `ssl`, so it must not be locked across calls into BoringSSL.
+    quic: Arc<Mutex<QuicState>>,
     next_secrets: Option<Secrets>,
-    write_level: Level,
-    levels: [LevelState; Level::NUM_LEVELS],
     handshaking: bool,
 }
 
 impl SessionState {
-    pub(crate) fn new(ssl: Ssl, side: Side, version: QuicVersion) -> Result<Box<Self>> {
-        let levels = [
-            LevelState::new(version, Level::Initial, &ssl),
-            LevelState::new(version, Level::EarlyData, &ssl),
-            LevelState::new(version, Level::Handshake, &ssl),
-            LevelState::new(version, Level::Application, &ssl),
-        ];
+    pub(crate) fn new(mut ssl: Ssl, side: Side, version: QuicVersion) -> Result<Self> {
+        let quic = Arc::new(Mutex::new(QuicState {
+            write_level: Level::Initial,
+            levels: [
+                LevelState::new(version, Level::Initial, &ssl),
+                LevelState::new(version, Level::EarlyData, &ssl),
+                LevelState::new(version, Level::Handshake, &ssl),
+                LevelState::new(version, Level::Application, &ssl),
+            ],
+            error: None,
+        }));
+        let index = QUIC_STATE_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
+        ssl.set_ex_data(index, quic.clone());
 
-        let mut state = Box::new(Self {
+        Ok(Self {
             ssl,
             version,
             side,
-            error: None,
+            quic,
             next_secrets: None,
-            write_level: Level::Initial,
-            levels,
             early_data_rejected: false,
             handshaking: true,
-        });
-
-        // Registers this instance as ex data on the underlying Ssl in order to support
-        // BoringSSL callbacks to this instance.
-        unsafe {
-            map_result(bffi::SSL_set_ex_data(
-                state.ssl.as_ptr(),
-                *SESSION_INDEX,
-                &mut *state as *mut Self as *mut _,
-            ))?;
-        }
-
-        Ok(state)
-    }
-
-    #[inline]
-    fn level_state(&self, level: Level) -> &LevelState {
-        &self.levels[level as usize]
-    }
-
-    #[inline]
-    fn level_state_mut(&mut self, level: Level) -> &mut LevelState {
-        &mut self.levels[level as usize]
+        })
     }
 
     #[inline]
@@ -158,9 +139,12 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<crypto::Keys> {
+        let mut quic = lock(&self.quic);
+
         // Write all available data at the current write level. Whatever is written here
         // belongs to the level in effect before any switch below.
-        let write_state = self.level_state_mut(self.write_level);
+        let write_level = quic.write_level;
+        let write_state = quic.level_state_mut(write_level);
         if write_state.write_buffer.has_remaining() {
             buf.extend_from_slice(&write_state.write_buffer);
             write_state.write_buffer.clear();
@@ -170,12 +154,12 @@ impl SessionState {
         // The server only learns the application read secret after the client Finished,
         // so the application keys may become available several calls after the write
         // secret did.
-        let next_write_level = self.write_level.next();
-        if next_write_level == self.write_level {
+        let next_write_level = write_level.next();
+        if next_write_level == write_level {
             return None;
         }
-        let secrets = self.level_state(next_write_level).builder.build()?;
-        self.write_level = next_write_level;
+        let secrets = quic.level_state(next_write_level).builder.build()?;
+        quic.write_level = next_write_level;
 
         if next_write_level == Level::Application {
             // Keep the next application secrets for `next_1rtt_keys`.
@@ -220,7 +204,8 @@ impl SessionState {
     pub(crate) fn early_crypto(
         &self,
     ) -> Option<(Box<dyn crypto::HeaderKey>, Box<dyn crypto::PacketKey>)> {
-        let builder = &self.level_state(Level::EarlyData).builder;
+        let quic = lock(&self.quic);
+        let builder = &quic.level_state(Level::EarlyData).builder;
         let version = builder.version;
         let suite = builder.suite?;
         let early_secret = match self.side {
@@ -281,7 +266,7 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn check_error(&self) -> StdResult<(), TransportError> {
-        if let Some(error) = &self.error {
+        if let Some(error) = &lock(&self.quic).error {
             return Err(error.clone());
         }
         Ok(())
@@ -329,8 +314,31 @@ impl SessionState {
     }
 }
 
+/// Locks `quic`, which stays usable if a thread panicked while holding it.
+fn lock(quic: &Mutex<QuicState>) -> MutexGuard<'_, QuicState> {
+    quic.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The state of the `SSL_QUIC_METHOD` callbacks.
+struct QuicState {
+    write_level: Level,
+    levels: [LevelState; Level::NUM_LEVELS],
+    /// The first fatal error of the handshake: a TLS alert, or a failed BoringSSL callback.
+    error: Option<TransportError>,
+}
+
 // BoringSSL event handlers.
-impl SessionState {
+impl QuicState {
+    #[inline]
+    fn level_state(&self, level: Level) -> &LevelState {
+        &self.levels[level as usize]
+    }
+
+    #[inline]
+    fn level_state_mut(&mut self, level: Level) -> &mut LevelState {
+        &mut self.levels[level as usize]
+    }
+
     /// Callback from BoringSSL that configures the read secret and cipher suite for the given
     /// encryption level. If an error is returned, the handshake is terminated with an error.
     /// This function will be called at most once per encryption level.
@@ -400,67 +408,24 @@ impl SessionState {
         self.error.get_or_insert_with(|| alert.into());
         Ok(())
     }
-
-    /// Callback from BoringSSL to handle (i.e. log) info events.
-    fn on_info(&self, type_: c_int, value: c_int) {
-        if type_ & bffi::SSL_CB_LOOP > 0 {
-            trace!("SSL:ACCEPT_LOOP:{}", self.ssl.state_string());
-        } else if type_ & bffi::SSL_CB_ALERT > 0 {
-            let prefix = if type_ & bffi::SSL_CB_READ > 0 {
-                "SSL:ALERT:READ:"
-            } else {
-                "SSL:ALERT:WRITE:"
-            };
-
-            if ((type_ & 0xF0) >> 8) == bffi::SSL3_AL_WARNING {
-                warn!("{}{}", prefix, self.ssl.state_string());
-            } else {
-                error!("{}{}", prefix, self.ssl.state_string());
-            }
-        } else if type_ & bffi::SSL_CB_EXIT > 0 {
-            if value == 1 {
-                trace!("SSL:ACCEPT_EXIT_OK:{}", self.ssl.state_string());
-            } else {
-                // Not necessarily an actual error. It could just require additional
-                // data from the other side.
-                trace!("SSL:ACCEPT_EXIT_FAIL:{}", self.ssl.state_string());
-            }
-        } else if type_ & bffi::SSL_CB_HANDSHAKE_START > 0 {
-            trace!("SSL:HANDSHAKE_START:{}", self.ssl.state_string());
-        } else if type_ & bffi::SSL_CB_HANDSHAKE_DONE > 0 {
-            trace!("SSL:HANDSHAKE_DONE:{}", self.ssl.state_string());
-        } else {
-            warn!(
-                "SSL:unknown event type {}:{}",
-                type_,
-                self.ssl.state_string()
-            );
-        }
-    }
 }
 
 // Raw callbacks from BoringSSL
-impl SessionState {
-    /// Called by the static callbacks to retrieve the instance pointer.
-    #[inline]
-    fn get_instance(ssl: *const bffi::SSL) -> &'static mut Self {
-        unsafe {
-            let data = bffi::SSL_get_ex_data(ssl, *SESSION_INDEX);
-            if data.is_null() {
-                panic!("BUG: SessionState instance missing")
-            }
-            &mut *(data as *mut Self)
-        }
-    }
-
-    /// Maps the result of a callback to its return value. BoringSSL fails the handshake
+impl QuicState {
+    /// Runs `f` on the state of `ssl` for a BoringSSL callback. BoringSSL fails the handshake
     /// without a reason when a callback returns 0, so the error is kept for
-    /// [`Self::check_error`].
-    fn map_cb_result(&mut self, result: Result<()>) -> c_int {
-        match result {
+    /// [`SessionState::check_error`].
+    fn callback(ssl: *const bffi::SSL, f: impl FnOnce(&mut Self) -> Result<()>) -> c_int {
+        // SAFETY: BoringSSL passes the callbacks the `SSL` they run for.
+        let ssl = unsafe { SslRef::from_ptr(ssl.cast_mut()) };
+        let Some(quic) = (*QUIC_STATE_INDEX).and_then(|index| ssl.ex_data(index)) else {
+            return 0;
+        };
+        let mut quic = lock(quic);
+        match f(&mut quic) {
             Ok(()) => 1,
             Err(e) => {
-                self.error.get_or_insert_with(|| {
+                quic.error.get_or_insert_with(|| {
                     TransportError::new(Alert::internal_error().into(), e.to_string())
                 });
                 0
@@ -490,11 +455,11 @@ impl SessionState {
         secret: *const u8,
         secret_len: usize,
     ) -> c_int {
-        let inst = Self::get_instance(ssl);
         let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
-        let result = Self::parse_secret(cipher, secret)
-            .and_then(|(suite, secret)| inst.on_set_read_secret(level.into(), suite, secret));
-        inst.map_cb_result(result)
+        Self::callback(ssl, |quic| {
+            let (suite, secret) = Self::parse_secret(cipher, secret)?;
+            quic.on_set_read_secret(level.into(), suite, secret)
+        })
     }
 
     extern "C" fn set_write_secret_callback(
@@ -504,11 +469,11 @@ impl SessionState {
         secret: *const u8,
         secret_len: usize,
     ) -> c_int {
-        let inst = Self::get_instance(ssl);
         let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
-        let result = Self::parse_secret(cipher, secret)
-            .and_then(|(suite, secret)| inst.on_set_write_secret(level.into(), suite, secret));
-        inst.map_cb_result(result)
+        Self::callback(ssl, |quic| {
+            let (suite, secret) = Self::parse_secret(cipher, secret)?;
+            quic.on_set_write_secret(level.into(), suite, secret)
+        })
     }
 
     extern "C" fn add_handshake_data_callback(
@@ -517,17 +482,12 @@ impl SessionState {
         data: *const u8,
         len: usize,
     ) -> c_int {
-        let inst = Self::get_instance(ssl);
-        let level: Level = level.into();
         let data = unsafe { slice::from_raw_parts(data, len) };
-        let result = inst.on_add_handshake_data(level, data);
-        inst.map_cb_result(result)
+        Self::callback(ssl, |quic| quic.on_add_handshake_data(level.into(), data))
     }
 
     extern "C" fn flush_flight_callback(ssl: *mut bffi::SSL) -> c_int {
-        let inst = Self::get_instance(ssl);
-        let result = inst.on_flush_flight();
-        inst.map_cb_result(result)
+        Self::callback(ssl, Self::on_flush_flight)
     }
 
     extern "C" fn send_alert_callback(
@@ -535,15 +495,50 @@ impl SessionState {
         level: bffi::ssl_encryption_level_t,
         alert: u8,
     ) -> c_int {
-        let inst = Self::get_instance(ssl);
-        let level: Level = level.into();
-        let result = inst.on_send_alert(level, Alert::from(alert));
-        inst.map_cb_result(result)
+        Self::callback(ssl, |quic| {
+            quic.on_send_alert(level.into(), Alert::from(alert))
+        })
+    }
+}
+
+impl SessionState {
+    /// Callback from BoringSSL to handle (i.e. log) info events.
+    fn on_info(ssl: &SslRef, type_: c_int, value: c_int) {
+        if type_ & bffi::SSL_CB_LOOP > 0 {
+            trace!("SSL:ACCEPT_LOOP:{}", ssl.state_string());
+        } else if type_ & bffi::SSL_CB_ALERT > 0 {
+            let prefix = if type_ & bffi::SSL_CB_READ > 0 {
+                "SSL:ALERT:READ:"
+            } else {
+                "SSL:ALERT:WRITE:"
+            };
+
+            if ((type_ & 0xF0) >> 8) == bffi::SSL3_AL_WARNING {
+                warn!("{}{}", prefix, ssl.state_string());
+            } else {
+                error!("{}{}", prefix, ssl.state_string());
+            }
+        } else if type_ & bffi::SSL_CB_EXIT > 0 {
+            if value == 1 {
+                trace!("SSL:ACCEPT_EXIT_OK:{}", ssl.state_string());
+            } else {
+                // Not necessarily an actual error. It could just require additional
+                // data from the other side.
+                trace!("SSL:ACCEPT_EXIT_FAIL:{}", ssl.state_string());
+            }
+        } else if type_ & bffi::SSL_CB_HANDSHAKE_START > 0 {
+            trace!("SSL:HANDSHAKE_START:{}", ssl.state_string());
+        } else if type_ & bffi::SSL_CB_HANDSHAKE_DONE > 0 {
+            trace!("SSL:HANDSHAKE_DONE:{}", ssl.state_string());
+        } else {
+            warn!("SSL:unknown event type {}:{}", type_, ssl.state_string());
+        }
     }
 
     pub(crate) extern "C" fn info_callback(ssl: *const bffi::SSL, type_: c_int, value: c_int) {
-        let inst = Self::get_instance(ssl);
-        inst.on_info(type_, value);
+        // SAFETY: BoringSSL passes the callback the `SSL` it runs for.
+        let ssl = unsafe { SslRef::from_ptr(ssl.cast_mut()) };
+        Self::on_info(ssl, type_, value);
     }
 }
 
@@ -570,6 +565,7 @@ mod tests {
     use crate::TransportErrorCode;
     use crate::crypto::btls::QuicSslContext;
     use btls::ssl::{SslContextBuilder, SslMethod};
+    use foreign_types_shared::ForeignType;
 
     #[test]
     fn callback_error_fails_handshake() {
@@ -583,7 +579,7 @@ mod tests {
         let cipher = |value| unsafe { bffi::SSL_get_cipher_by_value(value) };
 
         // TLS_AES_128_GCM_SHA256 for reading, then TLS_CHACHA20_POLY1305_SHA256 for writing.
-        let rc = SessionState::set_read_secret_callback(
+        let rc = QuicState::set_read_secret_callback(
             ssl,
             level,
             cipher(0x1301),
@@ -591,7 +587,7 @@ mod tests {
             secret.len(),
         );
         assert_eq!(rc, 1);
-        let rc = SessionState::set_write_secret_callback(
+        let rc = QuicState::set_write_secret_callback(
             ssl,
             level,
             cipher(0x1303),
@@ -600,7 +596,7 @@ mod tests {
         );
         assert_eq!(rc, 0);
         // A later alert does not replace the first error.
-        SessionState::send_alert_callback(ssl, level, bffi::SSL_AD_DECODE_ERROR as u8);
+        QuicState::send_alert_callback(ssl, level, bffi::SSL_AD_DECODE_ERROR as u8);
 
         let err = state.read_handshake(&[]).unwrap_err();
         assert_eq!(
@@ -609,7 +605,7 @@ mod tests {
         );
         assert!(err.reason.contains("cipher suite changed"), "{err}");
         assert!(
-            state
+            lock(&state.quic)
                 .level_state(Level::Handshake)
                 .builder
                 .build()

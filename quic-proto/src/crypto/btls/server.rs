@@ -1,6 +1,6 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
 use crate::crypto::btls::bffi_ext::QuicSsl;
-use crate::crypto::btls::error::{Result, map_result};
+use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::secret::Secrets;
 use crate::crypto::btls::session_state::{QUIC_METHOD, SessionState};
 use crate::crypto::btls::version::QuicVersion;
@@ -8,10 +8,11 @@ use crate::crypto::btls::{QuicSslContext, retry};
 use crate::{
     ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
 };
-use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVersion};
+use btls::ex_data::Index;
+use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslVersion};
 use btls_sys as bffi;
 use bytes::{Bytes, BytesMut};
-use foreign_types_shared::ForeignType;
+use foreign_types_shared::ForeignTypeRef;
 use std::any::Any;
 use std::ffi::{c_int, c_uint, c_void};
 use std::result::Result as StdResult;
@@ -122,15 +123,13 @@ impl crypto::ServerConfig for Config {
     }
 }
 
-static SESSION_INDEX: LazyLock<c_int> = LazyLock::new(|| unsafe {
-    bffi::SSL_get_ex_new_index(0, std::ptr::null_mut(), std::ptr::null_mut(), None, None)
-});
+/// The ALPN protocols the server accepts, for the ALPN callback.
+static ALPN_INDEX: LazyLock<Option<Index<Ssl, AlpnProtocols>>> =
+    LazyLock::new(|| Ssl::new_ex_index().ok());
 
 /// The [crypto::Session] implementation for BoringSSL.
 struct Session {
-    state: Box<SessionState>,
-    alpn: AlpnProtocols,
-    handshake_data_available: bool,
+    state: SessionState,
     handshake_data_sent: bool,
 }
 
@@ -155,61 +154,19 @@ impl Session {
         // Need to se
         ssl.set_quic_early_data_context(b"quinn-boring").unwrap();
 
-        let mut session = Box::new(Self {
+        let index = ALPN_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
+        ssl.set_ex_data(index, cfg.alpn_protocols.clone());
+
+        Ok(Box::new(Self {
             state: SessionState::new(ssl, Side::Server, version)?,
-            alpn: cfg.alpn_protocols.clone(),
-            handshake_data_available: false,
             handshake_data_sent: false,
-        });
-
-        // Register the instance in SSL ex_data. This allows the static callbacks to
-        // reference the instance.
-        unsafe {
-            map_result(bffi::SSL_set_ex_data(
-                session.state.ssl.as_ptr(),
-                *SESSION_INDEX,
-                &mut *session as *mut Self as *mut _,
-            ))?;
-        }
-
-        Ok(session)
-    }
-
-    /// Server-side only callback from BoringSSL to select the ALPN protocol.
-    #[inline]
-    fn on_alpn_select<'a>(&mut self, offered: &'a [u8]) -> Result<&'a [u8]> {
-        // Indicate that we now have handshake data available.
-        self.handshake_data_available = true;
-
-        self.alpn.select(offered)
-    }
-
-    /// Server-side only callback from BoringSSL indicating that the Server Name Indication (SNI)
-    /// extension in the client hello was successfully parsed.
-    #[inline]
-    fn on_server_name(&mut self, _: *mut c_int) -> c_int {
-        // Indicate that we now have handshake data available.
-        self.handshake_data_available = true;
-
-        // SSL_TLSEXT_ERR_OK causes the server_name extension to be acked in
-        // ServerHello.
-        bffi::SSL_TLSEXT_ERR_OK
+        }))
     }
 }
 
 // Raw callbacks from BoringSSL
 impl Session {
-    #[inline]
-    fn get_instance(ssl: *const bffi::SSL) -> &'static mut Self {
-        unsafe {
-            let data = bffi::SSL_get_ex_data(ssl, *SESSION_INDEX);
-            if data.is_null() {
-                panic!("BUG: Session instance missing")
-            }
-            &mut *(data as *mut Self)
-        }
-    }
-
+    /// Selects the ALPN protocol from the ones the client offered.
     extern "C" fn alpn_select_callback(
         ssl: *mut bffi::SSL,
         out: *mut *const u8,
@@ -218,11 +175,15 @@ impl Session {
         in_len: c_uint,
         _: *mut c_void,
     ) -> c_int {
-        let inst = Self::get_instance(ssl);
-
+        // SAFETY: BoringSSL passes the callback the `SSL` it runs for, the offered protocols,
+        // and the output slots for the selected one.
         unsafe {
+            let ssl = SslRef::from_ptr(ssl);
+            let Some(alpn) = (*ALPN_INDEX).and_then(|index| ssl.ex_data(index)) else {
+                return bffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+            };
             let protos = slice::from_raw_parts(in_, in_len as _);
-            match inst.on_alpn_select(protos) {
+            match alpn.select(protos) {
                 Ok(proto) => {
                     *out = proto.as_ptr() as _;
                     *out_len = proto.len() as _;
@@ -233,13 +194,11 @@ impl Session {
         }
     }
 
-    extern "C" fn server_name_callback(
-        ssl: *mut bffi::SSL,
-        out_alert: *mut c_int,
-        _: *mut c_void,
-    ) -> c_int {
-        let inst = Self::get_instance(ssl);
-        inst.on_server_name(out_alert)
+    /// Acknowledges the Server Name Indication (SNI) extension in the client hello.
+    extern "C" fn server_name_callback(_: *mut bffi::SSL, _: *mut c_int, _: *mut c_void) -> c_int {
+        // SSL_TLSEXT_ERR_OK causes the server_name extension to be acked in
+        // ServerHello.
+        bffi::SSL_TLSEXT_ERR_OK
     }
 }
 
@@ -271,8 +230,9 @@ impl crypto::Session for Session {
     fn read_handshake(&mut self, plaintext: &[u8]) -> StdResult<bool, TransportError> {
         self.state.read_handshake(plaintext)?;
 
-        // Only indicate that handshake data is available once.
-        if !self.handshake_data_sent && self.handshake_data_available {
+        // Only indicate that handshake data is available once, when the client hello has been
+        // processed. QUIC requires ALPN, so a protocol is selected by then.
+        if !self.handshake_data_sent && self.state.ssl.selected_alpn_protocol().is_some() {
             self.handshake_data_sent = true;
             return Ok(true);
         }
