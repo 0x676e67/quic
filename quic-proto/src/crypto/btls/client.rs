@@ -163,60 +163,11 @@ impl crypto::ClientConfig for Config {
 static TICKET_CACHE_INDEX: LazyLock<Option<Index<Ssl, TicketCache>>> =
     LazyLock::new(|| Ssl::new_ex_index().ok());
 
-/// The [SessionCache] entry of a connection. The new session callback finds it in the ex_data
-/// of the [Ssl].
-#[derive(Clone)]
-struct TicketCache {
-    cache: Arc<dyn SessionCache>,
-    server_name: Bytes,
-}
-
-impl TicketCache {
-    /// Caches a new session with the server transport parameters, which 0-RTT needs.
-    fn put(&self, ssl: &SslRef, session: SslSession) {
-        if !session.early_data_capable() {
-            warn!("failed caching session: not early data capable");
-            return;
-        }
-
-        // Get the server transport parameters.
-        let params = match ssl.get_peer_quic_transport_params() {
-            Some(params) => {
-                match TransportParameters::read(Side::Client, &mut Cursor::new(&params)) {
-                    Ok(params) => params,
-                    Err(e) => {
-                        warn!("failed parsing server transport parameters: {:?}", e);
-                        return;
-                    }
-                }
-            }
-            None => {
-                warn!("failed caching session: server transport parameters are not available");
-                return;
-            }
-        };
-
-        // Encode the session cache entry, including both the session and the server params.
-        let entry = Entry { session, params };
-        match entry.encode() {
-            Ok(value) => self.cache.put(self.server_name.clone(), value),
-            Err(e) => {
-                warn!("failed caching session: unable to encode entry: {:?}", e);
-            }
-        }
-    }
-
-    fn remove(&self) {
-        self.cache.remove(self.server_name.clone());
-    }
-}
-
 /// The [crypto::Session] implementation for BoringSSL.
 struct Session {
     state: SessionState,
     tickets: TicketCache,
     zero_rtt_peer_params: Option<TransportParameters>,
-    handshake_data_available: bool,
     handshake_data_sent: bool,
 }
 
@@ -305,7 +256,6 @@ impl Session {
             state: SessionState::new(ssl, Side::Client, version)?,
             tickets,
             zero_rtt_peer_params,
-            handshake_data_available: false,
             handshake_data_sent: false,
         });
 
@@ -382,18 +332,11 @@ impl crypto::Session for Session {
             self.on_zero_rtt_rejected()?;
         }
 
-        // Only indicate that handshake data is available once.
-        // On the client side there is no ALPN callback, so we need to manually check
-        // if the ALPN protocol has been selected.
-        if !self.handshake_data_sent {
-            if self.state.ssl.selected_alpn_protocol().is_some() {
-                self.handshake_data_available = true;
-            }
-
-            if self.handshake_data_available {
-                self.handshake_data_sent = true;
-                return Ok(true);
-            }
+        // Only indicate that handshake data is available once, when the server has selected
+        // the ALPN protocol.
+        if !self.handshake_data_sent && self.state.ssl.selected_alpn_protocol().is_some() {
+            self.handshake_data_sent = true;
+            return Ok(true);
         }
 
         Ok(false)
@@ -431,6 +374,54 @@ impl crypto::Session for Session {
         context: &[u8],
     ) -> StdResult<(), crypto::ExportKeyingMaterialError> {
         self.state.export_keying_material(output, label, context)
+    }
+}
+
+/// The [SessionCache] entry of a connection. The new session callback finds it in the ex_data
+/// of the [Ssl].
+#[derive(Clone)]
+struct TicketCache {
+    cache: Arc<dyn SessionCache>,
+    server_name: Bytes,
+}
+
+impl TicketCache {
+    /// Caches a new session with the server transport parameters, which 0-RTT needs.
+    fn put(&self, ssl: &SslRef, session: SslSession) {
+        if !session.early_data_capable() {
+            warn!("failed caching session: not early data capable");
+            return;
+        }
+
+        // Get the server transport parameters.
+        let params = match ssl.get_peer_quic_transport_params() {
+            Some(params) => {
+                match TransportParameters::read(Side::Client, &mut Cursor::new(&params)) {
+                    Ok(params) => params,
+                    Err(e) => {
+                        warn!("failed parsing server transport parameters: {:?}", e);
+                        return;
+                    }
+                }
+            }
+            None => {
+                warn!("failed caching session: server transport parameters are not available");
+                return;
+            }
+        };
+
+        // Encode the session cache entry, including both the session and the server params.
+        let entry = Entry { session, params };
+        match entry.encode() {
+            Ok(value) => self.cache.put(self.server_name.clone(), value),
+            Err(e) => {
+                warn!("failed caching session: unable to encode entry: {:?}", e);
+            }
+        }
+    }
+
+    fn remove(&self) {
+        self.cache.remove(self.server_name.clone());
     }
 }
 
