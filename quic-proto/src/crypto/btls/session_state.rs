@@ -234,9 +234,11 @@ impl SessionState {
         label: &[u8],
         context: &[u8],
     ) -> StdResult<(), crypto::ExportKeyingMaterialError> {
+        // Exporter labels are ASCII strings (https://www.rfc-editor.org/rfc/rfc5705#section-4).
+        let label = std::str::from_utf8(label).map_err(|_| crypto::ExportKeyingMaterialError)?;
         self.ssl
-            .export_keyring_material(output, label, context)
-            .map_err(|_| crypto::ExportKeyingMaterialError {})
+            .export_keying_material(output, label, Some(context))
+            .map_err(|_| crypto::ExportKeyingMaterialError)
     }
 
     #[inline]

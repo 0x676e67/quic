@@ -263,12 +263,6 @@ pub trait QuicSsl {
     fn quic_write_level(&self) -> Level;
     fn process_post_handshake(&mut self) -> SslError;
     fn set_verify_hostname(&mut self, domain: &str) -> BoringResult;
-    fn export_keyring_material(
-        &self,
-        output: &mut [u8],
-        label: &[u8],
-        context: &[u8],
-    ) -> BoringResult;
 
     fn in_early_data(&self) -> bool;
     fn early_data_accepted(&self) -> bool;
@@ -377,27 +371,6 @@ impl QuicSsl for Ssl {
             Err(_) => param.set_host(domain)?,
         }
         Ok(())
-    }
-
-    #[inline]
-    fn export_keyring_material(
-        &self,
-        output: &mut [u8],
-        label: &[u8],
-        context: &[u8],
-    ) -> BoringResult {
-        unsafe {
-            br(bffi::SSL_export_keying_material(
-                self.as_ptr(),
-                output.as_mut_ptr(),
-                output.len(),
-                label.as_ptr() as *const c_char,
-                label.len(),
-                context.as_ptr(),
-                context.len(),
-                context.is_empty() as _,
-            ))
-        }
     }
 
     #[inline]
