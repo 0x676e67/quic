@@ -135,12 +135,18 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of bytes to transmit to a peer without acknowledgment
+    /// Maximum number of bytes retained from application writes across all streams of a connection
     ///
-    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
-    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
-    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
-    /// every connection uses the entire window.
+    /// Acknowledged data continues to count against this limit until its storage is released. This
+    /// can keep writes blocked while earlier data is awaiting acknowledgment or only part of a buffer
+    /// has been acknowledged.
+    ///
+    /// Limits memory use when communicating with peers that issue large amounts of flow control
+    /// credit. Endpoints that wish to handle large numbers of connections robustly should take care
+    /// to set this low enough to avoid memory exhaustion if every connection uses the entire window.
+    ///
+    /// The limit counts bytes accepted from application buffers. Slices of larger allocations can
+    /// retain more memory than this limit accounts for.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
         self
@@ -307,6 +313,8 @@ impl TransportConfig {
     /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
     /// of all datagrams that have been received from the peer but not consumed by the application
     /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
         self.datagram_receive_buffer_size = value;
         self
@@ -318,6 +326,8 @@ impl TransportConfig {
     /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
     /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
     /// sent, older datagrams are dropped until sufficient space is available.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
         self.datagram_send_buffer_size = value;
         self

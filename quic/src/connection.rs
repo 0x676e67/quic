@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::sync::{
     Notify,
     futures::{Notified, OwnedNotified},
-    mpsc, oneshot,
+    mpsc, oneshot, watch,
 };
 use tracing::{Instrument, Span, debug_span};
 
@@ -69,7 +69,7 @@ impl Connecting {
         }));
         let connected = Box::pin(conn.shared.connected.clone().notified_owned());
 
-        let driver = ConnectionDriver(conn.clone());
+        let driver = ConnectionDriver::new(conn.clone());
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -153,12 +153,17 @@ impl Connecting {
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
     /// be [`downcast`](Box::downcast) to a
     /// [`crypto::rustls::HandshakeData`](crate::crypto::rustls::HandshakeData).
+    ///
+    /// This operation is cancel-safe.
     pub async fn handshake_data(&mut self) -> Result<Box<dyn Any>, ConnectionError> {
         // Taking &mut self allows us to use a single oneshot channel rather than dealing with
         // potentially many tasks waiting on the same event. It's a bit of a hack, but keeps things
         // simple.
-        if let Some(x) = self.handshake_data_ready.take() {
+        if let Some(x) = self.handshake_data_ready.as_mut() {
             let _ = x.await;
+            // Once the data is ready, apply state changes. This prevents a panic due to
+            // inconsistent state when retrying a call to `handshake_data`.
+            self.handshake_data_ready = None;
         }
         let conn = self.conn.as_ref().unwrap();
         let inner = conn.state.lock("handshake");
@@ -232,34 +237,54 @@ impl Future for Connecting {
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
-struct ConnectionDriver(ConnectionRef);
+struct ConnectionDriver {
+    conn: ConnectionRef,
+    span: Span,
+}
+
+impl ConnectionDriver {
+    fn new(conn: ConnectionRef) -> Self {
+        let span = {
+            let conn = &mut conn.state.lock("poll");
+            debug_span!("drive", id = conn.handle.0)
+        };
+
+        Self { conn, span }
+    }
+}
 
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let conn = &mut *self.0.state.lock("poll");
+        let conn = &mut *self.conn.state.lock("poll");
+        let _guard = self.span.enter();
 
-        let span = debug_span!("drive", id = conn.handle.0);
-        let _guard = span.enter();
-
-        if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
+        if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+            conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
+            // Transmit failed, so close the connection and clean state before returning the error.
+            if !conn.inner.is_closed() {
+                conn.implicit_close(&self.conn.shared);
+            }
+        })?;
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
-        conn.forward_app_events(&self.0.shared);
+        conn.forward_app_events(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
                 // If the connection hasn't processed all tasks, schedule it again
                 cx.waker().wake_by_ref();
             } else {
-                conn.driver = Some(cx.waker().clone());
+                match conn.driver.as_mut() {
+                    Some(old_waker) => old_waker.clone_from(cx.waker()),
+                    None => conn.driver = Some(cx.waker().clone()),
+                };
             }
             return Poll::Pending;
         }
@@ -479,7 +504,7 @@ impl Connection {
     /// datagram, in order of oldest to newest.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         let conn = &mut *self.0.state.lock("send_datagram");
-        if let Some(ref x) = conn.error {
+        if let Some(x) = &conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
         use proto::SendDatagramError::*;
@@ -559,6 +584,21 @@ impl Connection {
         self.0.state.lock("remote_address").inner.remote_address()
     }
 
+    /// Watch the peer's UDP address.
+    ///
+    /// If `ServerConfig::migration` is `true`, clients may change addresses at will, e.g. when
+    /// switching to a cellular internet connection.
+    pub fn watch_remote_address(&self) -> RemoteAddressWatcher {
+        let receiver = self
+            .0
+            .state
+            .lock("watch_remote_address")
+            .remote_address
+            .subscribe();
+
+        RemoteAddressWatcher { receiver }
+    }
+
     /// The local IP address which was used when the peer established
     /// the connection
     ///
@@ -575,6 +615,11 @@ impl Connection {
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self) -> Duration {
         self.0.state.lock("rtt").inner.rtt()
+    }
+
+    /// Minimum RTT seen on this path, ignoring ack delay
+    pub fn min_rtt(&self) -> Duration {
+        self.0.state.lock("min_rtt").inner.min_rtt()
     }
 
     /// Returns connection statistics
@@ -774,7 +819,7 @@ fn poll_open<'a>(
     dir: Dir,
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
     let mut state = conn.state.lock("poll_open");
-    if let Some(ref e) = state.error {
+    if let Some(e) = &state.error {
         return Poll::Ready(Err(e.clone()));
     } else if let Some(id) = state.inner.streams().open(dir) {
         let is_0rtt = state.inner.side().is_client() && state.inner.is_handshaking();
@@ -848,7 +893,7 @@ fn poll_accept<'a>(
         state.wake(); // To send additional stream ID credit
         drop(state); // Release the lock so clone can take it
         return Poll::Ready(Ok((conn.clone(), id, is_0rtt)));
-    } else if let Some(ref e) = state.error {
+    } else if let Some(e) = &state.error {
         return Poll::Ready(Err(e.clone()));
     }
     loop {
@@ -879,7 +924,7 @@ impl Future for ReadDatagram<'_> {
         // datagrams, which are necessarily finite, can be drained from a closed connection.
         if let Some(x) = state.inner.datagrams().recv() {
             return Poll::Ready(Ok(x));
-        } else if let Some(ref e) = state.error {
+        } else if let Some(e) = &state.error {
             return Poll::Ready(Err(e.clone()));
         }
         loop {
@@ -910,7 +955,7 @@ impl Future for SendDatagram<'_> {
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         let mut state = this.conn.state.lock("SendDatagram::poll");
-        if let Some(ref e) = state.error {
+        if let Some(e) = &state.error {
             return Poll::Ready(Err(SendDatagramError::ConnectionLost(e.clone())));
         }
         use proto::SendDatagramError::*;
@@ -941,6 +986,25 @@ impl Future for SendDatagram<'_> {
                 TooLarge => SendDatagramError::TooLarge,
             })),
         }
+    }
+}
+
+/// Watcher produced by [`Connection::watch_remote_address`]
+pub struct RemoteAddressWatcher {
+    receiver: watch::Receiver<SocketAddr>,
+}
+
+impl RemoteAddressWatcher {
+    /// Wait for an address change, mark it as seen and return the address.
+    ///
+    /// If multiple migrations occur between calls to `wait` or polls of the resulting future,
+    /// the last observed address will be returned, skipping intermediate updates.
+    pub async fn wait(&mut self) -> Option<SocketAddr> {
+        if self.receiver.changed().await.is_err() {
+            return None;
+        }
+
+        Some(*self.receiver.borrow())
     }
 }
 
@@ -1028,6 +1092,7 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    remote_address: watch::Sender<SocketAddr>,
 }
 
 impl State {
@@ -1041,6 +1106,8 @@ impl State {
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let remote_address = inner.remote_address();
+
         Self {
             inner,
             driver: None,
@@ -1060,6 +1127,7 @@ impl State {
             runtime,
             send_buffer: Vec::new(),
             buffered_transmit: None,
+            remote_address: watch::Sender::new(remote_address),
         }
     }
 
@@ -1209,6 +1277,14 @@ impl State {
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
                 }
+                PathUpdated => {
+                    // Using `send_replace` since `send` does not update the value
+                    // when there are no subscribed receivers.
+                    let _ = self
+                        .remote_address
+                        .send_replace(self.inner.remote_address());
+                }
+                _ => {}
             }
         }
     }
