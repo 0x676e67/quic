@@ -395,7 +395,8 @@ impl QuicSsl for Ssl {
                 label.len(),
                 context.as_ptr(),
                 context.len(),
-                context.is_empty() as _,
+                // A non-empty context must be marked as used, otherwise BoringSSL ignores it.
+                !context.is_empty() as _,
             ))
         }
     }
