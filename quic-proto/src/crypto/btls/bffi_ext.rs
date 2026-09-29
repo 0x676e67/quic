@@ -1,7 +1,7 @@
 use crate::crypto::btls::error::{BoringResult, br, br_zero_is_success};
 use btls::error::ErrorStack;
 use btls::pkey::{HasPrivate, PKey};
-use btls::ssl::{Ssl, SslContext, SslContextRef, SslSession};
+use btls::ssl::{SslContext, SslContextRef, SslRef, SslSession};
 use btls::x509::X509;
 use btls::x509::store::X509StoreBuilderRef;
 use btls_sys as bffi;
@@ -247,7 +247,7 @@ impl QuicSslContext for SslContext {
     }
 }
 
-/// Provides additional methods to [Ssl] needed for QUIC.
+/// Provides additional methods to [SslRef] needed for QUIC.
 pub trait QuicSsl {
     fn set_connect_state(&mut self);
     fn set_accept_state(&mut self);
@@ -274,7 +274,7 @@ pub trait QuicSsl {
     fn set_quic_use_legacy_codepoint(&mut self, use_legacy: bool);
 }
 
-impl QuicSsl for Ssl {
+impl QuicSsl for SslRef {
     fn set_connect_state(&mut self) {
         unsafe { bffi::SSL_set_connect_state(self.as_ptr()) }
     }

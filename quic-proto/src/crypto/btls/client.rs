@@ -1,17 +1,18 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
 use crate::crypto::btls::bffi_ext::QuicSslContext;
-use crate::crypto::btls::error::{Result, map_result};
+use crate::crypto::btls::error::Result;
 use crate::crypto::btls::session_state::{QUIC_METHOD, SessionState};
 use crate::crypto::btls::version::QuicVersion;
-use crate::crypto::btls::{Entry, QuicSsl, QuicSslSession, SessionCache, SimpleCache};
+use crate::crypto::btls::{Entry, Error, QuicSsl, QuicSslSession, SessionCache, SimpleCache};
 use crate::{
     ConnectError, ConnectionId, Side, TransportError, crypto,
     transport_parameters::TransportParameters,
 };
-use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslSession, SslVersion};
+use btls::ex_data::Index;
+use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslSession, SslVersion};
 use btls_sys as bffi;
 use bytes::{Bytes, BytesMut};
-use foreign_types_shared::ForeignType;
+use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use std::any::Any;
 use std::ffi::c_int;
 use std::io::Cursor;
@@ -159,15 +160,61 @@ impl crypto::ClientConfig for Config {
     }
 }
 
-static SESSION_INDEX: LazyLock<c_int> = LazyLock::new(|| unsafe {
-    bffi::SSL_get_ex_new_index(0, std::ptr::null_mut(), std::ptr::null_mut(), None, None)
-});
+static TICKET_CACHE_INDEX: LazyLock<Option<Index<Ssl, TicketCache>>> =
+    LazyLock::new(|| Ssl::new_ex_index().ok());
+
+/// The [SessionCache] entry of a connection. The new session callback finds it in the ex_data
+/// of the [Ssl].
+#[derive(Clone)]
+struct TicketCache {
+    cache: Arc<dyn SessionCache>,
+    server_name: Bytes,
+}
+
+impl TicketCache {
+    /// Caches a new session with the server transport parameters, which 0-RTT needs.
+    fn put(&self, ssl: &SslRef, session: SslSession) {
+        if !session.early_data_capable() {
+            warn!("failed caching session: not early data capable");
+            return;
+        }
+
+        // Get the server transport parameters.
+        let params = match ssl.get_peer_quic_transport_params() {
+            Some(params) => {
+                match TransportParameters::read(Side::Client, &mut Cursor::new(&params)) {
+                    Ok(params) => params,
+                    Err(e) => {
+                        warn!("failed parsing server transport parameters: {:?}", e);
+                        return;
+                    }
+                }
+            }
+            None => {
+                warn!("failed caching session: server transport parameters are not available");
+                return;
+            }
+        };
+
+        // Encode the session cache entry, including both the session and the server params.
+        let entry = Entry { session, params };
+        match entry.encode() {
+            Ok(value) => self.cache.put(self.server_name.clone(), value),
+            Err(e) => {
+                warn!("failed caching session: unable to encode entry: {:?}", e);
+            }
+        }
+    }
+
+    fn remove(&self) {
+        self.cache.remove(self.server_name.clone());
+    }
+}
 
 /// The [crypto::Session] implementation for BoringSSL.
 struct Session {
-    state: Box<SessionState>,
-    server_name: Bytes,
-    session_cache: Arc<dyn SessionCache>,
+    state: SessionState,
+    tickets: TicketCache,
     zero_rtt_peer_params: Option<TransportParameters>,
     handshake_data_available: bool,
     handshake_data_sent: bool,
@@ -180,7 +227,6 @@ impl Session {
         server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<Self>> {
-        let session_cache = cfg.session_cache.clone();
         let mut ssl = Ssl::new(&cfg.ctx).unwrap();
 
         // Configure the TLS extension based on the QUIC version used.
@@ -215,11 +261,14 @@ impl Session {
             ssl.set_alps_use_new_codepoint(settings.alps_use_new_codepoint);
         }
 
-        let server_name_bytes = Bytes::copy_from_slice(server_name.as_bytes());
+        let tickets = TicketCache {
+            cache: cfg.session_cache.clone(),
+            server_name: Bytes::copy_from_slice(server_name.as_bytes()),
+        };
 
         // If we have a cached session, use it.
         let mut zero_rtt_peer_params = None;
-        if let Some(entry) = session_cache.get(server_name_bytes.clone()) {
+        if let Some(entry) = tickets.cache.get(tickets.server_name.clone()) {
             match Entry::decode(ssl.ssl_context(), entry) {
                 Ok(entry) => {
                     zero_rtt_peer_params = Some(entry.params);
@@ -249,24 +298,16 @@ impl Session {
             );
         }
 
+        let index = TICKET_CACHE_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
+        ssl.set_ex_data(index, tickets.clone());
+
         let mut session = Box::new(Self {
             state: SessionState::new(ssl, Side::Client, version)?,
-            server_name: server_name_bytes,
-            session_cache,
+            tickets,
             zero_rtt_peer_params,
             handshake_data_available: false,
             handshake_data_sent: false,
         });
-
-        // Register the instance in SSL ex_data. This allows the static callbacks to
-        // reference the instance.
-        unsafe {
-            map_result(bffi::SSL_set_ex_data(
-                session.state.ssl.as_ptr(),
-                *SESSION_INDEX,
-                &mut *session as *mut Self as *mut _,
-            ))?;
-        }
 
         // Start the handshake in order to emit the Client Hello on the first
         // call to write_handshake.
@@ -279,13 +320,13 @@ impl Session {
     fn on_zero_rtt_rejected(&mut self) {
         trace!(
             "0-RTT handshake attempted but was rejected by the server: {}",
-            Ssl::early_data_reason_string(self.state.ssl.get_early_data_reason())
+            SslRef::early_data_reason_string(self.state.ssl.get_early_data_reason())
         );
 
         self.zero_rtt_peer_params = None;
 
         // Removed the failed cache entry.
-        self.session_cache.remove(self.server_name.clone());
+        self.tickets.remove();
 
         // Now retry advancing the handshake, this time in 1-RTT mode.
         if let Err(e) = self.state.advance_handshake() {
@@ -293,63 +334,18 @@ impl Session {
         }
     }
 
-    /// Client-side only callback from BoringSSL to allow caching of a new session.
-    fn on_new_session(&mut self, session: SslSession) {
-        if !session.early_data_capable() {
-            warn!("failed caching session: not early data capable");
-            return;
-        }
-
-        // Get the server transport parameters.
-        let params = match self.state.ssl.get_peer_quic_transport_params() {
-            Some(params) => {
-                match TransportParameters::read(Side::Client, &mut Cursor::new(&params)) {
-                    Ok(params) => params,
-                    Err(e) => {
-                        warn!("failed parsing server transport parameters: {:?}", e);
-                        return;
-                    }
-                }
-            }
-            None => {
-                warn!("failed caching session: server transport parameters are not available");
-                return;
-            }
-        };
-
-        // Encode the session cache entry, including both the session and the server params.
-        let entry = Entry { session, params };
-        match entry.encode() {
-            Ok(value) => {
-                // Cache the session.
-                self.session_cache.put(self.server_name.clone(), value)
-            }
-            Err(e) => {
-                warn!("failed caching session: unable to encode entry: {:?}", e);
-            }
-        }
-    }
-
-    /// Called by the static callbacks to retrieve the instance pointer.
-    #[inline]
-    fn get_instance(ssl: *const bffi::SSL) -> &'static mut Self {
-        unsafe {
-            let data = bffi::SSL_get_ex_data(ssl, *SESSION_INDEX);
-            if data.is_null() {
-                panic!("BUG: Session instance missing")
-            }
-            &mut *(data as *mut Self)
-        }
-    }
-
-    /// Raw callback from BoringSSL.
+    /// Raw callback from BoringSSL to cache a new session.
     extern "C" fn new_session_callback(
         ssl: *mut bffi::SSL,
         session: *mut bffi::SSL_SESSION,
     ) -> c_int {
-        let inst = Self::get_instance(ssl);
+        // SAFETY: BoringSSL passes the callback the `SSL` it runs for, and a session whose
+        // reference it hands over.
+        let ssl = unsafe { SslRef::from_ptr(ssl) };
         let session = unsafe { SslSession::from_ptr(session) };
-        inst.on_new_session(session);
+        if let Some(tickets) = (*TICKET_CACHE_INDEX).and_then(|index| ssl.ex_data(index)) {
+            tickets.put(ssl, session);
+        }
 
         // Return 1 to indicate we've taken ownership of the session.
         1
