@@ -26,6 +26,7 @@ aws-lc-rs-fips = ["proto/aws-lc-rs-fips"]
 bloom = ["proto/bloom"]
 
 # Enable btls/BoringSSL crypto support
+# Also enables `Endpoint::client` and `Endpoint::server` conveniences.
 btls = ["proto/btls"]
 btls-prefix-symbols = ["proto/btls-prefix-symbols"]
 
