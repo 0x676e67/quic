@@ -51,6 +51,10 @@ impl Alert {
         Self(bffi::SSL_AD_HANDSHAKE_FAILURE as u8)
     }
 
+    pub(crate) fn internal_error() -> Self {
+        Self(bffi::SSL_AD_INTERNAL_ERROR as u8)
+    }
+
     pub(crate) fn get_description(&self) -> &'static str {
         unsafe {
             CStr::from_ptr(bffi::SSL_alert_desc_string_long(self.0 as c_int))

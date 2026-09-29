@@ -61,19 +61,30 @@ impl Entry {
     /// Decodes a [SessionCache] value into an [Entry].
     pub fn decode(ctx: &SslContextRef, mut encoded: Bytes) -> Result<Self> {
         // Decode the session.
-        let len = encoded.get_u64() as usize;
-        let mut encoded_session = encoded.split_to(len);
+        let mut encoded_session = split_len_prefixed(&mut encoded)?;
         let session = SslSession::decode(ctx, &mut encoded_session)?;
 
         // Decode the transport parameters.
-        let len = encoded.get_u64() as usize;
-        let mut encoded_params = encoded.split_to(len);
+        let mut encoded_params = split_len_prefixed(&mut encoded)?;
         let params = TransportParameters::read(Side::Client, &mut encoded_params).map_err(|e| {
             Error::invalid_input(format!("failed parsing cached transport parameters: {e:?}"))
         })?;
 
         Ok(Self { session, params })
     }
+}
+
+/// Splits off a value that [Entry::encode] wrote with a `u64` length prefix.
+fn split_len_prefixed(encoded: &mut Bytes) -> Result<Bytes> {
+    let truncated = || Error::invalid_input("truncated session cache entry".into());
+    if encoded.remaining() < size_of::<u64>() {
+        return Err(truncated());
+    }
+    let len = usize::try_from(encoded.get_u64()).map_err(|_| truncated())?;
+    if len > encoded.remaining() {
+        return Err(truncated());
+    }
+    Ok(encoded.split_to(len))
 }
 
 /// A [SessionCache] implementation that will never cache anything. Requires no storage.
@@ -118,5 +129,26 @@ impl SessionCache for SimpleCache {
 
     fn clear(&self) {
         self.cache.lock().unwrap().clear()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btls::ssl::{SslContextBuilder, SslMethod};
+
+    #[test]
+    fn decode_truncated_entry() {
+        let ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
+        for encoded in [
+            &[][..],
+            &[0, 0, 0, 0],
+            // A session length longer than the rest of the entry.
+            &[0, 0, 0, 0, 0, 0, 0, 3, 1, 2],
+            &u64::MAX.to_be_bytes(),
+        ] {
+            let result = Entry::decode(&ctx, Bytes::copy_from_slice(encoded));
+            assert!(result.is_err(), "{encoded:?}");
+        }
     }
 }
