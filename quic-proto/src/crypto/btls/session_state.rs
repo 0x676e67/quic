@@ -1,5 +1,5 @@
 use crate::crypto::btls::alert::Alert;
-use crate::crypto::btls::error::{Result, map_cb_result, map_result};
+use crate::crypto::btls::error::{Result, map_result};
 use crate::crypto::btls::secret::{Secret, Secrets, SecretsBuilder};
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::{Error, HandshakeData, Level, QuicSsl, QuicVersion, SslError, retry};
@@ -40,7 +40,8 @@ pub(crate) struct SessionState {
     pub(crate) early_data_rejected: bool,
 
     side: Side,
-    alert: Option<TransportError>,
+    /// The first fatal error of the handshake: a TLS alert, or a failed BoringSSL callback.
+    error: Option<TransportError>,
     next_secrets: Option<Secrets>,
     write_level: Level,
     levels: [LevelState; Level::NUM_LEVELS],
@@ -60,7 +61,7 @@ impl SessionState {
             ssl,
             version,
             side,
-            alert: None,
+            error: None,
             next_secrets: None,
             write_level: Level::Initial,
             levels,
@@ -149,7 +150,7 @@ impl SessionState {
     pub(crate) fn read_handshake(&mut self, plaintext: &[u8]) -> StdResult<(), TransportError> {
         let read_level = self.ssl.quic_read_level();
         let ssl_err = self.ssl.provide_quic_data(read_level, plaintext);
-        self.check_alert()?;
+        self.check_error()?;
         self.check_ssl_error(ssl_err)?;
 
         self.advance_handshake()
@@ -266,22 +267,22 @@ impl SessionState {
             // Update the state of the handshake.
             self.handshaking = self.ssl.is_handshaking();
 
-            self.check_alert()?;
+            self.check_error()?;
             self.check_ssl_error(rc)?;
         }
 
         if !self.handshaking {
             let ssl_err = self.ssl.process_post_handshake();
-            self.check_alert()?;
+            self.check_error()?;
             return self.check_ssl_error(ssl_err);
         }
         Ok(())
     }
 
     #[inline]
-    pub(crate) fn check_alert(&self) -> StdResult<(), TransportError> {
-        if let Some(alert) = &self.alert {
-            return Err(alert.clone());
+    pub(crate) fn check_error(&self) -> StdResult<(), TransportError> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
         }
         Ok(())
     }
@@ -342,9 +343,8 @@ impl SessionState {
     ) -> Result<()> {
         // Store the secret.
         let builder = &mut self.level_state_mut(level).builder;
-        builder.set_suite(suite);
-        builder.set_remote_secret(secret);
-        Ok(())
+        builder.set_suite(suite)?;
+        builder.set_remote_secret(secret)
     }
 
     /// Callback from BoringSSL that configures the write secret and cipher suite for the given
@@ -359,9 +359,8 @@ impl SessionState {
     ) -> Result<()> {
         // Store the secret.
         let builder = &mut self.level_state_mut(level).builder;
-        builder.set_suite(suite);
-        builder.set_local_secret(secret);
-        Ok(())
+        builder.set_suite(suite)?;
+        builder.set_local_secret(secret)
     }
 
     /// Callback from BoringSSL that adds handshake data to the current flight at the given
@@ -398,7 +397,7 @@ impl SessionState {
     /// Callback from BoringSSL that sends a fatal alert at the specified encryption level.
     #[inline]
     fn on_send_alert(&mut self, _: Level, alert: Alert) -> Result<()> {
-        self.alert = Some(alert.into());
+        self.error.get_or_insert_with(|| alert.into());
         Ok(())
     }
 
@@ -454,6 +453,36 @@ impl SessionState {
         }
     }
 
+    /// Maps the result of a callback to its return value. BoringSSL fails the handshake
+    /// without a reason when a callback returns 0, so the error is kept for
+    /// [`Self::check_error`].
+    fn map_cb_result(&mut self, result: Result<()>) -> c_int {
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                self.error.get_or_insert_with(|| {
+                    TransportError::new(Alert::internal_error().into(), e.to_string())
+                });
+                0
+            }
+        }
+    }
+
+    /// Converts the arguments of the secret callbacks.
+    fn parse_secret(
+        cipher: *const bffi::SSL_CIPHER,
+        secret: &[u8],
+    ) -> Result<(&'static CipherSuite, Secret)> {
+        let suite = CipherSuite::from_cipher(cipher)?;
+        if secret.len() > Secret::MAX_LEN {
+            return Err(Error::other(format!(
+                "secret too long: {} bytes",
+                secret.len()
+            )));
+        }
+        Ok((suite, Secret::from(secret)))
+    }
+
     extern "C" fn set_read_secret_callback(
         ssl: *mut bffi::SSL,
         level: bffi::ssl_encryption_level_t,
@@ -462,11 +491,10 @@ impl SessionState {
         secret_len: usize,
     ) -> c_int {
         let inst = Self::get_instance(ssl);
-        let level: Level = level.into();
         let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
-        let suite = CipherSuite::from_cipher(cipher).unwrap();
-        let secret = Secret::from(secret);
-        map_cb_result(inst.on_set_read_secret(level, suite, secret))
+        let result = Self::parse_secret(cipher, secret)
+            .and_then(|(suite, secret)| inst.on_set_read_secret(level.into(), suite, secret));
+        inst.map_cb_result(result)
     }
 
     extern "C" fn set_write_secret_callback(
@@ -477,11 +505,10 @@ impl SessionState {
         secret_len: usize,
     ) -> c_int {
         let inst = Self::get_instance(ssl);
-        let level: Level = level.into();
         let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
-        let suite = CipherSuite::from_cipher(cipher).unwrap();
-        let secret = Secret::from(secret);
-        map_cb_result(inst.on_set_write_secret(level, suite, secret))
+        let result = Self::parse_secret(cipher, secret)
+            .and_then(|(suite, secret)| inst.on_set_write_secret(level.into(), suite, secret));
+        inst.map_cb_result(result)
     }
 
     extern "C" fn add_handshake_data_callback(
@@ -493,12 +520,14 @@ impl SessionState {
         let inst = Self::get_instance(ssl);
         let level: Level = level.into();
         let data = unsafe { slice::from_raw_parts(data, len) };
-        map_cb_result(inst.on_add_handshake_data(level, data))
+        let result = inst.on_add_handshake_data(level, data);
+        inst.map_cb_result(result)
     }
 
     extern "C" fn flush_flight_callback(ssl: *mut bffi::SSL) -> c_int {
         let inst = Self::get_instance(ssl);
-        map_cb_result(inst.on_flush_flight())
+        let result = inst.on_flush_flight();
+        inst.map_cb_result(result)
     }
 
     extern "C" fn send_alert_callback(
@@ -508,7 +537,8 @@ impl SessionState {
     ) -> c_int {
         let inst = Self::get_instance(ssl);
         let level: Level = level.into();
-        map_cb_result(inst.on_send_alert(level, Alert::from(alert)))
+        let result = inst.on_send_alert(level, Alert::from(alert));
+        inst.map_cb_result(result)
     }
 
     pub(crate) extern "C" fn info_callback(ssl: *const bffi::SSL, type_: c_int, value: c_int) {
@@ -531,5 +561,59 @@ impl LevelState {
             builder: SecretsBuilder::new(version),
             write_buffer: BytesMut::with_capacity(capacity),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TransportErrorCode;
+    use crate::crypto::btls::QuicSslContext;
+    use btls::ssl::{SslContextBuilder, SslMethod};
+
+    #[test]
+    fn callback_error_fails_handshake() {
+        let mut ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
+        ctx.set_quic_method(&QUIC_METHOD).unwrap();
+        let ssl = Ssl::new(&ctx).unwrap();
+        let mut state = SessionState::new(ssl, Side::Client, QuicVersion::V1).unwrap();
+        let ssl = state.ssl.as_ptr();
+        let level = bffi::ssl_encryption_level_t::ssl_encryption_handshake;
+        let secret = [0; 32];
+        let cipher = |value| unsafe { bffi::SSL_get_cipher_by_value(value) };
+
+        // TLS_AES_128_GCM_SHA256 for reading, then TLS_CHACHA20_POLY1305_SHA256 for writing.
+        let rc = SessionState::set_read_secret_callback(
+            ssl,
+            level,
+            cipher(0x1301),
+            secret.as_ptr(),
+            secret.len(),
+        );
+        assert_eq!(rc, 1);
+        let rc = SessionState::set_write_secret_callback(
+            ssl,
+            level,
+            cipher(0x1303),
+            secret.as_ptr(),
+            secret.len(),
+        );
+        assert_eq!(rc, 0);
+        // A later alert does not replace the first error.
+        SessionState::send_alert_callback(ssl, level, bffi::SSL_AD_DECODE_ERROR as u8);
+
+        let err = state.read_handshake(&[]).unwrap_err();
+        assert_eq!(
+            err.code,
+            TransportErrorCode::crypto(bffi::SSL_AD_INTERNAL_ERROR as u8)
+        );
+        assert!(err.reason.contains("cipher suite changed"), "{err}");
+        assert!(
+            state
+                .level_state(Level::Handshake)
+                .builder
+                .build()
+                .is_none()
+        );
     }
 }

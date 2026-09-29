@@ -124,14 +124,6 @@ pub(crate) fn map_result(bssl_result: c_int) -> Result<()> {
     }
 }
 
-/// Maps a result from a Rust callback to a BoringSSL result error code.
-pub(crate) fn map_cb_result<T>(result: Result<T>) -> c_int {
-    match result {
-        Ok(_) => 1,
-        _ => 0,
-    }
-}
-
 /// Like map_result, but for BoringSSL method that break the standard return value convention.
 pub(crate) fn map_result_zero_is_success(bssl_result: c_int) -> Result<()> {
     match bssl_result {

@@ -1,4 +1,4 @@
-use crate::crypto::btls::error::Result;
+use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::hkdf;
 use crate::crypto::btls::key::{HeaderKey, KeyPair, Keys, PacketKey};
 use crate::crypto::btls::macros::bounded_array;
@@ -159,34 +159,34 @@ impl SecretsBuilder {
         }
     }
 
-    pub(crate) fn set_suite(&mut self, suite: &'static CipherSuite) {
-        if let Some(prev) = self.suite {
-            // Make sure it doesn't change once set.
-            assert_eq!(prev, suite);
-            return;
+    pub(crate) fn set_suite(&mut self, suite: &'static CipherSuite) -> Result<()> {
+        match self.suite {
+            Some(prev) if prev != suite => Err(Error::other(format!(
+                "cipher suite changed from {prev:?} to {suite:?}"
+            ))),
+            _ => {
+                self.suite = Some(suite);
+                Ok(())
+            }
         }
-
-        self.suite = Some(suite)
     }
 
-    pub(crate) fn set_remote_secret(&mut self, secret: Secret) {
-        if let Some(prev) = &self.remote_secret {
-            // Make sure it doesn't change once set.
-            assert_eq!(*prev, secret);
-            return;
-        }
-
-        self.remote_secret = Some(secret)
+    // BoringSSL installs each secret at most once per level
+    // (see `SSL_QUIC_METHOD` in `openssl/ssl.h`).
+    pub(crate) fn set_remote_secret(&mut self, secret: Secret) -> Result<()> {
+        Self::set_secret(&mut self.remote_secret, secret)
     }
 
-    pub(crate) fn set_local_secret(&mut self, secret: Secret) {
-        if let Some(prev) = &self.local_secret {
-            // Make sure it doesn't change once set.
-            assert_eq!(*prev, secret);
-            return;
-        }
+    pub(crate) fn set_local_secret(&mut self, secret: Secret) -> Result<()> {
+        Self::set_secret(&mut self.local_secret, secret)
+    }
 
-        self.local_secret = Some(secret)
+    fn set_secret(slot: &mut Option<Secret>, secret: Secret) -> Result<()> {
+        if slot.is_some() {
+            return Err(Error::other("secret installed twice".into()));
+        }
+        *slot = Some(secret);
+        Ok(())
     }
 
     pub(crate) fn build(&self) -> Option<Secrets> {
