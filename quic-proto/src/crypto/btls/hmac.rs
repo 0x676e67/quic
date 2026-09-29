@@ -65,10 +65,29 @@ impl crypto::HmacKey for HmacKey {
         let mut out = [0u8; SIGNATURE_LEN_SHA_256];
         self.sign(data, &mut out);
 
-        // Compare the output.
-        if out == signature {
+        // Compare in constant time. The lengths are equal, as `memcmp::eq` requires.
+        if btls::memcmp::eq(&out, signature) {
             return Ok(());
         }
         Err(crypto::CryptoError {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HmacKey;
+    use crate::crypto::HmacKey as _;
+
+    #[test]
+    fn verify() {
+        let key = HmacKey::sha256();
+        let mut signature = [0; 32];
+        key.sign(b"data", &mut signature);
+        assert!(key.verify(b"data", &signature).is_ok());
+        assert!(key.verify(b"other", &signature).is_err());
+
+        signature[31] ^= 1;
+        assert!(key.verify(b"data", &signature).is_err());
+        assert!(key.verify(b"data", &signature[..31]).is_err());
     }
 }

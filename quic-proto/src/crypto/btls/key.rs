@@ -288,8 +288,10 @@ impl CryptoHeaderKey for ChaChaHeaderKey {
         }
 
         // Extract the counter and the nonce from the sample.
+        // The sample starts with the block counter in little endian
+        // (https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4).
         let (counter, nonce) = sample.split_at(size_of::<u32>());
-        let counter = u32::from_ne_bytes(counter.try_into().unwrap());
+        let counter = u32::from_le_bytes(counter.try_into().unwrap());
 
         let mut out: [u8; 5] = [0; 5];
         unsafe {
@@ -523,5 +525,44 @@ impl crypto::AeadKey for AeadKey {
     ) -> StdResult<&'a mut [u8], crypto::CryptoError> {
         let plain_len = self.open_in_place(&self.suite.aead.zero_nonce(), data, additional_data)?;
         Ok(&mut data[..plain_len])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::PacketKey as _;
+    use hex_literal::hex;
+
+    /// ChaCha20-Poly1305 short header packet
+    /// (https://www.rfc-editor.org/rfc/rfc9001#appendix-A.5).
+    #[test]
+    fn chacha20_short_header_packet() {
+        let suite = CipherSuite::chacha20_poly1305_sha256();
+        let secret = Secret::from(&hex!(
+            "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"
+        ));
+
+        let packet_key = secret.packet_key(QuicVersion::V1, suite).unwrap();
+        assert_eq!(
+            packet_key.key().slice(),
+            hex!("c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8")
+        );
+        assert_eq!(packet_key.iv().slice(), hex!("e0459b3474bdd0e44a41c144"));
+        let header_key = secret.header_key(QuicVersion::V1, suite).unwrap();
+        assert_eq!(
+            header_key.key().slice(),
+            hex!("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")
+        );
+
+        let mut packet = hex!("4200bff401").to_vec();
+        packet.extend_from_slice(&[0; 16]);
+        packet_key.encrypt(654360564, &mut packet, 4);
+        let header_key = header_key.as_crypto().unwrap();
+        header_key.encrypt(1, &mut packet);
+        assert_eq!(packet, hex!("4cfe4189655e5cd55c41f69080575d7999c25a5bfb"));
+
+        header_key.decrypt(1, &mut packet);
+        assert_eq!(packet[..4], hex!("4200bff4"));
     }
 }
