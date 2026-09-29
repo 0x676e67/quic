@@ -41,8 +41,6 @@ pub(crate) struct SessionState {
     side: Side,
     alert: Option<TransportError>,
     next_secrets: Option<Secrets>,
-    keys_updated: bool,
-    read_level: Level,
     write_level: Level,
     levels: [LevelState; Level::NUM_LEVELS],
     handshaking: bool,
@@ -63,8 +61,6 @@ impl SessionState {
             side,
             alert: None,
             next_secrets: None,
-            keys_updated: false,
-            read_level: Level::Initial,
             write_level: Level::Initial,
             levels,
             early_data_rejected: false,
@@ -150,7 +146,8 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn read_handshake(&mut self, plaintext: &[u8]) -> StdResult<(), TransportError> {
-        let ssl_err = self.ssl.provide_quic_data(self.read_level, plaintext);
+        let read_level = self.ssl.quic_read_level();
+        let ssl_err = self.ssl.provide_quic_data(read_level, plaintext);
         self.check_alert()?;
         self.check_ssl_error(ssl_err)?;
 
@@ -159,60 +156,33 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<crypto::Keys> {
-        // Write all available data at the current write level.
+        // Write all available data at the current write level. Whatever is written here
+        // belongs to the level in effect before any switch below.
         let write_state = self.level_state_mut(self.write_level);
         if write_state.write_buffer.has_remaining() {
             buf.extend_from_slice(&write_state.write_buffer);
             write_state.write_buffer.clear();
         }
 
-        // Advance to the next write level.
-        let ssl_engine_write_level = self.ssl.quic_write_level();
+        // Switch to the next level only once BoringSSL has installed both of its secrets.
+        // The server only learns the application read secret after the client Finished,
+        // so the application keys may become available several calls after the write
+        // secret did.
         let next_write_level = self.write_level.next();
-        if next_write_level != self.write_level && next_write_level <= ssl_engine_write_level {
-            self.write_level = next_write_level;
+        if next_write_level == self.write_level {
+            return None;
+        }
+        let secrets = self.level_state(next_write_level).builder.build()?;
+        self.write_level = next_write_level;
 
-            // Indicate that we're updating the keys.
-            self.keys_updated = true;
+        if next_write_level == Level::Application {
+            // Keep the next application secrets for `next_1rtt_keys`.
+            let mut next_app_secrets = secrets;
+            next_app_secrets.update().unwrap();
+            self.next_secrets = Some(next_app_secrets);
         }
 
-        let out = if self.keys_updated {
-            self.keys_updated = false;
-
-            if self.next_secrets.is_some() {
-                // Once we've returned the application secrets, stop sending key updates.
-                None
-            } else {
-                // Determine if we're transitioning to the application-level keys.
-                let is_app = self.write_level == Level::Application;
-
-                // Build the secrets.
-                let secrets = self
-                    .level_state(self.write_level)
-                    .builder
-                    .build()
-                    .unwrap_or_else(|| {
-                        panic!("failed building secrets for level {:?}", self.write_level)
-                    });
-
-                if is_app {
-                    // We've transitioned to the application level, we need to set the
-                    // next (i.e. application) secrets for use from next_1rtt_keys.
-
-                    // Copy the secrets and advance them to the next application secrets.
-                    let mut next_app_secrets = secrets;
-                    next_app_secrets.update().unwrap();
-
-                    self.next_secrets = Some(next_app_secrets);
-                }
-
-                Some(secrets.keys().unwrap())
-            }
-        } else {
-            None
-        };
-
-        out.map(|keys| keys.as_crypto().unwrap())
+        Some(secrets.keys().unwrap().as_crypto().unwrap())
     }
 
     #[inline]
@@ -357,12 +327,6 @@ impl SessionState {
         let builder = &mut self.level_state_mut(level).builder;
         builder.set_suite(suite);
         builder.set_remote_secret(secret);
-
-        // Advance the currently active read level.
-        self.read_level = level;
-
-        // Indicate that the next call to write_handshake should generate new keys.
-        self.keys_updated = true;
         Ok(())
     }
 
