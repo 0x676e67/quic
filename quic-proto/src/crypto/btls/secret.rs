@@ -190,18 +190,11 @@ impl SecretsBuilder {
     }
 
     pub(crate) fn build(&self) -> Option<Secrets> {
-        if let Some(suite) = self.suite {
-            if let Some(local) = self.local_secret {
-                if let Some(remote) = self.remote_secret {
-                    return Some(Secrets {
-                        version: self.version,
-                        suite,
-                        local,
-                        remote,
-                    });
-                }
-            }
-        }
-        None
+        Some(Secrets {
+            version: self.version,
+            suite: self.suite?,
+            local: self.local_secret?,
+            remote: self.remote_secret?,
+        })
     }
 }
