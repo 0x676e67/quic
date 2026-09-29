@@ -1,0 +1,234 @@
+//! End-to-end handshakes over the btls crypto backend.
+
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
+
+use quic::{
+    ClientConfig, Connection, Endpoint, ReadError, ReadToEndError, ServerConfig,
+    btls::{
+        pkey::{PKey, Private},
+        x509::X509,
+    },
+    crypto::btls::{HandshakeData, QuicClientConfig, QuicServerConfig, QuicSslContext},
+};
+
+#[tokio::test]
+async fn handshake_resumption_and_early_data() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    let server_chain = pki.chain(&leaf);
+    let server = serve(server_endpoint(&pki, &leaf, false));
+    // A second server has its own ticket keys, so it cannot resume the first one's sessions.
+    let other_server = serve(server_endpoint(&pki, &leaf, false));
+    let client = client_endpoint(&pki, None);
+
+    // Full handshake: there is no session to resume yet.
+    let connecting = client.connect(server, "localhost").unwrap();
+    let conn = connecting
+        .into_0rtt()
+        .expect_err("no ticket yet")
+        .await
+        .unwrap();
+    let data = conn
+        .handshake_data()
+        .unwrap()
+        .downcast::<HandshakeData>()
+        .unwrap();
+    assert_eq!(data.protocol.as_deref(), Some(&b"h3"[..]));
+    assert_eq!(data.server_name, None);
+    assert_eq!(peer_chain(&conn), server_chain);
+    check_response(
+        &conn,
+        b"1-rtt",
+        &request(&conn, b"1-rtt").await.unwrap(),
+        &[],
+    );
+    conn.close(0u32.into(), b"done");
+
+    // Resumption with the ticket from above: the server accepts the 0-RTT stream.
+    let connecting = client.connect(server, "localhost").unwrap();
+    let conn = connecting.into_0rtt().expect("resumable ticket");
+    let response = request(&conn, b"0-rtt").await.unwrap();
+    check_response(&conn, b"0-rtt", &response, &[]);
+    assert_eq!(peer_chain(&conn), server_chain);
+    conn.close(0u32.into(), b"done");
+
+    // The other server rejects the 0-RTT stream, and the connection continues in 1-RTT.
+    let connecting = client.connect(other_server, "localhost").unwrap();
+    let conn = connecting.into_0rtt().expect("resumable ticket");
+    assert!(matches!(
+        request(&conn, b"0-rtt").await,
+        Err(ReadToEndError::Read(ReadError::ZeroRttRejected))
+    ));
+    let response = request(&conn, b"retry").await.unwrap();
+    check_response(&conn, b"retry", &response, &[]);
+    conn.close(0u32.into(), b"done");
+
+    client.wait_idle().await;
+}
+
+#[tokio::test]
+async fn peer_identity_with_client_auth() {
+    let pki = Pki::new();
+    let server_leaf = pki.issue("localhost");
+    let client_leaf = pki.issue("client");
+    let server = serve(server_endpoint(&pki, &server_leaf, true));
+    let client = client_endpoint(&pki, Some(&client_leaf));
+
+    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+    assert_eq!(peer_chain(&conn), pki.chain(&server_leaf));
+    // The server replies with the client chain it sees, which must start with the leaf too.
+    let response = request(&conn, b"hello").await.unwrap();
+    check_response(
+        &conn,
+        b"hello",
+        &response,
+        &pki.chain(&client_leaf).concat(),
+    );
+    conn.close(0u32.into(), b"done");
+
+    client.wait_idle().await;
+}
+
+/// Serves each bidirectional stream with the request, the connection's keying material and
+/// the DER of the client certificate chain, if any.
+fn serve(endpoint: Endpoint) -> SocketAddr {
+    let addr = endpoint.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let Ok(conn) = incoming.await else { return };
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let Ok(request) = recv.read_to_end(1024).await else {
+                        return;
+                    };
+                    let mut response = request;
+                    response.extend(keying_material(&conn));
+                    if conn.peer_identity().is_some() {
+                        response.extend(peer_chain(&conn).concat());
+                    }
+                    send.write_all(&response).await.unwrap();
+                    send.finish().unwrap();
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn request(conn: &Connection, msg: &[u8]) -> Result<Vec<u8>, ReadToEndError> {
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(msg).await.unwrap();
+    send.finish().unwrap();
+    recv.read_to_end(64 * 1024).await
+}
+
+/// Checks a response of [`serve`]: both sides export the same keying material, which depends
+/// on the context, and the server saw `client_chain`.
+fn check_response(conn: &Connection, msg: &[u8], response: &[u8], client_chain: &[u8]) {
+    let (echo, rest) = response.split_at(msg.len());
+    assert_eq!(echo, msg);
+    let (server_material, server_seen_chain) = rest.split_at(32);
+    assert_eq!(server_material, keying_material(conn));
+    assert_ne!(server_material[..16], server_material[16..]);
+    assert_eq!(server_seen_chain, client_chain);
+}
+
+/// Keying material exported with a context, followed by the one exported without.
+fn keying_material(conn: &Connection) -> [u8; 32] {
+    let mut out = [0; 32];
+    let (with_context, without_context) = out.split_at_mut(16);
+    conn.export_keying_material(with_context, b"EXPORTER-test", b"context")
+        .unwrap();
+    conn.export_keying_material(without_context, b"EXPORTER-test", b"")
+        .unwrap();
+    out
+}
+
+fn peer_chain(conn: &Connection) -> Vec<Vec<u8>> {
+    conn.peer_identity()
+        .unwrap()
+        .downcast::<Vec<X509>>()
+        .unwrap()
+        .iter()
+        .map(|cert| cert.to_der().unwrap())
+        .collect()
+}
+
+fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
+    let mut crypto = QuicServerConfig::new().unwrap();
+    let ctx = crypto.ctx_mut();
+    ctx.set_certificate(leaf.cert.clone()).unwrap();
+    ctx.add_to_cert_chain(pki.ca.clone()).unwrap();
+    ctx.set_private_key(leaf.key.clone()).unwrap();
+    if client_auth {
+        ctx.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
+        crypto.verify_peer(true);
+    }
+    let config = ServerConfig::with_crypto(Arc::new(crypto));
+    Endpoint::server(config, localhost()).unwrap()
+}
+
+fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
+    let mut crypto = QuicClientConfig::new().unwrap();
+    let ctx = crypto.ctx_mut();
+    ctx.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
+    if let Some(leaf) = identity {
+        ctx.set_certificate(leaf.cert.clone()).unwrap();
+        ctx.add_to_cert_chain(pki.ca.clone()).unwrap();
+        ctx.set_private_key(leaf.key.clone()).unwrap();
+    }
+    let endpoint = Endpoint::client(localhost()).unwrap();
+    endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+    endpoint
+}
+
+fn localhost() -> SocketAddr {
+    (Ipv4Addr::LOCALHOST, 0).into()
+}
+
+/// A CA that issues the leaf certificates of a test.
+struct Pki {
+    ca: X509,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = X509::from_der(params.self_signed(&key).unwrap().der()).unwrap();
+        Self {
+            ca,
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    fn issue(&self, name: &str) -> Leaf {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+        // rcgen's default subject is the CA's, which would make the leaf look self-signed.
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        Leaf {
+            cert: X509::from_der(cert.der()).unwrap(),
+            key: PKey::private_key_from_pem(key.serialize_pem().as_bytes()).unwrap(),
+        }
+    }
+
+    /// The DER of the chain an endpoint with `leaf` sends, leaf first.
+    fn chain(&self, leaf: &Leaf) -> Vec<Vec<u8>> {
+        vec![leaf.cert.to_der().unwrap(), self.ca.to_der().unwrap()]
+    }
+}
+
+struct Leaf {
+    cert: X509,
+    key: PKey<Private>,
+}
