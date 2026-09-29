@@ -6,7 +6,8 @@ use std::{
 };
 
 use quic::{
-    ClientConfig, Connection, Endpoint, ReadError, ReadToEndError, ServerConfig,
+    ClientConfig, Connection, ConnectionError, Endpoint, ReadError, ReadToEndError, ServerConfig,
+    TransportErrorCode,
     btls::{
         pkey::{PKey, Private},
         x509::X509,
@@ -66,6 +67,23 @@ async fn handshake_resumption_and_early_data() {
     check_response(&conn, b"retry", &response, &[]);
     conn.close(0u32.into(), b"done");
 
+    // An untrusted server rejects the 0-RTT stream too. The client verifies the server
+    // certificate only after it resumes the handshake in 1-RTT, and that failure must close
+    // the connection with a TLS alert rather than leave it to time out.
+    let untrusted = Pki::new();
+    let untrusted_server = serve(server_endpoint(
+        &untrusted,
+        &untrusted.issue("localhost"),
+        false,
+    ));
+    let connecting = client.connect(untrusted_server, "localhost").unwrap();
+    let conn = connecting.into_0rtt().expect("resumable ticket");
+    let err = conn.closed().await;
+    assert!(
+        matches!(&err, ConnectionError::TransportError(e) if is_tls_alert(e.code)),
+        "{err:?}"
+    );
+
     client.wait_idle().await;
 }
 
@@ -90,6 +108,12 @@ async fn peer_identity_with_client_auth() {
     conn.close(0u32.into(), b"done");
 
     client.wait_idle().await;
+}
+
+/// Returns whether `code` carries a TLS alert
+/// (https://www.rfc-editor.org/rfc/rfc9001#section-4.8).
+fn is_tls_alert(code: TransportErrorCode) -> bool {
+    (0x100..0x200).contains(&u64::from(code))
 }
 
 /// Serves each bidirectional stream with the request, the connection's keying material and

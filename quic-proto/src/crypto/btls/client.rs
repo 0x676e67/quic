@@ -317,7 +317,7 @@ impl Session {
     }
 
     /// Handler for the rejection of a 0-RTT attempt. Will continue with 1-RTT.
-    fn on_zero_rtt_rejected(&mut self) {
+    fn on_zero_rtt_rejected(&mut self) -> StdResult<(), TransportError> {
         trace!(
             "0-RTT handshake attempted but was rejected by the server: {}",
             SslRef::early_data_reason_string(self.state.ssl.get_early_data_reason())
@@ -329,9 +329,7 @@ impl Session {
         self.tickets.remove();
 
         // Now retry advancing the handshake, this time in 1-RTT mode.
-        if let Err(e) = self.state.advance_handshake() {
-            warn!("failed advancing 1-RTT handshake: {:?}", e)
-        }
+        self.state.advance_handshake()
     }
 
     /// Raw callback from BoringSSL to cache a new session.
@@ -381,7 +379,7 @@ impl crypto::Session for Session {
         self.state.read_handshake(plaintext)?;
 
         if self.state.early_data_rejected {
-            self.on_zero_rtt_rejected();
+            self.on_zero_rtt_rejected()?;
         }
 
         // Only indicate that handshake data is available once.
