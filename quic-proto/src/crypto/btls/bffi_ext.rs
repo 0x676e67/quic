@@ -1,249 +1,33 @@
-use crate::crypto::btls::error::{BoringResult, br, br_zero_is_success};
+use crate::crypto::btls::error::{BoringResult, br};
 use btls::error::ErrorStack;
-use btls::pkey::{HasPrivate, PKey};
-use btls::ssl::{SslContext, SslContextRef, SslRef, SslSession};
-use btls::x509::X509;
-use btls::x509::store::X509StoreBuilderRef;
+use btls::ssl::{SslContextBuilder, SslContextRef, SslRef, SslSession, SslVerifyMode};
 use btls_sys as bffi;
 use bytes::{Buf, BufMut};
 use foreign_types_shared::{ForeignType, ForeignTypeRef};
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, c_int};
 use std::fmt::{Display, Formatter};
 use std::result::Result as StdResult;
-use std::{ffi, fmt, mem, ptr, slice};
+use std::{fmt, ptr, slice};
 
-/// Provides additional methods to [SslContext] needed for QUIC.
-pub trait QuicSslContext {
-    fn set_options(&mut self, options: u32) -> u32;
-    fn verify_peer(&mut self, verify: bool);
-    fn set_quic_method(&mut self, method: &bffi::SSL_QUIC_METHOD) -> BoringResult;
-    fn set_session_cache_mode(&mut self, mode: c_int) -> c_int;
-    fn set_new_session_callback(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(ssl: *mut bffi::SSL, session: *mut bffi::SSL_SESSION) -> c_int,
-        >,
-    );
-    fn set_info_callback(
-        &mut self,
-        cb: Option<unsafe extern "C" fn(ssl: *const bffi::SSL, type_: c_int, value: c_int)>,
-    );
-    fn set_keylog_callback(
-        &mut self,
-        cb: Option<unsafe extern "C" fn(ssl: *const bffi::SSL, line: *const c_char)>,
-    );
-    fn set_certificate(&mut self, cert: X509) -> BoringResult;
-    fn load_certificate_from_pem_file(&mut self, path: &str) -> BoringResult;
-    fn add_to_cert_chain(&mut self, cert: X509) -> BoringResult;
-    fn load_cert_chain_from_pem_file(&mut self, path: &str) -> BoringResult;
-    fn set_private_key<T: HasPrivate>(&mut self, key: PKey<T>) -> BoringResult;
-    fn load_private_key_from_pem_file(&mut self, path: &str) -> BoringResult;
-    fn check_private_key(&self) -> BoringResult;
-    fn cert_store_mut(&mut self) -> &mut X509StoreBuilderRef;
-
-    fn enable_early_data(&mut self, enable: bool);
-    fn set_alpn_protos(&mut self, protos: &[u8]) -> BoringResult;
-    fn set_alpn_select_cb(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(
-                ssl: *mut bffi::SSL,
-                out: *mut *const u8,
-                out_len: *mut u8,
-                in_: *const u8,
-                in_len: c_uint,
-                arg: *mut c_void,
-            ) -> c_int,
-        >,
-    );
-    fn set_server_name_cb(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(
-                ssl: *mut bffi::SSL,
-                out_alert: *mut c_int,
-                arg: *mut c_void,
-            ) -> c_int,
-        >,
-    );
-    fn set_select_certificate_cb(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(
-                arg1: *const bffi::SSL_CLIENT_HELLO,
-            ) -> bffi::ssl_select_cert_result_t,
-        >,
-    );
+/// The QUIC settings of an [SslContextBuilder] that btls has no safe API for yet.
+pub(crate) trait QuicSslContextBuilder {
+    /// Installs the QUIC callbacks, which BoringSSL keeps a pointer to.
+    fn set_quic_method(&mut self, method: &'static bffi::SSL_QUIC_METHOD) -> BoringResult;
+    fn set_early_data_enabled(&mut self, enabled: bool);
+    fn verify_mode(&self) -> SslVerifyMode;
 }
 
-impl QuicSslContext for SslContext {
-    fn set_options(&mut self, options: u32) -> u32 {
-        unsafe { bffi::SSL_CTX_set_options(self.as_ptr(), options) }
-    }
-
-    fn verify_peer(&mut self, verify: bool) {
-        let mode = if verify {
-            bffi::SSL_VERIFY_PEER | bffi::SSL_VERIFY_FAIL_IF_NO_PEER_CERT
-        } else {
-            bffi::SSL_VERIFY_NONE
-        };
-
-        unsafe { bffi::SSL_CTX_set_verify(self.as_ptr(), mode, None) }
-    }
-
-    fn set_quic_method(&mut self, method: &bffi::SSL_QUIC_METHOD) -> BoringResult {
+impl QuicSslContextBuilder for SslContextBuilder {
+    fn set_quic_method(&mut self, method: &'static bffi::SSL_QUIC_METHOD) -> BoringResult {
         unsafe { br(bffi::SSL_CTX_set_quic_method(self.as_ptr(), method)) }
     }
 
-    fn set_session_cache_mode(&mut self, mode: c_int) -> c_int {
-        unsafe { bffi::SSL_CTX_set_session_cache_mode(self.as_ptr(), mode) }
+    fn set_early_data_enabled(&mut self, enabled: bool) {
+        unsafe { bffi::SSL_CTX_set_early_data_enabled(self.as_ptr(), enabled.into()) }
     }
 
-    fn set_new_session_callback(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(ssl: *mut bffi::SSL, session: *mut bffi::SSL_SESSION) -> c_int,
-        >,
-    ) {
-        unsafe {
-            bffi::SSL_CTX_sess_set_new_cb(self.as_ptr(), cb);
-        }
-    }
-
-    fn set_info_callback(
-        &mut self,
-        cb: Option<unsafe extern "C" fn(ssl: *const bffi::SSL, type_: c_int, value: c_int)>,
-    ) {
-        unsafe { bffi::SSL_CTX_set_info_callback(self.as_ptr(), cb) }
-    }
-
-    fn set_keylog_callback(
-        &mut self,
-        cb: Option<unsafe extern "C" fn(ssl: *const bffi::SSL, line: *const c_char)>,
-    ) {
-        unsafe { bffi::SSL_CTX_set_keylog_callback(self.as_ptr(), cb) }
-    }
-
-    fn set_certificate(&mut self, cert: X509) -> BoringResult {
-        unsafe {
-            br(bffi::SSL_CTX_use_certificate(self.as_ptr(), cert.as_ptr()))?;
-            mem::forget(cert);
-            Ok(())
-        }
-    }
-
-    fn load_certificate_from_pem_file(&mut self, path: &str) -> BoringResult {
-        let path = ffi::CString::new(path).unwrap();
-        unsafe {
-            br(bffi::SSL_CTX_use_certificate_file(
-                self.as_ptr(),
-                path.as_ptr(),
-                bffi::SSL_FILETYPE_PEM,
-            ))
-        }
-    }
-
-    fn add_to_cert_chain(&mut self, cert: X509) -> BoringResult {
-        unsafe {
-            br(bffi::SSL_CTX_add_extra_chain_cert(self.as_ptr(), cert.as_ptr()) as c_int)?;
-            mem::forget(cert);
-            Ok(())
-        }
-    }
-
-    fn load_cert_chain_from_pem_file(&mut self, path: &str) -> BoringResult {
-        let path = ffi::CString::new(path).unwrap();
-        unsafe {
-            br(bffi::SSL_CTX_use_certificate_chain_file(
-                self.as_ptr(),
-                path.as_ptr(),
-            ))
-        }
-    }
-
-    fn set_private_key<T: HasPrivate>(&mut self, key: PKey<T>) -> BoringResult {
-        unsafe {
-            br(bffi::SSL_CTX_use_PrivateKey(self.as_ptr(), key.as_ptr()))?;
-            mem::forget(key);
-            Ok(())
-        }
-    }
-
-    fn load_private_key_from_pem_file(&mut self, path: &str) -> BoringResult {
-        let path = ffi::CString::new(path).unwrap();
-
-        unsafe {
-            br(bffi::SSL_CTX_use_PrivateKey_file(
-                self.as_ptr(),
-                path.as_ptr(),
-                bffi::SSL_FILETYPE_PEM,
-            ))
-        }
-    }
-
-    fn check_private_key(&self) -> BoringResult {
-        unsafe { br(bffi::SSL_CTX_check_private_key(self.as_ptr())) }
-    }
-
-    fn cert_store_mut(&mut self) -> &mut X509StoreBuilderRef {
-        unsafe { X509StoreBuilderRef::from_ptr_mut(bffi::SSL_CTX_get_cert_store(self.as_ptr())) }
-    }
-
-    fn enable_early_data(&mut self, enable: bool) {
-        unsafe { bffi::SSL_CTX_set_early_data_enabled(self.as_ptr(), enable.into()) }
-    }
-
-    fn set_alpn_protos(&mut self, protos: &[u8]) -> BoringResult {
-        unsafe {
-            br_zero_is_success(bffi::SSL_CTX_set_alpn_protos(
-                self.as_ptr(),
-                protos.as_ptr(),
-                protos.len() as _,
-            ))
-        }
-    }
-
-    fn set_alpn_select_cb(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(
-                *mut bffi::SSL,
-                *mut *const u8,
-                *mut u8,
-                *const u8,
-                c_uint,
-                *mut c_void,
-            ) -> c_int,
-        >,
-    ) {
-        unsafe { bffi::SSL_CTX_set_alpn_select_cb(self.as_ptr(), cb, ptr::null_mut()) }
-    }
-
-    fn set_server_name_cb(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(
-                ssl: *mut bffi::SSL,
-                out_alert: *mut c_int,
-                arg: *mut c_void,
-            ) -> c_int,
-        >,
-    ) {
-        // The function always returns 1.
-        unsafe {
-            let _ = bffi::SSL_CTX_set_tlsext_servername_callback(self.as_ptr(), cb);
-        }
-    }
-
-    fn set_select_certificate_cb(
-        &mut self,
-        cb: Option<
-            unsafe extern "C" fn(
-                arg1: *const bffi::SSL_CLIENT_HELLO,
-            ) -> bffi::ssl_select_cert_result_t,
-        >,
-    ) {
-        unsafe { bffi::SSL_CTX_set_select_certificate_cb(self.as_ptr(), cb) }
+    fn verify_mode(&self) -> SslVerifyMode {
+        SslVerifyMode::from_bits_retain(unsafe { bffi::SSL_CTX_get_verify_mode(self.as_ptr()) })
     }
 }
 
@@ -251,7 +35,6 @@ impl QuicSslContext for SslContext {
 pub trait QuicSsl {
     fn set_connect_state(&mut self);
     fn set_accept_state(&mut self);
-    fn state_string(&self) -> &'static str;
     fn set_quic_transport_params(&mut self, params: &[u8]) -> BoringResult;
     fn get_peer_quic_transport_params(&self) -> Option<&[u8]>;
     fn get_error(&self, raw: c_int) -> SslError;
@@ -266,7 +49,7 @@ pub trait QuicSsl {
 
     fn in_early_data(&self) -> bool;
     fn early_data_accepted(&self) -> bool;
-    fn set_quic_method(&mut self, method: &bffi::SSL_QUIC_METHOD) -> BoringResult;
+    fn set_quic_method(&mut self, method: &'static bffi::SSL_QUIC_METHOD) -> BoringResult;
     fn set_quic_early_data_context(&mut self, value: &[u8]) -> BoringResult;
     fn get_early_data_reason(&self) -> bffi::ssl_early_data_reason_t;
     fn early_data_reason_string(reason: bffi::ssl_early_data_reason_t) -> &'static str;
@@ -281,14 +64,6 @@ impl QuicSsl for SslRef {
 
     fn set_accept_state(&mut self) {
         unsafe { bffi::SSL_set_accept_state(self.as_ptr()) }
-    }
-
-    fn state_string(&self) -> &'static str {
-        unsafe {
-            CStr::from_ptr(bffi::SSL_state_string_long(self.as_ptr()))
-                .to_str()
-                .unwrap()
-        }
     }
 
     fn set_quic_transport_params(&mut self, params: &[u8]) -> BoringResult {
@@ -383,7 +158,7 @@ impl QuicSsl for SslRef {
         unsafe { bffi::SSL_early_data_accepted(self.as_ptr()) == 1 }
     }
 
-    fn set_quic_method(&mut self, method: &bffi::SSL_QUIC_METHOD) -> BoringResult {
+    fn set_quic_method(&mut self, method: &'static bffi::SSL_QUIC_METHOD) -> BoringResult {
         unsafe { br(bffi::SSL_set_quic_method(self.as_ptr(), method)) }
     }
 

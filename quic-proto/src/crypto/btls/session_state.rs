@@ -8,7 +8,7 @@ use crate::{
 };
 use btls::error::ErrorStack;
 use btls::ex_data::Index;
-use btls::ssl::{NameType, Ssl, SslRef};
+use btls::ssl::{NameType, Ssl, Ssl3AlertLevel, SslInfoCallbackMode, SslInfoCallbackValue, SslRef};
 use btls::x509::X509;
 use btls_sys as bffi;
 use bytes::{Buf, BytesMut};
@@ -508,44 +508,25 @@ impl QuicState {
     }
 }
 
-impl SessionState {
-    /// Callback from BoringSSL to handle (i.e. log) info events.
-    fn on_info(ssl: &SslRef, type_: c_int, value: c_int) {
-        if type_ & bffi::SSL_CB_LOOP > 0 {
-            trace!("SSL:ACCEPT_LOOP:{}", ssl.state_string());
-        } else if type_ & bffi::SSL_CB_ALERT > 0 {
-            let prefix = if type_ & bffi::SSL_CB_READ > 0 {
-                "SSL:ALERT:READ:"
+/// Traces the progress of a handshake, for [`SslContextBuilder::set_info_callback`].
+///
+/// [`SslContextBuilder::set_info_callback`]: btls::ssl::SslContextBuilder::set_info_callback
+pub(crate) fn trace_info(ssl: &SslRef, mode: SslInfoCallbackMode, value: SslInfoCallbackValue) {
+    let state = ssl.state_string_long();
+    match value {
+        SslInfoCallbackValue::Alert(alert) => {
+            let direction = if mode == SslInfoCallbackMode::READ_ALERT {
+                "READ"
             } else {
-                "SSL:ALERT:WRITE:"
+                "WRITE"
             };
-
-            if ((type_ & 0xF0) >> 8) == bffi::SSL3_AL_WARNING {
-                warn!("{}{}", prefix, ssl.state_string());
+            if alert.alert_level() == Ssl3AlertLevel::WARNING {
+                warn!("SSL:ALERT:{direction}:{state}");
             } else {
-                error!("{}{}", prefix, ssl.state_string());
+                error!("SSL:ALERT:{direction}:{state}");
             }
-        } else if type_ & bffi::SSL_CB_EXIT > 0 {
-            if value == 1 {
-                trace!("SSL:ACCEPT_EXIT_OK:{}", ssl.state_string());
-            } else {
-                // Not necessarily an actual error. It could just require additional
-                // data from the other side.
-                trace!("SSL:ACCEPT_EXIT_FAIL:{}", ssl.state_string());
-            }
-        } else if type_ & bffi::SSL_CB_HANDSHAKE_START > 0 {
-            trace!("SSL:HANDSHAKE_START:{}", ssl.state_string());
-        } else if type_ & bffi::SSL_CB_HANDSHAKE_DONE > 0 {
-            trace!("SSL:HANDSHAKE_DONE:{}", ssl.state_string());
-        } else {
-            warn!("SSL:unknown event type {}:{}", type_, ssl.state_string());
         }
-    }
-
-    pub(crate) extern "C" fn info_callback(ssl: *const bffi::SSL, type_: c_int, value: c_int) {
-        // SAFETY: BoringSSL passes the callback the `SSL` it runs for.
-        let ssl = unsafe { SslRef::from_ptr(ssl.cast_mut()) };
-        Self::on_info(ssl, type_, value);
+        SslInfoCallbackValue::Unit => trace!("SSL:{mode:?}:{state}"),
     }
 }
 
@@ -570,14 +551,15 @@ impl LevelState {
 mod tests {
     use super::*;
     use crate::TransportErrorCode;
-    use crate::crypto::btls::QuicSslContext;
+    use crate::crypto::btls::bffi_ext::QuicSslContextBuilder;
     use btls::ssl::{SslContextBuilder, SslMethod};
     use foreign_types_shared::ForeignType;
 
     #[test]
     fn callback_error_fails_handshake() {
-        let mut ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
-        ctx.set_quic_method(&QUIC_METHOD).unwrap();
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.set_quic_method(&QUIC_METHOD).unwrap();
+        let ctx = builder.build();
         let ssl = Ssl::new(&ctx).unwrap();
         let mut state = SessionState::new(ssl, Side::Client, QuicVersion::V1).unwrap();
         let ssl = state.ssl.as_ptr();
@@ -623,8 +605,9 @@ mod tests {
     /// Each secret is dropped once the keys of its level are derived.
     #[test]
     fn secrets_dropped_after_key_derivation() {
-        let mut ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
-        ctx.set_quic_method(&QUIC_METHOD).unwrap();
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.set_quic_method(&QUIC_METHOD).unwrap();
+        let ctx = builder.build();
         let ssl = Ssl::new(&ctx).unwrap();
         let mut state = SessionState::new(ssl, Side::Client, QuicVersion::V1).unwrap();
         let ssl = state.ssl.as_ptr();

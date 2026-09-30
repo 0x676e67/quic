@@ -109,13 +109,6 @@ pub(crate) fn br(bssl_result: c_int) -> BoringResult {
     }
 }
 
-pub(crate) fn br_zero_is_success(bssl_result: c_int) -> BoringResult {
-    match bssl_result {
-        0 => Ok(()),
-        _ => Err(ErrorStack::get()),
-    }
-}
-
 /// Maps BoringSSL ffi return values to a Result.
 pub(crate) fn map_result(bssl_result: c_int) -> Result<()> {
     match bssl_result {

@@ -14,7 +14,7 @@ use quic::{
         ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode},
         x509::X509,
     },
-    crypto::btls::{HandshakeData, QuicClientConfig, QuicServerConfig, QuicSslContext},
+    crypto::btls::{HandshakeData, QuicClientConfig, QuicServerConfig},
 };
 
 #[tokio::test]
@@ -191,6 +191,7 @@ async fn async_verification_fails_handshake() {
     let server = serve(server_endpoint(&pki, &pki.issue("localhost"), false));
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.set_custom_verify_callback(SslVerifyMode::PEER, |_| Err(SslVerifyError::Retry));
+    builder.set_alpn_protos(b"\x02h3").unwrap();
     let crypto = QuicClientConfig::from_builder(builder).unwrap();
     let client = Endpoint::client(localhost()).unwrap();
 
@@ -284,27 +285,29 @@ fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
 }
 
 fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig {
-    let mut crypto = QuicServerConfig::new().unwrap();
-    let ctx = crypto.ctx_mut();
-    ctx.set_certificate(leaf.cert.clone()).unwrap();
-    ctx.add_to_cert_chain(pki.ca.clone()).unwrap();
-    ctx.set_private_key(leaf.key.clone()).unwrap();
+    let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+    builder.set_certificate(&leaf.cert).unwrap();
+    builder.add_extra_chain_cert(pki.ca.clone()).unwrap();
+    builder.set_private_key(&leaf.key).unwrap();
     if client_auth {
-        ctx.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
-        crypto.verify_peer(true);
+        builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
+        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
     }
-    crypto
+    QuicServerConfig::from_builder(builder).unwrap()
 }
 
+/// A client that trusts `pki`. Its builder leaves verification off, which `from_builder` turns
+/// on, and it offers "h3" through [`QuicClientConfig::set_alpn`].
 fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
-    let mut crypto = QuicClientConfig::new().unwrap();
-    let ctx = crypto.ctx_mut();
-    ctx.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
+    let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+    builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
     if let Some(leaf) = identity {
-        ctx.set_certificate(leaf.cert.clone()).unwrap();
-        ctx.add_to_cert_chain(pki.ca.clone()).unwrap();
-        ctx.set_private_key(leaf.key.clone()).unwrap();
+        builder.set_certificate(&leaf.cert).unwrap();
+        builder.add_extra_chain_cert(pki.ca.clone()).unwrap();
+        builder.set_private_key(&leaf.key).unwrap();
     }
+    let mut crypto = QuicClientConfig::from_builder(builder).unwrap();
+    crypto.set_alpn(&[b"h3".to_vec()]).unwrap();
     let endpoint = Endpoint::client(localhost()).unwrap();
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
     endpoint
