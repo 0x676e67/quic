@@ -9,7 +9,7 @@ use btls_sys as bffi;
 use bytes::BytesMut;
 use std::ffi::c_uint;
 use std::fmt::{Debug, Formatter};
-use std::mem::{MaybeUninit, size_of};
+use std::mem::size_of;
 use std::result::Result as StdResult;
 use zeroize::Zeroize;
 
@@ -216,19 +216,18 @@ struct AesHeaderKey(bffi::AES_KEY);
 
 impl AesHeaderKey {
     fn new(key: &Key) -> Result<Self> {
-        let hpk = unsafe {
-            let mut hpk = MaybeUninit::uninit();
+        // AES-128 expands to fewer round keys than `rd_key` holds, so start from zeros to keep
+        // every field initialized. Wrapping it first zeroes a partial schedule on failure too.
+        let mut hpk = Self(bffi::AES_KEY {
+            rd_key: [0; 60],
+            rounds: 0,
+        });
 
-            // NOTE: this function breaks the usual return value convention.
-            map_result_zero_is_success(bffi::AES_set_encrypt_key(
-                key.as_ptr(),
-                (key.len() * 8) as c_uint,
-                hpk.as_mut_ptr(),
-            ))?;
-
-            hpk.assume_init()
-        };
-        Ok(Self(hpk))
+        // NOTE: this function breaks the usual return value convention.
+        map_result_zero_is_success(unsafe {
+            bffi::AES_set_encrypt_key(key.as_ptr(), (key.len() * 8) as c_uint, &mut hpk.0)
+        })?;
+        Ok(hpk)
     }
 }
 
