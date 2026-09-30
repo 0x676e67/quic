@@ -281,5 +281,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # btls generates its prefixed symbol list with Go for `btls-prefix-symbols`.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ">=1.22.0"
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --feature-powerset --depth 3 --optional-deps --no-dev-deps --ignore-private --skip "${{env.SKIP_FEATURES}}"
