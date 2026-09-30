@@ -1,7 +1,6 @@
 use crate::crypto;
 use crate::crypto::btls::hkdf::DIGEST_BLOCK_LEN;
-use btls::hash::MessageDigest;
-use btls::hmac::Hmac;
+use btls::hash::hmac_sha256;
 use rand::Rng;
 use std::result::Result as StdResult;
 use zeroize::Zeroizing;
@@ -10,7 +9,6 @@ const SIGNATURE_LEN_SHA_256: usize = 32;
 
 /// Implementation of [crypto::HmacKey] using BoringSSL.
 pub struct HmacKey {
-    alg: MessageDigest,
     key: Zeroizing<Vec<u8>>,
 }
 
@@ -21,21 +19,13 @@ impl HmacKey {
         let mut key = Zeroizing::new(vec![0u8; DIGEST_BLOCK_LEN]);
         rand::rng().fill_bytes(&mut key);
 
-        Self {
-            alg: MessageDigest::sha256(),
-            key,
-        }
+        Self { key }
     }
 }
 
 impl crypto::HmacKey for HmacKey {
     fn sign(&self, data: &[u8], out: &mut [u8]) {
-        let signature = Hmac::init(&self.key, &self.alg)
-            .and_then(|mut hmac| {
-                hmac.update(data)?;
-                hmac.finalize()
-            })
-            .expect("HMAC with a valid key and digest");
+        let signature = hmac_sha256(&self.key, data).expect("HMAC-SHA256 with a valid key");
         out.copy_from_slice(&signature);
     }
 

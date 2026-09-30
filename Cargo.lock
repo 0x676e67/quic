@@ -442,7 +442,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?rev=cc7060542f4aa1c421ef79acb6d4257194f6a3cb#cc7060542f4aa1c421ef79acb6d4257194f6a3cb"
+source = "git+https://github.com/0x676e67/btls?rev=ab50fb630c22760880a6d5bbeebd4089a2abf06e#ab50fb630c22760880a6d5bbeebd4089a2abf06e"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -454,7 +454,7 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?rev=cc7060542f4aa1c421ef79acb6d4257194f6a3cb#cc7060542f4aa1c421ef79acb6d4257194f6a3cb"
+source = "git+https://github.com/0x676e67/btls?rev=ab50fb630c22760880a6d5bbeebd4089a2abf06e#ab50fb630c22760880a6d5bbeebd4089a2abf06e"
 dependencies = [
  "bindgen",
  "cmake",

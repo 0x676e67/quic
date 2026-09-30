@@ -4,14 +4,13 @@ use crate::crypto::btls::macros::{bounded_array, secret_array};
 use crate::crypto::btls::secret::Secret;
 use crate::crypto::btls::suite::{CipherSuite, ID};
 use crate::crypto::btls::{Error, QuicVersion};
-use btls::aead::AeadCtx;
+use btls::aead::StatelessAeadCtx;
 use btls::aes::{self, AesKey};
 use btls::chacha;
 use bytes::BytesMut;
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::result::Result as StdResult;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const SAMPLE_LEN: usize = 16; // 128-bits.
 
@@ -404,12 +403,10 @@ impl crypto::PacketKey for PacketKey {
     }
 }
 
-/// An AEAD key whose [AeadCtx] owns the key material.
+/// An AEAD key whose context owns the key material.
 pub(crate) struct AeadKey {
     suite: &'static CipherSuite,
-    /// btls only seals and opens through `&mut AeadCtx`. The keys of a connection are used by
-    /// one task at a time, so the lock is never contended.
-    ctx: Mutex<AeadCtx>,
+    ctx: StatelessAeadCtx,
 }
 
 impl Debug for AeadKey {
@@ -423,12 +420,8 @@ impl Debug for AeadKey {
 impl AeadKey {
     #[inline]
     pub(crate) fn new(suite: &'static CipherSuite, key: &Key) -> Result<Self> {
-        let ctx = Mutex::new(suite.aead.new_ctx(key)?);
+        let ctx = suite.aead.new_ctx(key)?;
         Ok(Self { suite, ctx })
-    }
-
-    fn ctx(&self) -> MutexGuard<'_, AeadCtx> {
-        self.ctx.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Encrypts `data` in place. Its last [tag length](crate::crypto::btls::aead::Aead) bytes
@@ -448,8 +441,8 @@ impl AeadKey {
         };
         let (payload, tag) = data.split_at_mut(tag_start);
         let tag_len = self
-            .ctx()
-            .seal_in_place_mut(nonce.slice(), payload, tag, additional_data)?
+            .ctx
+            .seal_in_place(nonce.slice(), payload, tag, additional_data)?
             .len();
         if tag_len != self.suite.aead.tag_len {
             return Err(Error::other(format!("unexpected tag length: {tag_len}")));
@@ -469,8 +462,8 @@ impl AeadKey {
             return Err(crypto::CryptoError);
         };
         let (payload, tag) = data.split_at_mut(tag_start);
-        self.ctx()
-            .open_in_place_mut(nonce.slice(), payload, tag, additional_data)
+        self.ctx
+            .open_in_place(nonce.slice(), payload, tag, additional_data)
             .map_err(|_| crypto::CryptoError)?;
         Ok(tag_start)
     }

@@ -1,4 +1,4 @@
-use crate::crypto::btls::error::{Error, Result};
+use crate::crypto::btls::error::Result;
 use btls::hash::MessageDigest;
 use btls::hkdf::HkdfSuite;
 use bytes::{BufMut, BytesMut};
@@ -38,16 +38,7 @@ impl Hkdf {
     /// array containing the generated pseudorandom key (PRK).
     #[inline]
     pub(crate) fn extract(self, salt: &[u8], ikm: &[u8], out: &mut [u8]) -> Result<usize> {
-        if out.len() < self.digest_size() {
-            return Err(Error::invalid_input(format!(
-                "HKDF extract output array invalid size: {}",
-                out.len()
-            )));
-        }
-
-        let prk = HkdfSuite::new(self.0).extract(salt, ikm)?;
-        out[..prk.len()].copy_from_slice(&prk);
-        Ok(prk.len())
+        Ok(HkdfSuite::new(self.0).extract_into(salt, ikm, out)?)
     }
 
     /// Performs the HKDF-Expand-Label function as defined in the

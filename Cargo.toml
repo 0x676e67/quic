@@ -81,4 +81,4 @@ use_self = "warn"
 
 # The QUIC APIs of btls ahead of their release (https://github.com/0x676e67/btls/pull/217).
 [patch.crates-io]
-btls = { git = "https://github.com/0x676e67/btls", rev = "cc7060542f4aa1c421ef79acb6d4257194f6a3cb" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "ab50fb630c22760880a6d5bbeebd4089a2abf06e" }
