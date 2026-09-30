@@ -19,6 +19,7 @@ use std::result::Result as StdResult;
 use std::slice;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use tracing::warn;
 
 /// Configuration for a server-side QUIC. Wraps around a BoringSSL [SslContext].
 pub struct Config {
@@ -152,9 +153,12 @@ impl Session {
             .unwrap();
 
         // BoringSSL accepts 0-RTT only under the context of the ticket, so 0-RTT is rejected
-        // once the limits that a client remembers change.
-        ssl.set_quic_early_data_context(&params.early_data_context())
-            .unwrap();
+        // once the limits that a client remembers change. Without a context, BoringSSL issues
+        // no tickets for 0-RTT.
+        match params.early_data_context() {
+            Ok(context) => ssl.set_quic_early_data_context(&context)?,
+            Err(e) => warn!("0-RTT disabled: failed decoding own transport parameters: {e}"),
+        }
 
         let index = ALPN_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
         ssl.set_ex_data(index, cfg.alpn_protocols.clone());

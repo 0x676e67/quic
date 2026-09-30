@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
 use quic::{
     ClientConfig, Connection, ConnectionError, Endpoint, ReadError, ReadToEndError, ServerConfig,
     TransportConfig, TransportErrorCode,
@@ -90,42 +91,73 @@ async fn handshake_resumption_and_early_data() {
 
 #[tokio::test]
 async fn early_data_rejected_after_transport_change() {
-    let pki = Pki::new();
-    let crypto = Arc::new(server_crypto(&pki, &pki.issue("localhost"), false));
-    // Both servers share the ticket keys of `crypto`, and only differ in a stream limit.
-    let config = ServerConfig::with_crypto(crypto.clone());
-    let server = serve(Endpoint::server(config, localhost()).unwrap());
-    let mut transport = TransportConfig::default();
-    transport.max_concurrent_bidi_streams(10u32.into());
-    let mut config = ServerConfig::with_crypto(crypto);
-    config.transport_config(Arc::new(transport));
-    let limited_server = serve(Endpoint::server(config, localhost()).unwrap());
-    let client = client_endpoint(&pki, None);
+    // A lower stream limit, configured or only sent on the wire.
+    let mut configured = TransportConfig::default();
+    configured.max_concurrent_bidi_streams(10u32.into());
+    let mut sent = TransportConfig::default();
+    let mut entries: Vec<_> = [
+        TransportParameterId::OriginalDestinationConnectionId,
+        TransportParameterId::MaxIdleTimeout,
+        TransportParameterId::StatelessResetToken,
+        TransportParameterId::MaxUdpPayloadSize,
+        TransportParameterId::InitialMaxData,
+        TransportParameterId::InitialMaxStreamDataBidiLocal,
+        TransportParameterId::InitialMaxStreamDataBidiRemote,
+        TransportParameterId::InitialMaxStreamDataUni,
+        TransportParameterId::InitialMaxStreamsUni,
+        TransportParameterId::AckDelayExponent,
+        TransportParameterId::MaxAckDelay,
+        TransportParameterId::DisableActiveMigration,
+        TransportParameterId::ActiveConnectionIdLimit,
+        TransportParameterId::InitialSourceConnectionId,
+        TransportParameterId::RetrySourceConnectionId,
+        TransportParameterId::MaxDatagramFrameSize,
+        TransportParameterId::GreaseQuicBit,
+    ]
+    .map(TransportParameterKind::Known)
+    .into();
+    entries.push(TransportParameterKind::Custom {
+        id: TransportParameterId::InitialMaxStreamsBidi as u64,
+        value: vec![10],
+    });
+    sent.transport_parameter_config(TransportParameterConfig::new(entries, true));
 
-    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
-    request(&conn, b"1-rtt").await.unwrap();
-    conn.close(0u32.into(), b"done");
+    for limited in [configured, sent] {
+        let pki = Pki::new();
+        let crypto = Arc::new(server_crypto(&pki, &pki.issue("localhost"), false));
+        // Both servers share the ticket keys of `crypto`, and only differ in a stream limit.
+        let config = ServerConfig::with_crypto(crypto.clone());
+        let server = serve(Endpoint::server(config, localhost()).unwrap());
+        let mut config = ServerConfig::with_crypto(crypto);
+        config.transport_config(Arc::new(limited));
+        let limited_server = serve(Endpoint::server(config, localhost()).unwrap());
+        let client = client_endpoint(&pki, None);
 
-    // The limited server resumes the session, but rejects the 0-RTT stream: the client
-    // remembers a higher stream limit than the server now grants.
-    let connecting = client.connect(limited_server, "localhost").unwrap();
-    let conn = connecting.into_0rtt().expect("resumable ticket");
-    assert!(matches!(
-        request(&conn, b"0-rtt").await,
-        Err(ReadToEndError::Read(ReadError::ZeroRttRejected))
-    ));
-    let response = request(&conn, b"retry").await.unwrap();
-    check_response(&conn, b"retry", &response, &[]);
-    conn.close(0u32.into(), b"done");
+        let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+        request(&conn, b"1-rtt").await.unwrap();
+        conn.close(0u32.into(), b"done");
 
-    // A ticket of the limited server matches its limits, so it accepts 0-RTT.
-    let connecting = client.connect(limited_server, "localhost").unwrap();
-    let conn = connecting.into_0rtt().expect("resumable ticket");
-    let response = request(&conn, b"0-rtt").await.unwrap();
-    check_response(&conn, b"0-rtt", &response, &[]);
-    conn.close(0u32.into(), b"done");
+        // The limited server resumes the session, but rejects the 0-RTT stream: the client
+        // remembers a higher stream limit than the server now grants.
+        let connecting = client.connect(limited_server, "localhost").unwrap();
+        let conn = connecting.into_0rtt().expect("resumable ticket");
+        assert!(matches!(
+            request(&conn, b"0-rtt").await,
+            Err(ReadToEndError::Read(ReadError::ZeroRttRejected))
+        ));
+        let response = request(&conn, b"retry").await.unwrap();
+        check_response(&conn, b"retry", &response, &[]);
+        conn.close(0u32.into(), b"done");
 
-    client.wait_idle().await;
+        // A ticket of the limited server matches its limits, so it accepts 0-RTT.
+        let connecting = client.connect(limited_server, "localhost").unwrap();
+        let conn = connecting.into_0rtt().expect("resumable ticket");
+        let response = request(&conn, b"0-rtt").await.unwrap();
+        check_response(&conn, b"0-rtt", &response, &[]);
+        conn.close(0u32.into(), b"done");
+
+        client.wait_idle().await;
+    }
 }
 
 #[tokio::test]
