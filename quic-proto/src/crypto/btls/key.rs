@@ -1,6 +1,6 @@
 use crate::crypto;
 use crate::crypto::btls::error::{Result, map_result_zero_is_success};
-use crate::crypto::btls::macros::bounded_array;
+use crate::crypto::btls::macros::{bounded_array, secret_array};
 use crate::crypto::btls::secret::Secret;
 use crate::crypto::btls::suite::{CipherSuite, ID};
 use crate::crypto::btls::{Error, QuicVersion};
@@ -24,10 +24,12 @@ const MAX_NONCE_LEN: usize = 12;
 /// The maximum tag size used by Quic algorithms.
 const MAX_TAG_LEN: usize = 16;
 
-bounded_array! {
+secret_array! {
     /// A buffer that can fit the largest key supported by Quic.
-    pub(crate) struct Key(MAX_KEY_LEN),
+    pub(crate) struct Key(MAX_KEY_LEN)
+}
 
+bounded_array! {
     /// A buffer that can fit the largest nonce supported by Quic.
     pub(crate) struct Nonce(MAX_NONCE_LEN),
 
@@ -336,10 +338,18 @@ impl crypto::HeaderKey for ChaChaHeaderKey {
 }
 
 /// Internal key representation.
-#[derive(Debug)]
 pub(crate) struct PacketKey {
     aead_key: AeadKey,
     iv: Nonce,
+}
+
+impl Debug for PacketKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // The IV is derived from the secret, so leave it out like the key.
+        f.debug_struct("PacketKey")
+            .field("aead_key", &self.aead_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PacketKey {
@@ -565,7 +575,7 @@ mod tests {
         );
         assert_eq!(
             format!("{packet_key:?}"),
-            "PacketKey { aead_key: AeadKey { suite: Aes128GcmSha256, .. }, iv: Nonce { len: 12, .. } }"
+            "PacketKey { aead_key: AeadKey { suite: Aes128GcmSha256, .. }, .. }"
         );
     }
 }

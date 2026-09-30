@@ -1,14 +1,14 @@
 use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::hkdf;
 use crate::crypto::btls::key::{HeaderKey, KeyPair, Keys, PacketKey};
-use crate::crypto::btls::macros::bounded_array;
+use crate::crypto::btls::macros::secret_array;
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::version::QuicVersion;
 use crate::{ConnectionId, Side};
 
 const MAX_SECRET_LEN: usize = hkdf::DIGEST_BLOCK_LEN;
 
-bounded_array! {
+secret_array! {
     /// A buffer that can fit the largest master secret.
     pub(crate) struct Secret(MAX_SECRET_LEN)
 }
@@ -45,7 +45,7 @@ impl Secret {
 }
 
 /// A secret pair for reading (decryption) and writing (encryption).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Secrets {
     pub(crate) version: QuicVersion,
     pub(crate) suite: &'static CipherSuite,
