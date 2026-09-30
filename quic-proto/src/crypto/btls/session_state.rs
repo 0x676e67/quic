@@ -158,17 +158,18 @@ impl SessionState {
         if next_write_level == write_level {
             return None;
         }
-        let secrets = quic.level_state(next_write_level).builder.build()?;
+        let mut secrets = quic.level_state_mut(next_write_level).builder.take()?;
         quic.write_level = next_write_level;
 
+        // The secrets are only needed for this derivation, except that the application
+        // secrets live on as the next generation for `next_1rtt_keys`.
+        let keys = secrets.keys().unwrap().into_crypto().unwrap();
         if next_write_level == Level::Application {
-            // Keep the next application secrets for `next_1rtt_keys`.
-            let mut next_app_secrets = secrets.clone();
-            next_app_secrets.update().unwrap();
-            self.next_secrets = Some(next_app_secrets);
+            secrets.update().unwrap();
+            self.next_secrets = Some(secrets);
         }
 
-        Some(secrets.keys().unwrap().into_crypto().unwrap())
+        Some(keys)
     }
 
     #[inline]
@@ -200,24 +201,23 @@ impl SessionState {
         Some(Box::new(certs))
     }
 
+    /// Derives the 0-RTT keys once the secret is installed. The secret is dropped with them,
+    /// so the keys are returned once.
     #[inline]
     pub(crate) fn early_crypto(
         &self,
     ) -> Option<(Box<dyn crypto::HeaderKey>, Box<dyn crypto::PacketKey>)> {
-        let quic = lock(&self.quic);
-        let builder = &quic.level_state(Level::EarlyData).builder;
-        let version = builder.version;
-        let suite = builder.suite?;
-        let early_secret = match self.side {
-            Side::Client => builder.local_secret.as_ref()?,
-            Side::Server => builder.remote_secret.as_ref()?,
-        };
+        let mut quic = lock(&self.quic);
+        let (suite, early_secret) = quic
+            .level_state_mut(Level::EarlyData)
+            .builder
+            .take_early(self.side)?;
         let header_key = early_secret
-            .header_key(version, suite)
+            .header_key(self.version, suite)
             .unwrap()
             .as_crypto()
             .unwrap();
-        let packet_key = Box::new(early_secret.packet_key(version, suite).unwrap());
+        let packet_key = Box::new(early_secret.packet_key(self.version, suite).unwrap());
 
         Some((header_key, packet_key))
     }
@@ -613,10 +613,69 @@ mod tests {
         assert!(err.reason.contains("cipher suite changed"), "{err}");
         assert!(
             lock(&state.quic)
-                .level_state(Level::Handshake)
+                .level_state_mut(Level::Handshake)
                 .builder
-                .build()
+                .take()
                 .is_none()
         );
+    }
+
+    /// Each secret is dropped once the keys of its level are derived.
+    #[test]
+    fn secrets_dropped_after_key_derivation() {
+        let mut ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
+        ctx.set_quic_method(&QUIC_METHOD).unwrap();
+        let ssl = Ssl::new(&ctx).unwrap();
+        let mut state = SessionState::new(ssl, Side::Client, QuicVersion::V1).unwrap();
+        let ssl = state.ssl.as_ptr();
+        let secret = [0; 32];
+        let cipher = unsafe { bffi::SSL_get_cipher_by_value(0x1301) };
+        let install = |callback: unsafe extern "C" fn(_, _, _, _, _) -> c_int, level| unsafe {
+            callback(ssl, level, cipher, secret.as_ptr(), secret.len())
+        };
+        let early_data = bffi::ssl_encryption_level_t::ssl_encryption_early_data;
+        let handshake = bffi::ssl_encryption_level_t::ssl_encryption_handshake;
+        let application = bffi::ssl_encryption_level_t::ssl_encryption_application;
+        let mut buf = Vec::new();
+
+        // The 0-RTT keys come out once.
+        assert_eq!(install(QuicState::set_write_secret_callback, early_data), 1);
+        assert!(state.early_crypto().is_some());
+        assert!(state.early_crypto().is_none());
+
+        // The handshake keys wait for both secrets, then leave nothing behind.
+        assert_eq!(install(QuicState::set_write_secret_callback, handshake), 1);
+        assert!(state.write_handshake(&mut buf).is_none());
+        assert_eq!(install(QuicState::set_read_secret_callback, handshake), 1);
+        assert!(state.write_handshake(&mut buf).is_some());
+        assert!(
+            lock(&state.quic)
+                .level_state_mut(Level::Handshake)
+                .builder
+                .take()
+                .is_none()
+        );
+
+        // Only the next generation of the application secrets stays, for key updates.
+        assert_eq!(
+            install(QuicState::set_write_secret_callback, application),
+            1
+        );
+        assert_eq!(install(QuicState::set_read_secret_callback, application), 1);
+        assert!(state.write_handshake(&mut buf).is_some());
+        assert!(
+            lock(&state.quic)
+                .level_state_mut(Level::Application)
+                .builder
+                .take()
+                .is_none()
+        );
+        assert!(state.next_1rtt_keys().is_some());
+        assert!(state.write_handshake(&mut buf).is_none());
+
+        // A secret installed after its keys were derived is an error, not a leak.
+        assert_eq!(install(QuicState::set_write_secret_callback, handshake), 0);
+        let err = state.read_handshake(&[]).unwrap_err();
+        assert!(err.reason.contains("after the keys were derived"), "{err}");
     }
 }
