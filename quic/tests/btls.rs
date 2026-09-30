@@ -2,7 +2,11 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
@@ -14,7 +18,9 @@ use quic::{
         ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode},
         x509::X509,
     },
-    crypto::btls::{HandshakeData, QuicClientConfig, QuicServerConfig},
+    crypto::btls::{
+        HandshakeData, QuicClientConfig, QuicServerConfig, SessionCache, SimpleCache, Zeroizing,
+    },
 };
 
 #[tokio::test]
@@ -25,7 +31,8 @@ async fn handshake_resumption_and_early_data() {
     let server = serve(server_endpoint(&pki, &leaf, false));
     // A second server has its own ticket keys, so it cannot resume the first one's sessions.
     let other_server = serve(server_endpoint(&pki, &leaf, false));
-    let client = client_endpoint(&pki, None);
+    let cache = Arc::new(RemovalTracker::default());
+    let client = client_endpoint_with(&pki, None, cache.clone());
 
     // Full handshake: there is no session to resume yet.
     let connecting = client.connect(server, "localhost").unwrap();
@@ -68,6 +75,8 @@ async fn handshake_resumption_and_early_data() {
     let response = request(&conn, b"retry").await.unwrap();
     check_response(&conn, b"retry", &response, &[]);
     conn.close(0u32.into(), b"done");
+    // The rejected ticket was used up, and the others of the server stay for other connections.
+    assert!(!cache.removed.load(Ordering::Relaxed));
 
     // An untrusted server rejects the 0-RTT stream too. The client verifies the server
     // certificate only after it resumes the handshake in 1-RTT, and that failure must close
@@ -318,6 +327,15 @@ fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig 
 /// A client that trusts `pki`. Its builder leaves verification off, which `from_builder` turns
 /// on, and it offers "h3" through [`QuicClientConfig::set_alpn`].
 fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
+    let cache = SimpleCache::new(NonZeroUsize::MIN);
+    client_endpoint_with(pki, identity, Arc::new(cache))
+}
+
+fn client_endpoint_with(
+    pki: &Pki,
+    identity: Option<&Leaf>,
+    cache: Arc<dyn SessionCache>,
+) -> Endpoint {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
     if let Some(leaf) = identity {
@@ -327,6 +345,7 @@ fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
     }
     let mut crypto = QuicClientConfig::from_builder(builder).unwrap();
     crypto.set_alpn(&[b"h3".to_vec()]).unwrap();
+    crypto.set_session_cache(cache);
     let endpoint = Endpoint::client(localhost()).unwrap();
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
     endpoint
@@ -334,6 +353,41 @@ fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
 
 fn localhost() -> SocketAddr {
     (Ipv4Addr::LOCALHOST, 0).into()
+}
+
+/// A [SimpleCache] that notes whether sessions were removed without being taken.
+struct RemovalTracker {
+    cache: SimpleCache,
+    removed: AtomicBool,
+}
+
+impl Default for RemovalTracker {
+    fn default() -> Self {
+        Self {
+            cache: SimpleCache::new(NonZeroUsize::MIN),
+            removed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SessionCache for RemovalTracker {
+    fn put(&self, key: bytes::Bytes, value: Zeroizing<Vec<u8>>) {
+        self.cache.put(key, value);
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        self.cache.take(key)
+    }
+
+    fn remove(&self, key: &[u8]) {
+        self.removed.store(true, Ordering::Relaxed);
+        self.cache.remove(key);
+    }
+
+    fn clear(&self) {
+        self.removed.store(true, Ordering::Relaxed);
+        self.cache.clear();
+    }
 }
 
 /// A CA that issues the leaf certificates of a test.

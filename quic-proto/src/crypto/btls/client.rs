@@ -151,7 +151,6 @@ static TICKET_CACHE_INDEX: LazyLock<Option<Index<Ssl, TicketCache>>> =
 /// The [crypto::Session] implementation for BoringSSL.
 struct Session {
     state: SessionState,
-    tickets: TicketCache,
     zero_rtt_peer_params: Option<TransportParameters>,
     handshake_data_sent: bool,
 }
@@ -243,11 +242,10 @@ impl Session {
         }
 
         let index = TICKET_CACHE_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
-        ssl.set_ex_data(index, tickets.clone());
+        ssl.set_ex_data(index, tickets);
 
         let mut session = Box::new(Self {
             state: SessionState::new(ssl, Side::Client, version)?,
-            tickets,
             zero_rtt_peer_params,
             handshake_data_sent: false,
         });
@@ -269,10 +267,9 @@ impl Session {
             self.state.ssl.early_data_reason()
         );
 
+        // The rejected session left the cache when it was taken, and the other sessions of the
+        // server may still resume other connections.
         self.zero_rtt_peer_params = None;
-
-        // Removed the failed cache entry.
-        self.tickets.remove();
 
         // Now retry advancing the handshake, this time in 1-RTT mode.
         self.state.advance_handshake()
@@ -399,10 +396,6 @@ impl TicketCache {
                 warn!("failed caching session: unable to encode entry: {:?}", e);
             }
         }
-    }
-
-    fn remove(&self) {
-        self.cache.remove(&self.server_name);
     }
 }
 

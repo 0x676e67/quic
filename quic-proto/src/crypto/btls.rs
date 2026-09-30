@@ -23,6 +23,8 @@ pub use hmac::HmacKey;
 pub use server::Config as QuicServerConfig;
 pub use session_cache::{NoSessionCache, SessionCache, SimpleCache};
 use version::QuicVersion;
+/// The wrapper of [SessionCache] values, which zeroes them on drop.
+pub use zeroize::Zeroizing;
 
 /// Authentication data for a btls TLS session.
 #[derive(Clone, Debug)]
