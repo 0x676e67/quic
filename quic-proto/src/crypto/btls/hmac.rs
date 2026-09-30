@@ -1,10 +1,8 @@
 use crate::crypto;
-use crate::crypto::btls::error::map_ptr_result;
 use crate::crypto::btls::hkdf::DIGEST_BLOCK_LEN;
 use btls::hash::MessageDigest;
-use btls_sys as bffi;
+use btls::hmac::Hmac;
 use rand::Rng;
-use std::ffi::{c_uint, c_void};
 use std::result::Result as StdResult;
 use zeroize::Zeroizing;
 
@@ -32,24 +30,13 @@ impl HmacKey {
 
 impl crypto::HmacKey for HmacKey {
     fn sign(&self, data: &[u8], out: &mut [u8]) {
-        let mut out_len = out.len() as c_uint;
-        unsafe {
-            map_ptr_result(bffi::HMAC(
-                self.alg.as_ptr(),
-                self.key.as_ptr() as *const c_void,
-                self.key.len(),
-                data.as_ptr(),
-                data.len(),
-                out.as_mut_ptr(),
-                &mut out_len,
-            ))
-            .unwrap();
-        }
-
-        // Verify the signature length.
-        if out_len as usize != self.signature_len() {
-            panic!("HMAC.sign: generated signature with unexpected length: {out_len}");
-        }
+        let signature = Hmac::init(&self.key, &self.alg)
+            .and_then(|mut hmac| {
+                hmac.update(data)?;
+                hmac.finalize()
+            })
+            .expect("HMAC with a valid key and digest");
+        out.copy_from_slice(&signature);
     }
 
     #[inline]

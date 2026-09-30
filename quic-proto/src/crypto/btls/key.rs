@@ -1,17 +1,17 @@
 use crate::crypto;
-use crate::crypto::btls::error::{Result, map_result_zero_is_success};
+use crate::crypto::btls::error::Result;
 use crate::crypto::btls::macros::{bounded_array, secret_array};
 use crate::crypto::btls::secret::Secret;
 use crate::crypto::btls::suite::{CipherSuite, ID};
 use crate::crypto::btls::{Error, QuicVersion};
 use btls::aead::AeadCtx;
-use btls_sys as bffi;
+use btls::aes::{self, AesKey};
+use btls::chacha;
 use bytes::BytesMut;
-use std::ffi::c_uint;
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::result::Result as StdResult;
-use zeroize::Zeroize;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const SAMPLE_LEN: usize = 16; // 128-bits.
 
@@ -212,46 +212,24 @@ trait CryptoHeaderKey: crypto::HeaderKey {
 }
 
 /// A [CryptoHeaderKey] for AES ciphers.
-struct AesHeaderKey(bffi::AES_KEY);
+struct AesHeaderKey(AesKey);
 
 impl AesHeaderKey {
     fn new(key: &Key) -> Result<Self> {
-        // AES-128 expands to fewer round keys than `rd_key` holds, so start from zeros to keep
-        // every field initialized. Wrapping it first zeroes a partial schedule on failure too.
-        let mut hpk = Self(bffi::AES_KEY {
-            rd_key: [0; 60],
-            rounds: 0,
-        });
-
-        // NOTE: this function breaks the usual return value convention.
-        map_result_zero_is_success(unsafe {
-            bffi::AES_set_encrypt_key(key.as_ptr(), (key.len() * 8) as c_uint, &mut hpk.0)
-        })?;
-        Ok(hpk)
-    }
-}
-
-impl Drop for AesHeaderKey {
-    fn drop(&mut self) {
-        self.0.rd_key.zeroize();
-        self.0.rounds.zeroize();
+        AesKey::new_encrypt(key.slice())
+            .map(Self)
+            .map_err(|_| Error::invalid_input(format!("invalid AES key length: {}", key.len())))
     }
 }
 
 impl CryptoHeaderKey for AesHeaderKey {
     #[inline]
     fn new_mask(&self, sample: &[u8]) -> Result<[u8; 5]> {
-        if sample.len() != SAMPLE_LEN {
-            return Err(Error::invalid_input(format!(
-                "invalid sample length: {}",
-                sample.len()
-            )));
-        }
-
-        let mut encrypted: [u8; SAMPLE_LEN] = [0; SAMPLE_LEN];
-        unsafe {
-            bffi::AES_encrypt(sample.as_ptr(), encrypted.as_mut_ptr(), &self.0);
-        }
+        let sample = sample.try_into().map_err(|_| {
+            Error::invalid_input(format!("invalid sample length: {}", sample.len()))
+        })?;
+        let mut encrypted = [0; SAMPLE_LEN];
+        aes::encrypt_block(&self.0, sample, &mut encrypted);
 
         let mut out: [u8; 5] = [0; 5];
         out.copy_from_slice(&encrypted[..5]);
@@ -280,8 +258,6 @@ impl crypto::HeaderKey for AesHeaderKey {
 struct ChaChaHeaderKey(Key);
 
 impl ChaChaHeaderKey {
-    const ZEROS: [u8; 5] = [0; 5];
-
     fn new(key: &Key) -> Result<Self> {
         Ok(Self(key.clone()))
     }
@@ -302,20 +278,14 @@ impl CryptoHeaderKey for ChaChaHeaderKey {
         // (https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4).
         let (counter, nonce) = sample.split_at(size_of::<u32>());
         let counter = u32::from_le_bytes(counter.try_into().unwrap());
+        let key = self.0.slice().try_into().map_err(|_| {
+            Error::invalid_input(format!("invalid ChaCha20 key length: {}", self.0.len()))
+        })?;
 
-        let mut out: [u8; 5] = [0; 5];
-        unsafe {
-            bffi::CRYPTO_chacha_20(
-                out.as_mut_ptr(),
-                Self::ZEROS.as_ptr(),
-                Self::ZEROS.len(),
-                self.0.as_ptr(),
-                nonce.as_ptr(),
-                counter,
-            );
-        }
-
-        Ok(out)
+        // The mask is the keystream, encrypting zeros.
+        let mut mask = [0; 5];
+        chacha::chacha20(key, nonce.try_into().unwrap(), counter, &mut mask);
+        Ok(mask)
     }
 }
 
@@ -437,9 +407,9 @@ impl crypto::PacketKey for PacketKey {
 /// An AEAD key whose [AeadCtx] owns the key material.
 pub(crate) struct AeadKey {
     suite: &'static CipherSuite,
-    // `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` may run concurrently on one context
-    // (https://github.com/google/boringssl/blob/master/include/openssl/aead.h).
-    ctx: AeadCtx,
+    /// btls only seals and opens through `&mut AeadCtx`. The keys of a connection are used by
+    /// one task at a time, so the lock is never contended.
+    ctx: Mutex<AeadCtx>,
 }
 
 impl Debug for AeadKey {
@@ -453,8 +423,12 @@ impl Debug for AeadKey {
 impl AeadKey {
     #[inline]
     pub(crate) fn new(suite: &'static CipherSuite, key: &Key) -> Result<Self> {
-        let ctx = suite.aead.new_ctx(key)?;
+        let ctx = Mutex::new(suite.aead.new_ctx(key)?);
         Ok(Self { suite, ctx })
+    }
+
+    fn ctx(&self) -> MutexGuard<'_, AeadCtx> {
+        self.ctx.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Encrypts `data` in place. Its last [tag length](crate::crypto::btls::aead::Aead) bytes
@@ -474,8 +448,8 @@ impl AeadKey {
         };
         let (payload, tag) = data.split_at_mut(tag_start);
         let tag_len = self
-            .ctx
-            .seal_in_place(nonce.slice(), payload, tag, additional_data)?
+            .ctx()
+            .seal_in_place_mut(nonce.slice(), payload, tag, additional_data)?
             .len();
         if tag_len != self.suite.aead.tag_len {
             return Err(Error::other(format!("unexpected tag length: {tag_len}")));
@@ -495,8 +469,8 @@ impl AeadKey {
             return Err(crypto::CryptoError);
         };
         let (payload, tag) = data.split_at_mut(tag_start);
-        self.ctx
-            .open_in_place(nonce.slice(), payload, tag, additional_data)
+        self.ctx()
+            .open_in_place_mut(nonce.slice(), payload, tag, additional_data)
             .map_err(|_| crypto::CryptoError)?;
         Ok(tag_start)
     }

@@ -1,18 +1,19 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
-use crate::crypto::btls::bffi_ext::QuicSslContextBuilder;
 use crate::crypto::btls::error::Result;
-use crate::crypto::btls::session_state::{QUIC_METHOD, SessionState, trace_info};
+use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
 use crate::crypto::btls::version::QuicVersion;
-use crate::crypto::btls::{Entry, Error, QuicSsl, QuicSslSession, SessionCache, SimpleCache};
+use crate::crypto::btls::{Entry, Error, SessionCache, SimpleCache};
 use crate::{
     ConnectError, ConnectionId, Side, TransportError, crypto,
     transport_parameters::TransportParameters,
 };
+use btls::error::ErrorStack;
 use btls::ex_data::Index;
 use btls::ssl::{
     Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslSession, SslSessionCacheMode,
     SslVerifyMode, SslVersion,
 };
+use btls::x509::verify::X509CheckFlags;
 use bytes::{Bytes, BytesMut};
 use std::any::Any;
 use std::io::Cursor;
@@ -80,7 +81,7 @@ impl Config {
         builder
             .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
         builder.set_new_session_callback(Session::on_new_session);
-        builder.set_quic_method(&QUIC_METHOD)?;
+        builder.set_quic_method(QuicCallbacks)?;
         builder.set_early_data_enabled(true);
 
         Ok(Self {
@@ -165,7 +166,7 @@ impl Session {
         ssl.set_connect_state();
 
         // Configure verification for the server hostname.
-        ssl.set_verify_hostname(server_name)
+        set_verify_hostname(&mut ssl, server_name)
             .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
 
         // Set the SNI hostname.
@@ -203,9 +204,13 @@ impl Session {
         // If we have a cached session, use it.
         let mut zero_rtt_peer_params = None;
         if let Some(entry) = tickets.cache.get(tickets.server_name.clone()) {
-            match Entry::decode(ssl.ssl_context(), entry) {
+            match Entry::decode(entry) {
                 Ok(entry) => {
                     zero_rtt_peer_params = Some(entry.params);
+                    // SAFETY: The handshake has not started, and the session was cached for
+                    // this server name through the session cache of this configuration, whose
+                    // verification it passed. A cache shared with a configuration that verifies
+                    // differently must not be used.
                     match unsafe { ssl.set_session(entry.session.as_ref()) } {
                         Ok(()) => {
                             trace!("attempting resumption (0-RTT) for server: {}.", server_name);
@@ -253,7 +258,7 @@ impl Session {
     fn on_zero_rtt_rejected(&mut self) -> StdResult<(), TransportError> {
         trace!(
             "0-RTT handshake attempted but was rejected by the server: {}",
-            SslRef::early_data_reason_string(self.state.ssl.get_early_data_reason())
+            self.state.ssl.early_data_reason()
         );
 
         self.zero_rtt_peer_params = None;
@@ -367,7 +372,7 @@ impl TicketCache {
         }
 
         // Get the server transport parameters.
-        let params = match ssl.get_peer_quic_transport_params() {
+        let params = match ssl.peer_quic_transport_params() {
             Some(params) => {
                 match TransportParameters::read(Side::Client, &mut Cursor::new(&params)) {
                     Ok(params) => params,
@@ -395,6 +400,16 @@ impl TicketCache {
 
     fn remove(&self) {
         self.cache.remove(self.server_name.clone());
+    }
+}
+
+/// Verifies the server certificate for `server_name`, an IP address or a host name.
+fn set_verify_hostname(ssl: &mut SslRef, server_name: &str) -> StdResult<(), ErrorStack> {
+    let param = ssl.param_mut();
+    param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+    match server_name.parse() {
+        Ok(ip) => param.set_ip(ip),
+        Err(_) => param.set_host(server_name),
     }
 }
 

@@ -1,7 +1,7 @@
+use crate::crypto::btls::Error;
 use crate::crypto::btls::error::Result;
-use crate::crypto::btls::{Error, QuicSslSession};
 use crate::{Side, transport_parameters::TransportParameters};
-use btls::ssl::{SslContextRef, SslSession};
+use btls::ssl::SslSession;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -39,7 +39,7 @@ impl Entry {
         let mut encoded = out.split_off(8);
 
         // Store the session in the second buffer.
-        self.session.encode(&mut encoded)?;
+        encoded.put_slice(&self.session.to_der()?);
 
         // Go back and write the length to the first buffer.
         out.put_u64(encoded.len() as u64);
@@ -59,10 +59,10 @@ impl Entry {
     }
 
     /// Decodes a [SessionCache] value into an [Entry].
-    pub fn decode(ctx: &SslContextRef, mut encoded: Bytes) -> Result<Self> {
+    pub fn decode(mut encoded: Bytes) -> Result<Self> {
         // Decode the session.
-        let mut encoded_session = split_len_prefixed(&mut encoded)?;
-        let session = SslSession::decode(ctx, &mut encoded_session)?;
+        let encoded_session = split_len_prefixed(&mut encoded)?;
+        let session = SslSession::from_der(&encoded_session)?;
 
         // Decode the transport parameters.
         let mut encoded_params = split_len_prefixed(&mut encoded)?;
@@ -135,11 +135,9 @@ impl SessionCache for SimpleCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use btls::ssl::{SslContextBuilder, SslMethod};
 
     #[test]
     fn decode_truncated_entry() {
-        let ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
         for encoded in [
             &[][..],
             &[0, 0, 0, 0],
@@ -147,7 +145,7 @@ mod tests {
             &[0, 0, 0, 0, 0, 0, 0, 3, 1, 2],
             &u64::MAX.to_be_bytes(),
         ] {
-            let result = Entry::decode(&ctx, Bytes::copy_from_slice(encoded));
+            let result = Entry::decode(Bytes::copy_from_slice(encoded));
             assert!(result.is_err(), "{encoded:?}");
         }
     }

@@ -1,17 +1,11 @@
-use crate::crypto::btls::error::{Error, Result, map_result};
+use crate::crypto::btls::error::{Error, Result};
 use btls::hash::MessageDigest;
-use btls_sys as bffi;
+use btls::hkdf::HkdfSuite;
 use bytes::{BufMut, BytesMut};
 use std::sync::LazyLock;
 
-/// The block size used by the supported digest algorithms (64).
-pub(crate) const DIGEST_BLOCK_LEN: usize = bffi::SHA_CBLOCK as _;
-
-// /// The digest size for SHA256 (32).
-// pub(crate) const SHA256_DIGEST_LEN: usize = bffi::SHA256_DIGEST_LENGTH as _;
-//
-// /// The digest size for SHA384 (48).
-// pub(crate) const SHA384_DIGEST_LEN: usize = bffi::SHA384_DIGEST_LENGTH as _;
+/// The block size of SHA-256, which bounds the secrets and keys derived here.
+pub(crate) const DIGEST_BLOCK_LEN: usize = 64;
 
 /// Implementation of [HKDF](https://www.rfc-editor.org/rfc/rfc5869) used for
 /// creating the initial secrets for
@@ -51,21 +45,9 @@ impl Hkdf {
             )));
         }
 
-        let mut out_len = out.len();
-
-        unsafe {
-            map_result(bffi::HKDF_extract(
-                out.as_mut_ptr(),
-                &mut out_len,
-                self.0.as_ptr(),
-                ikm.as_ptr(),
-                ikm.len(),
-                salt.as_ptr(),
-                salt.len(),
-            ))?;
-
-            Ok(out_len)
-        }
+        let prk = HkdfSuite::new(self.0).extract(salt, ikm)?;
+        out[..prk.len()].copy_from_slice(&prk);
+        Ok(prk.len())
     }
 
     /// Performs the HKDF-Expand-Label function as defined in the
@@ -113,17 +95,6 @@ impl Hkdf {
 
     #[inline]
     pub(crate) fn expand(&self, prk: &[u8], info: &[u8], out: &mut [u8]) -> Result<()> {
-        unsafe {
-            map_result(bffi::HKDF_expand(
-                out.as_mut_ptr(),
-                out.len(),
-                self.0.as_ptr(),
-                prk.as_ptr(),
-                prk.len(),
-                info.as_ptr(),
-                info.len(),
-            ))?;
-        }
-        Ok(())
+        Ok(HkdfSuite::new(self.0).expand(prk, info, out)?)
     }
 }

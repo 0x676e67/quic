@@ -1,9 +1,8 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
-use crate::crypto::btls::bffi_ext::{QuicSsl, QuicSslContextBuilder};
 use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::retry;
 use crate::crypto::btls::secret::Secrets;
-use crate::crypto::btls::session_state::{QUIC_METHOD, SessionState, trace_info};
+use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
 use crate::crypto::btls::version::QuicVersion;
 use crate::{
     ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
@@ -47,7 +46,7 @@ impl Config {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_alpn_select_callback(Session::select_alpn);
-        builder.set_quic_method(&QUIC_METHOD)?;
+        builder.set_quic_method(QuicCallbacks)?;
         builder.set_early_data_enabled(true);
 
         Ok(Self {

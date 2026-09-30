@@ -1,6 +1,5 @@
 use crate::{ConnectError, TransportError, crypto};
 use btls::error::ErrorStack;
-use std::ffi::c_int;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::ErrorKind;
 use std::result::Result as StdResult;
@@ -97,39 +96,3 @@ impl From<TransportError> for Error {
 
 /// The main result type for this (crypto boring) module.
 pub type Result<T> = StdResult<T, Error>;
-
-/// The result returned by the Cloudflare Boring library API functions.
-pub(crate) type BoringResult = StdResult<(), ErrorStack>;
-
-/// Maps BoringSSL ffi return values to the Result type consistent with the Boring APIs.
-pub(crate) fn br(bssl_result: c_int) -> BoringResult {
-    match bssl_result {
-        1 => Ok(()),
-        _ => Err(ErrorStack::get()),
-    }
-}
-
-/// Maps BoringSSL ffi return values to a Result.
-pub(crate) fn map_result(bssl_result: c_int) -> Result<()> {
-    match bssl_result {
-        1 => Ok(()),
-        _ => Err(Error::SslError(ErrorStack::get())),
-    }
-}
-
-/// Like map_result, but for BoringSSL method that break the standard return value convention.
-pub(crate) fn map_result_zero_is_success(bssl_result: c_int) -> Result<()> {
-    match bssl_result {
-        0 => Ok(()),
-        _ => Err(Error::SslError(ErrorStack::get())),
-    }
-}
-
-/// Like map_result, but ensures that the resulting pointer is non-null.
-pub(crate) fn map_ptr_result<T>(r: *mut T) -> Result<*mut T> {
-    if r.is_null() {
-        Err(Error::ssl())
-    } else {
-        Ok(r)
-    }
-}

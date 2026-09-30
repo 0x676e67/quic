@@ -3,7 +3,6 @@
 mod aead;
 mod alert;
 mod alpn;
-mod bffi_ext;
 mod client;
 mod error;
 mod handshake_token;
@@ -19,7 +18,6 @@ mod session_state;
 mod suite;
 mod version;
 
-pub use bffi_ext::*;
 pub use client::{Config as ClientConfig, Config as QuicClientConfig, SessionSettings};
 pub use error::{Error, Result};
 pub use handshake_token::HandshakeTokenKey;
