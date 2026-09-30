@@ -1,3 +1,4 @@
+/// Defines fixed-capacity byte buffers for values that need no protection, such as nonces.
 macro_rules! bounded_array {
     {$(
         $(#[$struct_docs:meta])*
@@ -11,6 +12,17 @@ macro_rules! bounded_array {
             len: u8,
         }
 
+        $crate::crypto::btls::macros::bounded_array!(@impl $vis $struct_name $max_len);
+
+        impl std::fmt::Debug for $struct_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{:02x?}", self.slice())
+            }
+        }
+    )*
+    };
+
+    (@impl $vis:vis $struct_name:ident $max_len:ident) => {
         #[allow(dead_code)]
         impl $struct_name {
             /// Maximum value allowed.
@@ -110,13 +122,42 @@ macro_rules! bounded_array {
             }
         }
 
+    };
+}
+
+/// Defines fixed-capacity byte buffers for key material. Their contents are zeroed on drop and
+/// left out of [`Debug`](std::fmt::Debug), and they cannot be compared, which would not run in
+/// constant time.
+macro_rules! secret_array {
+    {$(
+        $(#[$struct_docs:meta])*
+        $vis:vis struct $struct_name:ident($max_len:ident)
+    ),*} => {
+    $(
+        $(#[$struct_docs])*
+        #[derive(Clone)]
+        $vis struct $struct_name {
+            buf: [u8; Self::MAX_LEN],
+            len: u8,
+        }
+
+        $crate::crypto::btls::macros::bounded_array!(@impl $vis $struct_name $max_len);
+
+        impl Drop for $struct_name {
+            fn drop(&mut self) {
+                zeroize::Zeroize::zeroize(&mut self.buf);
+            }
+        }
+
         impl std::fmt::Debug for $struct_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{:02x?}", self.slice())
+                f.debug_struct(stringify!($struct_name))
+                    .field("len", &self.len)
+                    .finish_non_exhaustive()
             }
         }
     )*
-    }
+    };
 }
 
-pub(crate) use bounded_array;
+pub(crate) use {bounded_array, secret_array};

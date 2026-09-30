@@ -23,7 +23,7 @@ aws-lc-rs-fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
 bloom = ["dep:fastbloom"]
 
 # Enable btls/BoringSSL crypto support
-btls = ["dep:btls", "dep:btls-sys", "dep:foreign-types-shared", "dep:lru"]
+btls = ["dep:btls", "dep:btls-sys", "dep:foreign-types-shared", "dep:lru", "dep:zeroize"]
 btls-prefix-symbols = ["btls", "btls?/prefix-symbols"]
 
 # For backwards compatibility, `rustls` forwards to `rustls-ring`
@@ -77,6 +77,7 @@ slab = { workspace = true }
 thiserror = { workspace = true }
 tinyvec = { workspace = true, features = ["alloc"] }
 tracing = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 # Feature flags & dependencies for wasm
 # wasm-bindgen is assumed for a wasm*-*-unknown target

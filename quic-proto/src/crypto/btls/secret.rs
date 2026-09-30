@@ -1,14 +1,14 @@
 use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::hkdf;
 use crate::crypto::btls::key::{HeaderKey, KeyPair, Keys, PacketKey};
-use crate::crypto::btls::macros::bounded_array;
+use crate::crypto::btls::macros::secret_array;
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::version::QuicVersion;
 use crate::{ConnectionId, Side};
 
 const MAX_SECRET_LEN: usize = hkdf::DIGEST_BLOCK_LEN;
 
-bounded_array! {
+secret_array! {
     /// A buffer that can fit the largest master secret.
     pub(crate) struct Secret(MAX_SECRET_LEN)
 }
@@ -17,11 +17,11 @@ impl Secret {
     /// Performs an in-place key update.
     #[inline]
     pub(crate) fn update(&mut self, version: QuicVersion, suite: &CipherSuite) -> Result<()> {
-        let out = &mut [0u8; Self::MAX_LEN][..self.len()];
+        let mut next = Self::with_len(self.len());
         suite
             .hkdf
-            .expand_label(self.slice(), version.key_update_label(), out)?;
-        self.slice_mut().copy_from_slice(out);
+            .expand_label(self.slice(), version.key_update_label(), next.slice_mut())?;
+        *self = next;
         Ok(())
     }
 
@@ -45,7 +45,7 @@ impl Secret {
 }
 
 /// A secret pair for reading (decryption) and writing (encryption).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Secrets {
     pub(crate) version: QuicVersion,
     pub(crate) suite: &'static CipherSuite,
@@ -67,9 +67,11 @@ impl Secrets {
 
         // Generate the initial secret.
         let salt = version.initial_salt();
-        let mut initial_secret = [0u8; Secret::MAX_LEN];
-        let initial_secret_len = suite.hkdf.extract(salt, dst_cid, &mut initial_secret)?;
-        let initial_secret = &initial_secret[..initial_secret_len];
+        let mut initial_secret = Secret::with_len(Secret::MAX_LEN);
+        let initial_secret_len = suite
+            .hkdf
+            .extract(salt, dst_cid, initial_secret.slice_mut())?;
+        let initial_secret = &initial_secret.slice()[..initial_secret_len];
 
         // Use the appropriate secret labels for "this" side of the connection.
         const CLIENT_LABEL: &[u8] = b"client in";
@@ -193,8 +195,8 @@ impl SecretsBuilder {
         Some(Secrets {
             version: self.version,
             suite: self.suite?,
-            local: self.local_secret?,
-            remote: self.remote_secret?,
+            local: self.local_secret.clone()?,
+            remote: self.remote_secret.clone()?,
         })
     }
 }
