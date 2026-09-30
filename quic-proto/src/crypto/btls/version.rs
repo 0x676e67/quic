@@ -5,9 +5,8 @@ use std::result::Result as StdResult;
 ///
 /// Governs version-specific behavior in the TLS layer
 // TODO: add support for draft version 2.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
-pub enum QuicVersion {
+pub(crate) enum QuicVersion {
     V1Draft29,
     V1Draft30,
     V1Draft31,
@@ -30,23 +29,6 @@ impl QuicVersion {
     const VERSION_1_DRAFT_34: u32 = Self::DRAFT_INDICATOR | 34;
     const VERSION_1: u32 = 1;
 
-    /// Returns the default list of supported quic versions.
-    pub fn default_supported_versions() -> Vec<u32> {
-        let mut out = Vec::new();
-        for v in [
-            Self::V1,
-            Self::V1Draft34,
-            Self::V1Draft33,
-            Self::V1Draft32,
-            Self::V1Draft31,
-            Self::V1Draft30,
-            Self::V1Draft29,
-        ] {
-            out.push(v.label());
-        }
-        out
-    }
-
     pub(crate) fn parse(version: u32) -> StdResult<Self, crypto::UnsupportedVersion> {
         match version {
             Self::VERSION_1_DRAFT_29 => Ok(Self::V1Draft29),
@@ -57,18 +39,6 @@ impl QuicVersion {
             Self::VERSION_1_DRAFT_34 => Ok(Self::V1Draft34),
             Self::VERSION_1 => Ok(Self::V1),
             _ => Err(crypto::UnsupportedVersion),
-        }
-    }
-
-    pub(crate) fn label(&self) -> u32 {
-        match self {
-            Self::V1Draft29 => Self::VERSION_1_DRAFT_29,
-            Self::V1Draft30 => Self::VERSION_1_DRAFT_30,
-            Self::V1Draft31 => Self::VERSION_1_DRAFT_31,
-            Self::V1Draft32 => Self::VERSION_1_DRAFT_32,
-            Self::V1Draft33 => Self::VERSION_1_DRAFT_33,
-            Self::V1Draft34 => Self::VERSION_1_DRAFT_34,
-            Self::V1 => Self::VERSION_1,
         }
     }
 

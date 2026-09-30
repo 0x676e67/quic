@@ -1,16 +1,18 @@
-use crate::{ConnectError, TransportError, crypto};
+use crate::{ConnectError, crypto};
 use btls::error::ErrorStack;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::ErrorKind;
 use std::result::Result as StdResult;
 use std::{fmt, io};
 
-// Error conversion:
+/// An error of the btls crypto provider.
 pub enum Error {
+    /// A BoringSSL error.
     SslError(ErrorStack),
+    /// An invalid argument, or another failure outside BoringSSL.
     IoError(io::Error),
+    /// A failure to start a connection, such as an invalid server name.
     ConnectError(ConnectError),
-    TransportError(TransportError),
 }
 
 impl Debug for Error {
@@ -19,7 +21,6 @@ impl Debug for Error {
             Self::SslError(e) => Debug::fmt(&e, f),
             Self::IoError(e) => Debug::fmt(&e, f),
             Self::ConnectError(e) => Debug::fmt(&e, f),
-            Self::TransportError(e) => Debug::fmt(&e, f),
         }
     }
 }
@@ -30,7 +31,6 @@ impl Display for Error {
             Self::SslError(e) => Display::fmt(&e, f),
             Self::IoError(e) => Display::fmt(&e, f),
             Self::ConnectError(e) => Display::fmt(&e, f),
-            Self::TransportError(e) => Display::fmt(&e, f),
         }
     }
 }
@@ -38,10 +38,6 @@ impl Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
-    pub(crate) fn ssl() -> Self {
-        Self::SslError(ErrorStack::get())
-    }
-
     pub(crate) fn invalid_input(msg: String) -> Self {
         Self::IoError(io::Error::new(ErrorKind::InvalidInput, msg))
     }
@@ -58,14 +54,13 @@ impl From<Error> for crypto::CryptoError {
     }
 }
 
-/// Support conversion to ConnectError.
+/// Keeps a [ConnectError], and reports any other failure to start a connection as
+/// [`ConnectError::EndpointStopping`].
 impl From<Error> for ConnectError {
     fn from(e: Error) -> Self {
         match e {
-            Error::SslError(_) => Self::EndpointStopping,
-            Error::IoError(_) => Self::EndpointStopping,
             Error::ConnectError(e) => e,
-            Error::TransportError(_) => Self::EndpointStopping,
+            Error::SslError(_) | Error::IoError(_) => Self::EndpointStopping,
         }
     }
 }
@@ -85,12 +80,6 @@ impl From<io::Error> for Error {
 impl From<ConnectError> for Error {
     fn from(e: ConnectError) -> Self {
         Self::ConnectError(e)
-    }
-}
-
-impl From<TransportError> for Error {
-    fn from(e: TransportError) -> Self {
-        Self::TransportError(e)
     }
 }
 

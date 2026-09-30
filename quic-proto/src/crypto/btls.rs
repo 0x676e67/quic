@@ -1,5 +1,3 @@
-#![allow(dead_code, missing_docs)]
-
 mod aead;
 mod alert;
 mod alpn;
@@ -18,13 +16,13 @@ mod session_state;
 mod suite;
 mod version;
 
-pub use client::{Config as ClientConfig, Config as QuicClientConfig, SessionSettings};
+pub use client::{Config as QuicClientConfig, SessionSettings};
 pub use error::{Error, Result};
 pub use handshake_token::HandshakeTokenKey;
 pub use hmac::HmacKey;
-pub use server::{Config as QuicServerConfig, Config as ServerConfig};
-pub use session_cache::*;
-pub use version::QuicVersion;
+pub use server::Config as QuicServerConfig;
+pub use session_cache::{NoSessionCache, SessionCache, SimpleCache};
+use version::QuicVersion;
 
 /// Authentication data for a btls TLS session.
 #[derive(Clone, Debug)]

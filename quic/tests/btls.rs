@@ -183,6 +183,25 @@ async fn peer_identity_with_client_auth() {
     client.wait_idle().await;
 }
 
+/// A server flight may exceed the 16 KiB a server itself accepts per level.
+#[tokio::test]
+async fn large_certificate_chain() {
+    let pki = Pki::new();
+    let names = ["localhost".to_owned()]
+        .into_iter()
+        .chain((0..1000).map(|i| format!("padding-{i}.example")));
+    let leaf = pki.issue_for(names.collect());
+    assert!(leaf.cert.to_der().unwrap().len() > 16 * 1024);
+    let server = serve(server_endpoint(&pki, &leaf, false));
+    let client = client_endpoint(&pki, None);
+
+    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+    assert_eq!(peer_chain(&conn), pki.chain(&leaf));
+    conn.close(0u32.into(), b"done");
+
+    client.wait_idle().await;
+}
+
 /// Asynchronous certificate verification needs someone to resume the handshake once it is
 /// done, which the session cannot do, so the connection fails instead of stalling.
 #[tokio::test]
@@ -336,8 +355,14 @@ impl Pki {
     }
 
     fn issue(&self, name: &str) -> Leaf {
+        self.issue_for(vec![name.into()])
+    }
+
+    /// Issues a leaf for `names`, the first of which is its common name.
+    fn issue_for(&self, names: Vec<String>) -> Leaf {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+        let name = names[0].clone();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
         // rcgen's default subject is the CA's, which would make the leaf look self-signed.
         params.distinguished_name = rcgen::DistinguishedName::new();
         params

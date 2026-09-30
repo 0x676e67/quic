@@ -2,133 +2,158 @@ use crate::crypto::btls::Error;
 use crate::crypto::btls::error::Result;
 use crate::{Side, transport_parameters::TransportParameters};
 use btls::ssl::SslSession;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes};
 use lru::LruCache;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
-/// A client-side Session cache for the BoringSSL crypto provider.
+/// A client-side session cache for the btls crypto provider, keyed by server name.
+///
+/// Values are encoded sessions, which hold resumption secrets. A session resumes at most one
+/// connection ([RFC 8446 §C.4](https://www.rfc-editor.org/rfc/rfc8446#appendix-C.4)), so
+/// [`SessionCache::take`] removes the value it returns.
 pub trait SessionCache: Send + Sync {
-    /// Adds the given value to the session cache.
-    fn put(&self, key: Bytes, value: Bytes);
+    /// Adds a session for `key`, next to the ones already cached for it.
+    fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>);
 
-    /// Returns the cached session, if it exists.
-    fn get(&self, key: Bytes) -> Option<Bytes>;
+    /// Removes and returns a session for `key`, preferably the newest.
+    fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>>;
 
-    /// Removes the cached session, if it exists.
-    fn remove(&self, key: Bytes);
+    /// Removes all sessions for `key`.
+    fn remove(&self, key: &[u8]);
 
-    /// Removes all entries from the cache.
+    /// Removes all sessions.
     fn clear(&self);
 }
 
-/// A utility for combining an [SslSession] and server [TransportParameters] as a
-/// [SessionCache] entry.
-pub struct Entry {
-    pub session: SslSession,
-    pub params: TransportParameters,
+/// An [SslSession] with the server [TransportParameters] that 0-RTT needs, as a [SessionCache]
+/// value.
+pub(crate) struct Entry {
+    pub(crate) session: SslSession,
+    pub(crate) params: TransportParameters,
 }
 
 impl Entry {
-    /// Encodes this [Entry] into a [SessionCache] value.
-    pub fn encode(&self) -> Result<Bytes> {
-        let mut out = BytesMut::with_capacity(2048);
+    /// Encodes the session and the parameters, each with a `u64` length prefix.
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let session = Zeroizing::new(self.session.to_der()?);
+        let mut params = Vec::new();
+        self.params.write(&mut params);
 
-        // Split the buffer in two: the length prefix buffer and the encoded session buffer.
-        // This will be O(1) as both will refer to the same underlying buffer.
-        let mut encoded = out.split_off(8);
-
-        // Store the session in the second buffer.
-        encoded.put_slice(&self.session.to_der()?);
-
-        // Go back and write the length to the first buffer.
-        out.put_u64(encoded.len() as u64);
-
-        // Unsplit to merge the two buffers back together. This will be O(1) since
-        // the buffers are already contiguous in memory.
-        out.unsplit(encoded);
-
-        // Now add the transport parameters.
-        out.reserve(128);
-        let mut encoded = out.split_off(out.len() + 8);
-        self.params.write(&mut encoded);
-        out.put_u64(encoded.len() as u64);
-        out.unsplit(encoded);
-
-        Ok(out.freeze())
+        // Sized up front, so that no copy of the session is left behind by a reallocation.
+        let len = 2 * size_of::<u64>() + session.len() + params.len();
+        let mut out = Zeroizing::new(Vec::with_capacity(len));
+        out.put_u64(session.len() as u64);
+        out.put_slice(&session);
+        out.put_u64(params.len() as u64);
+        out.put_slice(&params);
+        Ok(out)
     }
 
-    /// Decodes a [SessionCache] value into an [Entry].
-    pub fn decode(mut encoded: Bytes) -> Result<Self> {
-        // Decode the session.
-        let encoded_session = split_len_prefixed(&mut encoded)?;
-        let session = SslSession::from_der(&encoded_session)?;
-
-        // Decode the transport parameters.
-        let mut encoded_params = split_len_prefixed(&mut encoded)?;
-        let params = TransportParameters::read(Side::Client, &mut encoded_params).map_err(|e| {
+    /// Decodes a value of [Entry::encode].
+    pub(crate) fn decode(mut encoded: &[u8]) -> Result<Self> {
+        let session = SslSession::from_der(split_len_prefixed(&mut encoded)?)?;
+        let mut params = split_len_prefixed(&mut encoded)?;
+        let params = TransportParameters::read(Side::Client, &mut params).map_err(|e| {
             Error::invalid_input(format!("failed parsing cached transport parameters: {e:?}"))
         })?;
-
         Ok(Self { session, params })
+    }
+
+    /// Returns whether the session outlived its lifetime, after which the server rejects it.
+    pub(crate) fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |now| now.as_secs());
+        let expiry = self
+            .session
+            .time()
+            .saturating_add(self.session.timeout().into());
+        now >= expiry
     }
 }
 
 /// Splits off a value that [Entry::encode] wrote with a `u64` length prefix.
-fn split_len_prefixed(encoded: &mut Bytes) -> Result<Bytes> {
+fn split_len_prefixed<'a>(encoded: &mut &'a [u8]) -> Result<&'a [u8]> {
     let truncated = || Error::invalid_input("truncated session cache entry".into());
     if encoded.remaining() < size_of::<u64>() {
         return Err(truncated());
     }
     let len = usize::try_from(encoded.get_u64()).map_err(|_| truncated())?;
-    if len > encoded.remaining() {
+    if len > encoded.len() {
         return Err(truncated());
     }
-    Ok(encoded.split_to(len))
+    let (value, rest) = encoded.split_at(len);
+    *encoded = rest;
+    Ok(value)
 }
 
-/// A [SessionCache] implementation that will never cache anything. Requires no storage.
+/// A [SessionCache] that never caches anything.
 pub struct NoSessionCache;
 
 impl SessionCache for NoSessionCache {
-    fn put(&self, _: Bytes, _: Bytes) {}
+    fn put(&self, _: Bytes, _: Zeroizing<Vec<u8>>) {}
 
-    fn get(&self, _: Bytes) -> Option<Bytes> {
+    fn take(&self, _: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         None
     }
 
-    fn remove(&self, _: Bytes) {}
+    fn remove(&self, _: &[u8]) {}
 
     fn clear(&self) {}
 }
 
+/// A [SessionCache] that keeps the two newest sessions of each of its most recently used
+/// servers, since a server issues two per connection.
 pub struct SimpleCache {
-    cache: Mutex<LruCache<Bytes, Bytes>>,
+    cache: Mutex<LruCache<Bytes, VecDeque<Zeroizing<Vec<u8>>>>>,
 }
 
 impl SimpleCache {
-    pub fn new(num_entries: usize) -> Self {
+    /// The sessions kept per server.
+    const SESSIONS_PER_SERVER: usize = 2;
+
+    /// Creates a cache for the sessions of up to `num_servers` servers.
+    pub fn new(num_servers: NonZeroUsize) -> Self {
         Self {
-            cache: Mutex::new(LruCache::new(NonZeroUsize::new(num_entries).unwrap())),
+            cache: Mutex::new(LruCache::new(num_servers)),
         }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LruCache<Bytes, VecDeque<Zeroizing<Vec<u8>>>>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl SessionCache for SimpleCache {
-    fn put(&self, key: Bytes, value: Bytes) {
-        let _ = self.cache.lock().unwrap().put(key, value);
+    fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>) {
+        let mut cache = self.lock();
+        let sessions = cache.get_or_insert_mut(key, VecDeque::new);
+        if sessions.len() == Self::SESSIONS_PER_SERVER {
+            sessions.pop_front();
+        }
+        sessions.push_back(value);
     }
 
-    fn get(&self, key: Bytes) -> Option<Bytes> {
-        self.cache.lock().unwrap().get(&key).cloned()
+    fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        let mut cache = self.lock();
+        let sessions = cache.get_mut(key)?;
+        let value = sessions.pop_back();
+        if sessions.is_empty() {
+            cache.pop(key);
+        }
+        value
     }
 
-    fn remove(&self, key: Bytes) {
-        let _ = self.cache.lock().unwrap().pop(&key);
+    fn remove(&self, key: &[u8]) {
+        self.lock().pop(key);
     }
 
     fn clear(&self) {
-        self.cache.lock().unwrap().clear()
+        self.lock().clear()
     }
 }
 
@@ -145,8 +170,28 @@ mod tests {
             &[0, 0, 0, 0, 0, 0, 0, 3, 1, 2],
             &u64::MAX.to_be_bytes(),
         ] {
-            let result = Entry::decode(Bytes::copy_from_slice(encoded));
-            assert!(result.is_err(), "{encoded:?}");
+            assert!(Entry::decode(encoded).is_err(), "{encoded:?}");
         }
+    }
+
+    #[test]
+    fn simple_cache_hands_out_each_session_once() {
+        let cache = SimpleCache::new(NonZeroUsize::MIN);
+        let value = |v: u8| Zeroizing::new(vec![v]);
+        let take = |key: &[u8]| cache.take(key).map(|v| v[0]);
+
+        // The newest two sessions of a server are kept, and each is taken once, newest first.
+        for v in 1..=3 {
+            cache.put(Bytes::from_static(b"a"), value(v));
+        }
+        assert_eq!(take(b"a"), Some(3));
+        assert_eq!(take(b"a"), Some(2));
+        assert_eq!(take(b"a"), None);
+
+        // Another server evicts the least recently used one.
+        cache.put(Bytes::from_static(b"a"), value(1));
+        cache.put(Bytes::from_static(b"b"), value(2));
+        assert_eq!(take(b"a"), None);
+        assert_eq!(take(b"b"), Some(2));
     }
 }
