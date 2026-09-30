@@ -1,6 +1,6 @@
 use crate::crypto::btls::error::Result;
 use crate::crypto::btls::key::{Key, Nonce, Tag};
-use btls::aead::{AeadCtx, Algorithm};
+use btls::aead::{Algorithm, StatelessAeadCtx};
 use std::sync::LazyLock;
 
 const AES_128_GCM_KEY_LEN: usize = 16;
@@ -98,7 +98,7 @@ impl Aead {
 
     /// Creates a context that owns `key`. BoringSSL zeroes the context when it is freed.
     #[inline]
-    pub(crate) fn new_ctx(&self, key: &Key) -> Result<AeadCtx> {
-        Ok(AeadCtx::new(&self.alg, key.slice(), self.tag_len)?)
+    pub(crate) fn new_ctx(&self, key: &Key) -> Result<StatelessAeadCtx> {
+        Ok(StatelessAeadCtx::new(&self.alg, key.slice(), self.tag_len)?)
     }
 }

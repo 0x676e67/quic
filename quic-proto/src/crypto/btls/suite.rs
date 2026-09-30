@@ -1,7 +1,7 @@
 use crate::crypto::btls::aead::Aead;
 use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::hkdf::Hkdf;
-use btls_sys as bffi;
+use btls::ssl::SslCipherRef;
 use std::fmt::{Debug, Formatter};
 use std::sync::LazyLock;
 
@@ -74,9 +74,6 @@ static CHACHA20_POLY1305_SHA256: LazyLock<CipherSuite> = LazyLock::new(|| Cipher
     integrity_limit: CHACHA20_POLY1305_INTEGRITY_LIMIT,
 });
 
-unsafe impl Send for CipherSuite {}
-unsafe impl Sync for CipherSuite {}
-
 impl CipherSuite {
     #[inline]
     pub(crate) fn aes128_gcm_sha256() -> &'static Self {
@@ -93,13 +90,17 @@ impl CipherSuite {
         &CHACHA20_POLY1305_SHA256
     }
 
+    /// Returns the suite of a TLS 1.3 cipher suite, by its IANA number
+    /// (<https://www.rfc-editor.org/rfc/rfc8446#appendix-B.4>).
     #[inline]
-    pub(crate) fn from_cipher(cipher: *const bffi::SSL_CIPHER) -> Result<&'static Self> {
-        match unsafe { bffi::SSL_CIPHER_get_id(cipher) } as i32 {
-            bffi::TLS1_CK_AES_128_GCM_SHA256 => Ok(Self::aes128_gcm_sha256()),
-            bffi::TLS1_CK_AES_256_GCM_SHA384 => Ok(Self::aes256_gcm_sha384()),
-            bffi::TLS1_CK_CHACHA20_POLY1305_SHA256 => Ok(Self::chacha20_poly1305_sha256()),
-            id => Err(Error::invalid_input(format!("invalid cipher id: {id}"))),
+    pub(crate) fn from_cipher(cipher: &SslCipherRef) -> Result<&'static Self> {
+        match cipher.protocol_id() {
+            0x1301 => Ok(Self::aes128_gcm_sha256()),
+            0x1302 => Ok(Self::aes256_gcm_sha384()),
+            0x1303 => Ok(Self::chacha20_poly1305_sha256()),
+            id => Err(Error::invalid_input(format!(
+                "invalid cipher id: {id:#06x}"
+            ))),
         }
     }
 }

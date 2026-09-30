@@ -21,13 +21,11 @@ assert_matches = "1.1"
 aws-lc-rs = { version = "1.9", default-features = false }
 bencher = "0.1.5"
 btls = "0.5.5"
-btls-sys = "0.5.5"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc = "3"
 directories-next = "2"
 fastbloom = { version = "0.17", default-features = false }
-foreign-types-shared = "0.3"
 futures-io = "0.3.19"
 getrandom = { version = "0.4", default-features = false }
 hdrhistogram = { version = "7.2", default-features = false }
@@ -80,3 +78,7 @@ unused_qualifications = "warn"
 manual_let_else = "warn"
 or_fun_call = "warn"
 use_self = "warn"
+
+# The QUIC APIs of btls ahead of their release (https://github.com/0x676e67/btls/pull/217).
+[patch.crates-io]
+btls = { git = "https://github.com/0x676e67/btls", rev = "ab50fb630c22760880a6d5bbeebd4089a2abf06e" }

@@ -1,22 +1,19 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
-use crate::crypto::btls::bffi_ext::QuicSsl;
 use crate::crypto::btls::error::{Error, Result};
+use crate::crypto::btls::retry;
 use crate::crypto::btls::secret::Secrets;
-use crate::crypto::btls::session_state::{QUIC_METHOD, SessionState};
+use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
 use crate::crypto::btls::version::QuicVersion;
-use crate::crypto::btls::{QuicSslContext, retry};
 use crate::{
     ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
 };
 use btls::ex_data::Index;
-use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslVersion};
-use btls_sys as bffi;
+use btls::ssl::{
+    AlpnError, Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslRef, SslVersion,
+};
 use bytes::{Bytes, BytesMut};
-use foreign_types_shared::ForeignTypeRef;
 use std::any::Any;
-use std::ffi::{c_int, c_uint, c_void};
 use std::result::Result as StdResult;
-use std::slice;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use tracing::warn;
@@ -28,40 +25,32 @@ pub struct Config {
 }
 
 impl Config {
+    /// Creates a new [Config] that prefers its own cipher order, acknowledges SNI and does not
+    /// ask for client certificates.
     pub fn new() -> Result<Self> {
         let mut builder = SslContextBuilder::new(SslMethod::tls())?;
+        builder.set_default_verify_paths()?;
+        builder.set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
+        builder.set_servername_callback(|_, _| Ok(()));
+        builder.set_info_callback(trace_info);
+        Self::from_builder(builder)
+    }
 
-        // QUIC requires TLS 1.3.
+    /// Creates a new [Config] from a caller-provided [SslContextBuilder], which holds the
+    /// certificates, client verification and every other TLS setting.
+    ///
+    /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
+    /// callbacks and the ALPN selection of [`Config::set_alpn`], replacing any on the builder.
+    /// Other callbacks of the builder are kept.
+    pub fn from_builder(mut builder: SslContextBuilder) -> Result<Self> {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-
-        builder.set_default_verify_paths()?;
-
-        // We build the context early, since we are not allowed to further mutate the context
-        // in start_session.
-        let mut ctx = builder.build();
-
-        // Disable verification of the client by default.
-        ctx.verify_peer(false);
-
-        // By default, enable early data (used for 0-RTT).
-        ctx.enable_early_data(true);
-
-        // Configure default ALPN protocols accepted by the server.QUIC requires ALPN be
-        // configured (see https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1).
-        ctx.set_alpn_select_cb(Some(Session::alpn_select_callback));
-
-        // Set the callback for receipt of the Server Name Indication (SNI) extension.
-        ctx.set_server_name_cb(Some(Session::server_name_callback));
-
-        // Set callbacks for the SessionState.
-        ctx.set_quic_method(&QUIC_METHOD)?;
-        ctx.set_info_callback(Some(SessionState::info_callback));
-
-        ctx.set_options(bffi::SSL_OP_CIPHER_SERVER_PREFERENCE as u32);
+        builder.set_alpn_select_callback(Session::select_alpn);
+        builder.set_quic_method(QuicCallbacks)?;
+        builder.set_early_data_enabled(true);
 
         Ok(Self {
-            ctx,
+            ctx: builder.build(),
             alpn_protocols: AlpnProtocols::default(),
         })
     }
@@ -69,23 +58,6 @@ impl Config {
     /// Returns the underlying [SslContext] backing all created sessions.
     pub fn ctx(&self) -> &SslContext {
         &self.ctx
-    }
-
-    /// Returns the underlying [SslContext] backing all created sessions. Wherever possible use
-    /// the provided methods to modify settings rather than accessing this directly.
-    ///
-    /// Care should be taken to avoid overriding required behavior. In particular, this
-    /// configuration will set callbacks for QUIC events, alpn selection, server name,
-    /// as well as info and key logging.
-    pub fn ctx_mut(&mut self) -> &mut SslContext {
-        &mut self.ctx
-    }
-
-    /// Sets whether or not the peer certificate should be verified. If `true`, any error
-    /// during verification will be fatal. If not called, verification of the client is
-    /// disabled by default.
-    pub fn verify_peer(&mut self, verify: bool) {
-        self.ctx.verify_peer(verify)
     }
 
     /// Sets the ALPN protocols that will be accepted by the server. QUIC requires that
@@ -170,41 +142,14 @@ impl Session {
     }
 }
 
-// Raw callbacks from BoringSSL
 impl Session {
-    /// Selects the ALPN protocol from the ones the client offered.
-    extern "C" fn alpn_select_callback(
-        ssl: *mut bffi::SSL,
-        out: *mut *const u8,
-        out_len: *mut u8,
-        in_: *const u8,
-        in_len: c_uint,
-        _: *mut c_void,
-    ) -> c_int {
-        // SAFETY: BoringSSL passes the callback the `SSL` it runs for, the offered protocols,
-        // and the output slots for the selected one.
-        unsafe {
-            let ssl = SslRef::from_ptr(ssl);
-            let Some(alpn) = (*ALPN_INDEX).and_then(|index| ssl.ex_data(index)) else {
-                return bffi::SSL_TLSEXT_ERR_ALERT_FATAL;
-            };
-            let protos = slice::from_raw_parts(in_, in_len as _);
-            match alpn.select(protos) {
-                Ok(proto) => {
-                    *out = proto.as_ptr() as _;
-                    *out_len = proto.len() as _;
-                    bffi::SSL_TLSEXT_ERR_OK
-                }
-                Err(_) => bffi::SSL_TLSEXT_ERR_ALERT_FATAL,
-            }
-        }
-    }
-
-    /// Acknowledges the Server Name Indication (SNI) extension in the client hello.
-    extern "C" fn server_name_callback(_: *mut bffi::SSL, _: *mut c_int, _: *mut c_void) -> c_int {
-        // SSL_TLSEXT_ERR_OK causes the server_name extension to be acked in
-        // ServerHello.
-        bffi::SSL_TLSEXT_ERR_OK
+    /// Selects the ALPN protocol from the ones the client offered, for
+    /// [`SslContextBuilder::set_alpn_select_callback`].
+    fn select_alpn<'a>(ssl: &mut SslRef, offered: &'a [u8]) -> StdResult<&'a [u8], AlpnError> {
+        let alpn = (*ALPN_INDEX)
+            .and_then(|index| ssl.ex_data(index))
+            .ok_or(AlpnError::ALERT_FATAL)?;
+        alpn.select(offered).map_err(|_| AlpnError::ALERT_FATAL)
     }
 }
 

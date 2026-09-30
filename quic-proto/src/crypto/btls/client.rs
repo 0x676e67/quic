@@ -1,20 +1,21 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
-use crate::crypto::btls::bffi_ext::QuicSslContext;
 use crate::crypto::btls::error::Result;
-use crate::crypto::btls::session_state::{QUIC_METHOD, SessionState};
+use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
 use crate::crypto::btls::version::QuicVersion;
-use crate::crypto::btls::{Entry, Error, QuicSsl, QuicSslSession, SessionCache, SimpleCache};
+use crate::crypto::btls::{Entry, Error, SessionCache, SimpleCache};
 use crate::{
     ConnectError, ConnectionId, Side, TransportError, crypto,
     transport_parameters::TransportParameters,
 };
+use btls::error::ErrorStack;
 use btls::ex_data::Index;
-use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslSession, SslVersion};
-use btls_sys as bffi;
+use btls::ssl::{
+    Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslSession, SslSessionCacheMode,
+    SslVerifyMode, SslVersion,
+};
+use btls::x509::verify::X509CheckFlags;
 use bytes::{Bytes, BytesMut};
-use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use std::any::Any;
-use std::ffi::c_int;
 use std::io::Cursor;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -39,56 +40,53 @@ pub struct SessionSettings {
 /// Configuration for a client-side QUIC. Wraps around a BoringSSL [SslContext].
 pub struct Config {
     ctx: SslContext,
+    /// Encoded ALPN protocols that replace the ones of `ctx` for each connection.
+    alpn_protocols: Option<Vec<u8>>,
     session_cache: Arc<dyn SessionCache>,
     session_settings: SessionSettings,
 }
 
 impl Config {
-    /// Creates a new [Config] using a default [SslContextBuilder].
+    /// Creates a new [Config] that verifies the server against the default trust store and
+    /// offers "h3".
     pub fn new() -> Result<Self> {
         let mut builder = SslContextBuilder::new(SslMethod::tls())?;
         builder.set_default_verify_paths()?;
+        builder.set_verify(SslVerifyMode::PEER);
+        // QUIC requires ALPN (https://www.rfc-editor.org/rfc/rfc9001#section-8.1).
+        builder.set_alpn_protos(&AlpnProtocols::default().encode())?;
+        builder.set_info_callback(trace_info);
         Self::from_builder(builder)
     }
 
     /// Creates a new [Config] from a caller-provided [SslContextBuilder].
     ///
-    /// The builder is the right place to configure settings that are only available on
-    /// [SslContextBuilder] and not on the finished [SslContext], such as:
+    /// The builder is the place for every TLS setting, including those that only exist on
+    /// [SslContextBuilder], such as:
     /// - [`SslContextBuilder::set_grease_enabled`]
     /// - [`SslContextBuilder::set_sigalgs_list`]
     /// - [`SslContextBuilder::set_extension_permutation`]
     /// - [`SslContextBuilder::add_certificate_compression_algorithm`]
     ///
-    /// Quinn-btls will apply its required QUIC callbacks and defaults on top of whatever
-    /// the caller has already configured.
+    /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
+    /// callbacks and the session cache callback, replacing any on the builder. The ALPN
+    /// protocols, which QUIC requires, and the verification settings and other callbacks of the
+    /// builder are kept, except that the server is verified if the builder verifies nothing.
     pub fn from_builder(mut builder: SslContextBuilder) -> Result<Self> {
-        // QUIC requires TLS 1.3. Enforce this regardless of what the caller configured.
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-
-        let mut ctx = builder.build();
-
-        // By default, enable early data (used for 0-RTT).
-        ctx.enable_early_data(true);
-
-        // Set the default ALPN protocols offered by the client. QUIC requires ALPN be configured
-        // (see <https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
-        ctx.set_alpn_protos(&AlpnProtocols::default().encode())?;
-
-        // Configure session caching.
-        ctx.set_session_cache_mode(bffi::SSL_SESS_CACHE_CLIENT | bffi::SSL_SESS_CACHE_NO_INTERNAL);
-        ctx.set_new_session_callback(Some(Session::new_session_callback));
-
-        // Set callbacks for the SessionState.
-        ctx.set_quic_method(&QUIC_METHOD)?;
-        ctx.set_info_callback(Some(SessionState::info_callback));
-
-        // For clients, verification of the server is on by default.
-        ctx.verify_peer(true);
+        if builder.verify_mode() == SslVerifyMode::NONE {
+            builder.set_verify(SslVerifyMode::PEER);
+        }
+        builder
+            .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
+        builder.set_new_session_callback(Session::on_new_session);
+        builder.set_quic_method(QuicCallbacks)?;
+        builder.set_early_data_enabled(true);
 
         Ok(Self {
-            ctx,
+            ctx: builder.build(),
+            alpn_protocols: None,
             session_cache: Arc::new(SimpleCache::new(256)),
             session_settings: SessionSettings::default(),
         })
@@ -97,16 +95,6 @@ impl Config {
     /// Returns the underlying [SslContext] backing all created sessions.
     pub fn ctx(&self) -> &SslContext {
         &self.ctx
-    }
-
-    /// Returns the underlying [SslContext] backing all created sessions. Wherever possible use
-    /// the provided methods to modify settings rather than accessing this directly.
-    ///
-    /// Care should be taken to avoid overriding required behavior. In particular, this
-    /// configuration will set callbacks for QUIC events, alpn selection, server name,
-    /// as well as info and key logging.
-    pub fn ctx_mut(&mut self) -> &mut SslContext {
-        &mut self.ctx
     }
 
     /// Returns the [SessionSettings] applied to each new TLS session.
@@ -119,13 +107,6 @@ impl Config {
         &mut self.session_settings
     }
 
-    /// Sets whether or not the peer certificate should be verified. If `true`, any error
-    /// during verification will be fatal. If not called, verification of the server is
-    /// enabled by default.
-    pub fn verify_peer(&mut self, verify: bool) {
-        self.ctx.verify_peer(verify)
-    }
-
     /// Gets the [SessionCache] used to cache all client sessions.
     pub fn get_session_cache(&self) -> Arc<dyn SessionCache> {
         self.session_cache.clone()
@@ -136,12 +117,10 @@ impl Config {
         self.session_cache = session_cache;
     }
 
-    /// Sets the ALPN protocols supported by the client. QUIC requires that
-    /// ALPN be used (see <https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
-    /// By default, the client will offer "h3".
+    /// Sets the ALPN protocols the client offers, in place of those of the [SslContextBuilder].
+    /// QUIC requires ALPN (<https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
     pub fn set_alpn(&mut self, alpn_protocols: &[Vec<u8>]) -> Result<()> {
-        self.ctx
-            .set_alpn_protos(&AlpnProtocols::from(alpn_protocols).encode())?;
+        self.alpn_protocols = Some(AlpnProtocols::from(alpn_protocols).encode());
         Ok(())
     }
 }
@@ -187,7 +166,7 @@ impl Session {
         ssl.set_connect_state();
 
         // Configure verification for the server hostname.
-        ssl.set_verify_hostname(server_name)
+        set_verify_hostname(&mut ssl, server_name)
             .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
 
         // Set the SNI hostname.
@@ -198,6 +177,11 @@ impl Session {
         // Set the transport parameters.
         ssl.set_quic_transport_params(&encode_params(params))
             .map_err(|_| ConnectError::EndpointStopping)?;
+
+        if let Some(alpn_protocols) = &cfg.alpn_protocols {
+            ssl.set_alpn_protos(alpn_protocols)
+                .map_err(|_| ConnectError::EndpointStopping)?;
+        }
 
         // Apply per-session settings.
         let settings = &cfg.session_settings;
@@ -220,9 +204,13 @@ impl Session {
         // If we have a cached session, use it.
         let mut zero_rtt_peer_params = None;
         if let Some(entry) = tickets.cache.get(tickets.server_name.clone()) {
-            match Entry::decode(ssl.ssl_context(), entry) {
+            match Entry::decode(entry) {
                 Ok(entry) => {
                     zero_rtt_peer_params = Some(entry.params);
+                    // SAFETY: The handshake has not started, and the session was cached for
+                    // this server name through the session cache of this configuration, whose
+                    // verification it passed. A cache shared with a configuration that verifies
+                    // differently must not be used.
                     match unsafe { ssl.set_session(entry.session.as_ref()) } {
                         Ok(()) => {
                             trace!("attempting resumption (0-RTT) for server: {}.", server_name);
@@ -270,7 +258,7 @@ impl Session {
     fn on_zero_rtt_rejected(&mut self) -> StdResult<(), TransportError> {
         trace!(
             "0-RTT handshake attempted but was rejected by the server: {}",
-            SslRef::early_data_reason_string(self.state.ssl.get_early_data_reason())
+            self.state.ssl.early_data_reason()
         );
 
         self.zero_rtt_peer_params = None;
@@ -282,21 +270,11 @@ impl Session {
         self.state.advance_handshake()
     }
 
-    /// Raw callback from BoringSSL to cache a new session.
-    extern "C" fn new_session_callback(
-        ssl: *mut bffi::SSL,
-        session: *mut bffi::SSL_SESSION,
-    ) -> c_int {
-        // SAFETY: BoringSSL passes the callback the `SSL` it runs for, and a session whose
-        // reference it hands over.
-        let ssl = unsafe { SslRef::from_ptr(ssl) };
-        let session = unsafe { SslSession::from_ptr(session) };
+    /// Caches a new session, for [`SslContextBuilder::set_new_session_callback`].
+    fn on_new_session(ssl: &mut SslRef, session: SslSession) {
         if let Some(tickets) = (*TICKET_CACHE_INDEX).and_then(|index| ssl.ex_data(index)) {
             tickets.put(ssl, session);
         }
-
-        // Return 1 to indicate we've taken ownership of the session.
-        1
     }
 }
 
@@ -394,7 +372,7 @@ impl TicketCache {
         }
 
         // Get the server transport parameters.
-        let params = match ssl.get_peer_quic_transport_params() {
+        let params = match ssl.peer_quic_transport_params() {
             Some(params) => {
                 match TransportParameters::read(Side::Client, &mut Cursor::new(&params)) {
                     Ok(params) => params,
@@ -422,6 +400,16 @@ impl TicketCache {
 
     fn remove(&self) {
         self.cache.remove(self.server_name.clone());
+    }
+}
+
+/// Verifies the server certificate for `server_name`, an IP address or a host name.
+fn set_verify_hostname(ssl: &mut SslRef, server_name: &str) -> StdResult<(), ErrorStack> {
+    let param = ssl.param_mut();
+    param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+    match server_name.parse() {
+        Ok(ip) => param.set_ip(ip),
+        Err(_) => param.set_host(server_name),
     }
 }
 
