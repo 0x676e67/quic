@@ -7,7 +7,6 @@ use lru::LruCache;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 /// A client-side session cache for the btls crypto provider, keyed by server name.
@@ -61,18 +60,6 @@ impl Entry {
             Error::invalid_input(format!("failed parsing cached transport parameters: {e:?}"))
         })?;
         Ok(Self { session, params })
-    }
-
-    /// Returns whether the session outlived its lifetime, after which the server rejects it.
-    pub(crate) fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |now| now.as_secs());
-        let expiry = self
-            .session
-            .time()
-            .saturating_add(self.session.timeout().into());
-        now >= expiry
     }
 }
 

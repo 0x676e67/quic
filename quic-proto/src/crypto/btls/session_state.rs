@@ -653,6 +653,16 @@ mod tests {
         assert_eq!(err.code, crate::TransportErrorCode::CRYPTO_BUFFER_EXCEEDED);
     }
 
+    /// A local failure has no alert, such as a client without the ALPN that QUIC requires.
+    #[test]
+    fn local_failure_is_internal_error() {
+        let mut state = session();
+        state.ssl.set_connect_state();
+        let err = state.advance_handshake().unwrap_err();
+        assert_eq!(err.code, alert_code(SslAlert::INTERNAL_ERROR));
+        assert!(err.reason.contains("NO_APPLICATION_PROTOCOL"), "{err}");
+    }
+
     /// Each secret is dropped once the keys of its level are derived.
     #[test]
     fn secrets_dropped_after_key_derivation() {

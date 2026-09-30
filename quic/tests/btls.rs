@@ -103,33 +103,7 @@ async fn early_data_rejected_after_transport_change() {
     // A lower stream limit, configured or only sent on the wire.
     let mut configured = TransportConfig::default();
     configured.max_concurrent_bidi_streams(10u32.into());
-    let mut sent = TransportConfig::default();
-    let mut entries: Vec<_> = [
-        TransportParameterId::OriginalDestinationConnectionId,
-        TransportParameterId::MaxIdleTimeout,
-        TransportParameterId::StatelessResetToken,
-        TransportParameterId::MaxUdpPayloadSize,
-        TransportParameterId::InitialMaxData,
-        TransportParameterId::InitialMaxStreamDataBidiLocal,
-        TransportParameterId::InitialMaxStreamDataBidiRemote,
-        TransportParameterId::InitialMaxStreamDataUni,
-        TransportParameterId::InitialMaxStreamsUni,
-        TransportParameterId::AckDelayExponent,
-        TransportParameterId::MaxAckDelay,
-        TransportParameterId::DisableActiveMigration,
-        TransportParameterId::ActiveConnectionIdLimit,
-        TransportParameterId::InitialSourceConnectionId,
-        TransportParameterId::RetrySourceConnectionId,
-        TransportParameterId::MaxDatagramFrameSize,
-        TransportParameterId::GreaseQuicBit,
-    ]
-    .map(TransportParameterKind::Known)
-    .into();
-    entries.push(TransportParameterKind::Custom {
-        id: TransportParameterId::InitialMaxStreamsBidi as u64,
-        value: vec![10],
-    });
-    sent.transport_parameter_config(TransportParameterConfig::new(entries, true));
+    let sent = sending_max_streams_bidi(vec![10]);
 
     for limited in [configured, sent] {
         let pki = Pki::new();
@@ -167,6 +141,29 @@ async fn early_data_rejected_after_transport_change() {
 
         client.wait_idle().await;
     }
+}
+
+/// A malformed transport parameter fails the connection with TRANSPORT_PARAMETER_ERROR
+/// (https://www.rfc-editor.org/rfc/rfc9000#section-7.4).
+#[tokio::test]
+async fn malformed_transport_parameter() {
+    let pki = Pki::new();
+    let crypto = server_crypto(&pki, &pki.issue("localhost"), false);
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    // The prefix of a two-byte integer, without its second byte.
+    config.transport_config(Arc::new(sending_max_streams_bidi(vec![0x40])));
+    let server = serve(Endpoint::server(config, localhost()).unwrap());
+    let client = client_endpoint(&pki, None);
+
+    let err = client
+        .connect(server, "localhost")
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConnectionError::TransportError(e) if e.code == TransportErrorCode::TRANSPORT_PARAMETER_ERROR),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -231,6 +228,38 @@ async fn async_verification_fails_handshake() {
         matches!(&err, ConnectionError::TransportError(e) if e.code == TransportErrorCode::crypto(INTERNAL_ERROR)),
         "{err:?}"
     );
+}
+
+/// A transport configuration that sends `value` as the raw initial_max_streams_bidi parameter.
+fn sending_max_streams_bidi(value: Vec<u8>) -> TransportConfig {
+    let mut entries: Vec<_> = [
+        TransportParameterId::OriginalDestinationConnectionId,
+        TransportParameterId::MaxIdleTimeout,
+        TransportParameterId::StatelessResetToken,
+        TransportParameterId::MaxUdpPayloadSize,
+        TransportParameterId::InitialMaxData,
+        TransportParameterId::InitialMaxStreamDataBidiLocal,
+        TransportParameterId::InitialMaxStreamDataBidiRemote,
+        TransportParameterId::InitialMaxStreamDataUni,
+        TransportParameterId::InitialMaxStreamsUni,
+        TransportParameterId::AckDelayExponent,
+        TransportParameterId::MaxAckDelay,
+        TransportParameterId::DisableActiveMigration,
+        TransportParameterId::ActiveConnectionIdLimit,
+        TransportParameterId::InitialSourceConnectionId,
+        TransportParameterId::RetrySourceConnectionId,
+        TransportParameterId::MaxDatagramFrameSize,
+        TransportParameterId::GreaseQuicBit,
+    ]
+    .map(TransportParameterKind::Known)
+    .into();
+    entries.push(TransportParameterKind::Custom {
+        id: TransportParameterId::InitialMaxStreamsBidi as u64,
+        value,
+    });
+    let mut config = TransportConfig::default();
+    config.transport_parameter_config(TransportParameterConfig::new(entries, true));
+    config
 }
 
 /// The TLS alert for a local failure (https://www.rfc-editor.org/rfc/rfc8446#section-6.2).

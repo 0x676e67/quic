@@ -202,13 +202,11 @@ impl Session {
             server_name: Bytes::copy_from_slice(server_name.as_bytes()),
         };
 
-        // Resume a cached session. Taking it out of the cache keeps it to this connection.
+        // Resume a cached session. Taking it out of the cache keeps it to this connection, and
+        // BoringSSL does not offer it once expired.
         let mut zero_rtt_peer_params = None;
         if let Some(entry) = tickets.cache.take(&tickets.server_name) {
             match Entry::decode(&entry) {
-                Ok(entry) if entry.is_expired() => {
-                    trace!("cached session expired for server: {}", server_name);
-                }
                 Ok(entry) => {
                     zero_rtt_peer_params = Some(entry.params);
                     // SAFETY: The handshake has not started, and the session was cached for
