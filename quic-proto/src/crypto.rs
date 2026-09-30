@@ -47,6 +47,9 @@ pub trait Session: Send + Sync + 'static {
     ///
     /// Returns `None` if the key material is not available. This might happen if you have
     /// not connected to this server before.
+    ///
+    /// An implementation may hand the keys out only once and drop the secret with them, so
+    /// keep the keys of a successful call instead of calling again for them.
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)>;
 
     /// If the 0-RTT-encrypted data has been accepted by the peer
