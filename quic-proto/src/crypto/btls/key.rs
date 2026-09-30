@@ -1,15 +1,17 @@
 use crate::crypto;
-use crate::crypto::btls::error::{Result, map_result, map_result_zero_is_success};
+use crate::crypto::btls::error::{Result, map_result_zero_is_success};
 use crate::crypto::btls::macros::bounded_array;
 use crate::crypto::btls::secret::Secret;
 use crate::crypto::btls::suite::{CipherSuite, ID};
 use crate::crypto::btls::{Error, QuicVersion};
+use btls::aead::AeadCtx;
 use btls_sys as bffi;
 use bytes::BytesMut;
 use std::ffi::c_uint;
 use std::fmt::{Debug, Formatter};
 use std::mem::{MaybeUninit, size_of};
 use std::result::Result as StdResult;
+use zeroize::Zeroize;
 
 const SAMPLE_LEN: usize = 16; // 128-bits.
 
@@ -34,7 +36,7 @@ bounded_array! {
 }
 
 /// A pair of keys for bidirectional communication
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct KeyPair<T> {
     /// The key for this side, used for encrypting data.
     pub(crate) local: T,
@@ -55,16 +57,16 @@ impl KeyPair<HeaderKey> {
 
 impl KeyPair<PacketKey> {
     #[inline]
-    pub(crate) fn as_crypto(&self) -> Result<crypto::KeyPair<Box<dyn crypto::PacketKey>>> {
-        Ok(crypto::KeyPair {
+    pub(crate) fn into_crypto(self) -> crypto::KeyPair<Box<dyn crypto::PacketKey>> {
+        crypto::KeyPair {
             local: Box::new(self.local),
             remote: Box::new(self.remote),
-        })
+        }
     }
 }
 
 /// A complete set of keys for a certain encryption level.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Keys {
     /// Header protection keys
     pub(crate) header: KeyPair<HeaderKey>,
@@ -73,16 +75,16 @@ pub(crate) struct Keys {
 }
 
 impl Keys {
-    pub(crate) fn as_crypto(&self) -> Result<crypto::Keys> {
+    pub(crate) fn into_crypto(self) -> Result<crypto::Keys> {
         Ok(crypto::Keys {
             header: self.header.as_crypto()?,
-            packet: self.packet.as_crypto()?,
+            packet: self.packet.into_crypto(),
         })
     }
 }
 
 /// Internal header key representation. Supports conversion to [crypto::HeaderKey]
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct HeaderKey {
     suite: &'static CipherSuite,
     key: Key,
@@ -228,6 +230,13 @@ impl AesHeaderKey {
     }
 }
 
+impl Drop for AesHeaderKey {
+    fn drop(&mut self) {
+        self.0.rd_key.zeroize();
+        self.0.rounds.zeroize();
+    }
+}
+
 impl CryptoHeaderKey for AesHeaderKey {
     #[inline]
     fn new_mask(&self, sample: &[u8]) -> Result<[u8; 5]> {
@@ -273,7 +282,7 @@ impl ChaChaHeaderKey {
     const ZEROS: [u8; 5] = [0; 5];
 
     fn new(key: &Key) -> Result<Self> {
-        Ok(Self(*key))
+        Ok(Self(key.clone()))
     }
 }
 
@@ -327,7 +336,7 @@ impl crypto::HeaderKey for ChaChaHeaderKey {
 }
 
 /// Internal key representation.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct PacketKey {
     aead_key: AeadKey,
     iv: Nonce,
@@ -350,14 +359,9 @@ impl PacketKey {
             .hkdf
             .expand_label(secret.slice(), version.iv_label(), iv.slice_mut())?;
 
-        let aead_key = AeadKey::new(suite, key)?;
+        let aead_key = AeadKey::new(suite, &key)?;
 
         Ok(Self { aead_key, iv })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn key(&self) -> &Key {
-        &self.aead_key.key
     }
 
     #[cfg(test)]
@@ -421,36 +425,31 @@ impl crypto::PacketKey for PacketKey {
     }
 }
 
-/// A [crypto::PacketKey] that is based on a BoringSSL [bffi::EVP_AEAD_CTX].
-#[derive(Copy, Clone)]
+/// An AEAD key whose [AeadCtx] owns the key material.
 pub(crate) struct AeadKey {
     suite: &'static CipherSuite,
-    key: Key,
-    ctx: bffi::EVP_AEAD_CTX,
+    // `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` may run concurrently on one context
+    // (https://github.com/google/boringssl/blob/master/include/openssl/aead.h).
+    ctx: AeadCtx,
 }
 
 impl Debug for AeadKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AeadKey")
             .field("suite", self.suite)
-            .field("key", &self.key)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-unsafe impl Send for AeadKey {}
-
-// EVP_AEAD_CTX_seal & EVP_AEAD_CTX_open allowed to be called concurrently on the same instance of EVP_AEAD_CTX
-// https://github.com/google/boringssl/blob/master/include/openssl/aead.h#L278
-unsafe impl Sync for AeadKey {}
-
 impl AeadKey {
     #[inline]
-    pub(crate) fn new(suite: &'static CipherSuite, key: Key) -> Result<Self> {
-        let ctx = suite.aead.new_aead_ctx(&key)?;
-        Ok(Self { suite, key, ctx })
+    pub(crate) fn new(suite: &'static CipherSuite, key: &Key) -> Result<Self> {
+        let ctx = suite.aead.new_ctx(key)?;
+        Ok(Self { suite, ctx })
     }
 
+    /// Encrypts `data` in place. Its last [tag length](crate::crypto::btls::aead::Aead) bytes
+    /// receive the tag.
     #[inline]
     pub(crate) fn seal_in_place(
         &self,
@@ -458,24 +457,24 @@ impl AeadKey {
         data: &mut [u8],
         additional_data: &[u8],
     ) -> Result<()> {
-        let mut out_len = data.len() - self.suite.aead.tag_len;
-        unsafe {
-            map_result(bffi::EVP_AEAD_CTX_seal(
-                &self.ctx,
-                data.as_mut_ptr(),
-                &mut out_len,
-                data.len(),
-                nonce.as_ptr(),
-                nonce.len(),
-                data.as_ptr(),
-                out_len,
-                additional_data.as_ptr(),
-                additional_data.len(),
-            ))?;
+        let Some(tag_start) = data.len().checked_sub(self.suite.aead.tag_len) else {
+            return Err(Error::invalid_input(format!(
+                "buffer too short for the tag: {}",
+                data.len()
+            )));
+        };
+        let (payload, tag) = data.split_at_mut(tag_start);
+        let tag_len = self
+            .ctx
+            .seal_in_place(nonce.slice(), payload, tag, additional_data)?
+            .len();
+        if tag_len != self.suite.aead.tag_len {
+            return Err(Error::other(format!("unexpected tag length: {tag_len}")));
         }
         Ok(())
     }
 
+    /// Decrypts `data`, which ends with the tag, in place and returns the plaintext length.
     #[inline]
     pub(crate) fn open_in_place(
         &self,
@@ -483,25 +482,14 @@ impl AeadKey {
         data: &mut [u8],
         additional_data: &[u8],
     ) -> StdResult<usize, crypto::CryptoError> {
-        let Some(mut out_len) = data.len().checked_sub(self.suite.aead.tag_len) else {
-            return Err(crypto::CryptoError {});
+        let Some(tag_start) = data.len().checked_sub(self.suite.aead.tag_len) else {
+            return Err(crypto::CryptoError);
         };
-
-        unsafe {
-            map_result(bffi::EVP_AEAD_CTX_open(
-                &self.ctx,
-                data.as_mut_ptr(),
-                &mut out_len,
-                out_len,
-                nonce.as_ptr(),
-                nonce.len(),
-                data.as_ptr(),
-                data.len(),
-                additional_data.as_ptr(),
-                additional_data.len(),
-            ))?;
-        }
-        Ok(out_len)
+        let (payload, tag) = data.split_at_mut(tag_start);
+        self.ctx
+            .open_in_place(nonce.slice(), payload, tag, additional_data)
+            .map_err(|_| crypto::CryptoError)?;
+        Ok(tag_start)
     }
 }
 
@@ -543,11 +531,8 @@ mod tests {
             "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"
         ));
 
+        // The packet key itself stays inside BoringSSL; the ciphertext below depends on it.
         let packet_key = secret.packet_key(QuicVersion::V1, suite).unwrap();
-        assert_eq!(
-            packet_key.key().slice(),
-            hex!("c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8")
-        );
         assert_eq!(packet_key.iv().slice(), hex!("e0459b3474bdd0e44a41c144"));
         let header_key = secret.header_key(QuicVersion::V1, suite).unwrap();
         assert_eq!(
@@ -564,5 +549,23 @@ mod tests {
 
         header_key.decrypt(1, &mut packet);
         assert_eq!(packet[..4], hex!("4200bff4"));
+    }
+
+    #[test]
+    fn debug_omits_key_material() {
+        let suite = CipherSuite::aes128_gcm_sha256();
+        let secret = Secret::from(&[0xab; 32]);
+        let header_key = secret.header_key(QuicVersion::V1, suite).unwrap();
+        let packet_key = secret.packet_key(QuicVersion::V1, suite).unwrap();
+
+        assert_eq!(format!("{secret:?}"), "Secret { len: 32, .. }");
+        assert_eq!(
+            format!("{header_key:?}"),
+            "HeaderKey { suite: Aes128GcmSha256, key: Key { len: 16, .. } }"
+        );
+        assert_eq!(
+            format!("{packet_key:?}"),
+            "PacketKey { aead_key: AeadKey { suite: Aes128GcmSha256, .. }, iv: Nonce { len: 12, .. } }"
+        );
     }
 }

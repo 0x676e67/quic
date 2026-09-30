@@ -105,7 +105,7 @@ impl SessionState {
     pub(crate) fn next_1rtt_keys(&mut self) -> Option<crypto::KeyPair<Box<dyn crypto::PacketKey>>> {
         self.next_secrets
             .as_mut()
-            .map(|secrets| secrets.next_packet_keys().unwrap().as_crypto().unwrap())
+            .map(|secrets| secrets.next_packet_keys().unwrap().into_crypto())
     }
 
     #[inline]
@@ -163,12 +163,12 @@ impl SessionState {
 
         if next_write_level == Level::Application {
             // Keep the next application secrets for `next_1rtt_keys`.
-            let mut next_app_secrets = secrets;
+            let mut next_app_secrets = secrets.clone();
             next_app_secrets.update().unwrap();
             self.next_secrets = Some(next_app_secrets);
         }
 
-        Some(secrets.keys().unwrap().as_crypto().unwrap())
+        Some(secrets.keys().unwrap().into_crypto().unwrap())
     }
 
     #[inline]
@@ -209,8 +209,8 @@ impl SessionState {
         let version = builder.version;
         let suite = builder.suite?;
         let early_secret = match self.side {
-            Side::Client => builder.local_secret?,
-            Side::Server => builder.remote_secret?,
+            Side::Client => builder.local_secret.as_ref()?,
+            Side::Server => builder.remote_secret.as_ref()?,
         };
         let header_key = early_secret
             .header_key(version, suite)
@@ -225,7 +225,7 @@ impl SessionState {
     #[inline]
     pub(crate) fn initial_keys(&self, dcid: &ConnectionId, side: Side) -> crypto::Keys {
         let secrets = Secrets::initial(self.version, dcid, side).unwrap();
-        secrets.keys().unwrap().as_crypto().unwrap()
+        secrets.keys().unwrap().into_crypto().unwrap()
     }
 
     #[inline]

@@ -15,9 +15,9 @@ impl HandshakeTokenKey {
 
     fn new_for(secret: Secret) -> Result<Self> {
         // Extract the key.
-        let mut key = [0u8; Key::MAX_LEN];
-        let len = Hkdf::sha256().extract(&[], secret.slice(), &mut key)?;
-        Ok(Self(Key::new(key, len)))
+        let mut key = Key::with_len(Key::MAX_LEN);
+        let len = Hkdf::sha256().extract(&[], secret.slice(), key.slice_mut())?;
+        Ok(Self(Key::from(&key.slice()[..len])))
     }
 }
 
@@ -30,7 +30,7 @@ impl crypto::HandshakeTokenKey for HandshakeTokenKey {
             .expand(prk, random_bytes, key.slice_mut())
             .unwrap();
 
-        Box::new(AeadKey::new(suite, key).unwrap())
+        Box::new(AeadKey::new(suite, &key).unwrap())
     }
 }
 

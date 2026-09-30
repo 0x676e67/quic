@@ -106,7 +106,7 @@ impl crypto::ServerConfig for Config {
     ) -> StdResult<crypto::Keys, crypto::UnsupportedVersion> {
         let version = QuicVersion::parse(version)?;
         let secrets = Secrets::initial(version, &dst_cid, Side::Server).unwrap();
-        Ok(secrets.keys().unwrap().as_crypto().unwrap())
+        Ok(secrets.keys().unwrap().into_crypto().unwrap())
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16] {

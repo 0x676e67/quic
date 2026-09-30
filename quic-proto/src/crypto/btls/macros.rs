@@ -5,7 +5,9 @@ macro_rules! bounded_array {
     ),*} => {
     $(
         $(#[$struct_docs])*
-        #[derive(Copy, Clone, Eq, PartialEq)]
+        ///
+        /// The contents are zeroed on drop and left out of [`Debug`](std::fmt::Debug).
+        #[derive(Clone, Eq, PartialEq)]
         $vis struct $struct_name {
             buf: [u8; Self::MAX_LEN],
             len: u8,
@@ -110,9 +112,17 @@ macro_rules! bounded_array {
             }
         }
 
+        impl Drop for $struct_name {
+            fn drop(&mut self) {
+                zeroize::Zeroize::zeroize(&mut self.buf);
+            }
+        }
+
         impl std::fmt::Debug for $struct_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{:02x?}", self.slice())
+                f.debug_struct(stringify!($struct_name))
+                    .field("len", &self.len)
+                    .finish_non_exhaustive()
             }
         }
     )*

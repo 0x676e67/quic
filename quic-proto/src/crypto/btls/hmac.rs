@@ -6,25 +6,26 @@ use btls_sys as bffi;
 use rand::Rng;
 use std::ffi::{c_uint, c_void};
 use std::result::Result as StdResult;
+use zeroize::Zeroizing;
 
 const SIGNATURE_LEN_SHA_256: usize = 32;
 
 /// Implementation of [crypto::HmacKey] using BoringSSL.
 pub struct HmacKey {
     alg: MessageDigest,
-    key: Vec<u8>,
+    key: Zeroizing<Vec<u8>>,
 }
 
 impl HmacKey {
     /// Creates a new randomized SHA-256 HMAC key.
     pub fn sha256() -> Self {
         // Create a random key.
-        let mut key = [0u8; DIGEST_BLOCK_LEN];
+        let mut key = Zeroizing::new(vec![0u8; DIGEST_BLOCK_LEN]);
         rand::rng().fill_bytes(&mut key);
 
         Self {
             alg: MessageDigest::sha256(),
-            key: Vec::from(key),
+            key,
         }
     }
 }

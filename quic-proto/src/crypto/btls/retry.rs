@@ -14,7 +14,7 @@ pub(crate) fn retry_tag(
     let suite = CipherSuite::aes128_gcm_sha256();
     let key = Key::from(version.retry_integrity_key());
     let nonce = Nonce::from(version.retry_integrity_nonce());
-    let key = AeadKey::new(suite, key).unwrap();
+    let key = AeadKey::new(suite, &key).unwrap();
 
     let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
     pseudo_packet.push(orig_dst_cid.len() as u8);
@@ -55,7 +55,7 @@ pub(crate) fn is_valid_retry(
     let suite = CipherSuite::aes128_gcm_sha256();
     let key = Key::from(version.retry_integrity_key());
     let nonce = Nonce::from(version.retry_integrity_nonce());
-    let key = AeadKey::new(suite, key).unwrap();
+    let key = AeadKey::new(suite, &key).unwrap();
 
     let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
     key.open_in_place(&nonce, tag, aad).is_ok()

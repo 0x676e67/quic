@@ -1,7 +1,6 @@
-use crate::crypto::btls::error::{Error, Result, map_result};
+use crate::crypto::btls::error::Result;
 use crate::crypto::btls::key::{Key, Nonce, Tag};
-use btls_sys as bffi;
-use std::mem::MaybeUninit;
+use btls::aead::{AeadCtx, Algorithm};
 use std::sync::LazyLock;
 
 const AES_128_GCM_KEY_LEN: usize = 16;
@@ -21,30 +20,9 @@ pub(crate) enum ID {
     Chacha20Poly1305,
 }
 
-/// Wrapper around a raw BoringSSL EVP_AEAD.
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct AeadPtr(*const bffi::EVP_AEAD);
-
-unsafe impl Send for AeadPtr {}
-unsafe impl Sync for AeadPtr {}
-
-impl AeadPtr {
-    fn aes128_gcm() -> Self {
-        unsafe { Self(bffi::EVP_aead_aes_128_gcm()) }
-    }
-
-    fn aes256_gcm() -> Self {
-        unsafe { Self(bffi::EVP_aead_aes_256_gcm()) }
-    }
-
-    fn chacha20_poly1305() -> Self {
-        unsafe { Self(bffi::EVP_aead_chacha20_poly1305()) }
-    }
-}
-
 /// Wrapper around an BoringSSL EVP_AEAD.
 pub(crate) struct Aead {
-    ptr: AeadPtr,
+    alg: Algorithm,
     pub(crate) id: ID,
     pub(crate) key_len: usize,
     pub(crate) tag_len: usize,
@@ -61,7 +39,7 @@ impl PartialEq for Aead {
 impl Eq for Aead {}
 
 static AES128_GCM: LazyLock<Aead> = LazyLock::new(|| Aead {
-    ptr: AeadPtr::aes128_gcm(),
+    alg: Algorithm::aes_128_gcm(),
     id: ID::Aes128Gcm,
     key_len: AES_128_GCM_KEY_LEN,
     tag_len: AES_GCM_TAG_LEN,
@@ -69,7 +47,7 @@ static AES128_GCM: LazyLock<Aead> = LazyLock::new(|| Aead {
 });
 
 static AES256_GCM: LazyLock<Aead> = LazyLock::new(|| Aead {
-    ptr: AeadPtr::aes256_gcm(),
+    alg: Algorithm::aes_256_gcm(),
     id: ID::Aes256Gcm,
     key_len: AES_256_GCM_KEY_LEN,
     tag_len: AES_GCM_TAG_LEN,
@@ -77,7 +55,7 @@ static AES256_GCM: LazyLock<Aead> = LazyLock::new(|| Aead {
 });
 
 static CHACHA20_POLY1305: LazyLock<Aead> = LazyLock::new(|| Aead {
-    ptr: AeadPtr::chacha20_poly1305(),
+    alg: Algorithm::chacha20_poly1305(),
     id: ID::Chacha20Poly1305,
     key_len: CHACHA20_POLY1305_KEY_LEN,
     tag_len: POLY1305_TAG_LEN,
@@ -118,35 +96,9 @@ impl Aead {
         Tag::with_len(self.tag_len)
     }
 
+    /// Creates a context that owns `key`. BoringSSL zeroes the context when it is freed.
     #[inline]
-    pub(crate) fn as_ptr(&self) -> *const bffi::EVP_AEAD {
-        self.ptr.0
-    }
-
-    #[inline]
-    pub(crate) fn new_aead_ctx(&self, key: &Key) -> Result<bffi::EVP_AEAD_CTX> {
-        if key.len() != self.key_len {
-            return Err(Error::invalid_input(format!(
-                "key length invalid for AEAD_CTX: {}",
-                key.len()
-            )));
-        }
-
-        let ctx = unsafe {
-            let mut ctx = MaybeUninit::uninit();
-
-            map_result(bffi::EVP_AEAD_CTX_init(
-                ctx.as_mut_ptr(),
-                self.as_ptr(),
-                key.as_ptr(),
-                key.len(),
-                self.tag_len,
-                std::ptr::null_mut(),
-            ))?;
-
-            ctx.assume_init()
-        };
-
-        Ok(ctx)
+    pub(crate) fn new_ctx(&self, key: &Key) -> Result<AeadCtx> {
+        Ok(AeadCtx::new(&self.alg, key.slice(), self.tag_len)?)
     }
 }

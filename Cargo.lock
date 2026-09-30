@@ -1999,6 +1999,7 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen-test",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]
