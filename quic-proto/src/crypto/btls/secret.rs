@@ -45,7 +45,7 @@ impl Secret {
 }
 
 /// A secret pair for reading (decryption) and writing (encryption).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Secrets {
     pub(crate) version: QuicVersion,
     pub(crate) suite: &'static CipherSuite,
@@ -144,11 +144,15 @@ impl Secrets {
     }
 }
 
+/// Collects the secrets BoringSSL installs for one encryption level, until they are taken to
+/// derive the keys of that level. It holds no key material after that.
 pub(crate) struct SecretsBuilder {
-    pub(crate) version: QuicVersion,
-    pub(crate) suite: Option<&'static CipherSuite>,
-    pub(crate) local_secret: Option<Secret>,
-    pub(crate) remote_secret: Option<Secret>,
+    version: QuicVersion,
+    suite: Option<&'static CipherSuite>,
+    local_secret: Option<Secret>,
+    remote_secret: Option<Secret>,
+    /// Whether the secrets were taken: nothing derives keys from one installed later.
+    taken: bool,
 }
 
 impl SecretsBuilder {
@@ -158,6 +162,7 @@ impl SecretsBuilder {
             suite: None,
             local_secret: None,
             remote_secret: None,
+            taken: false,
         }
     }
 
@@ -176,14 +181,19 @@ impl SecretsBuilder {
     // BoringSSL installs each secret at most once per level
     // (see `SSL_QUIC_METHOD` in `openssl/ssl.h`).
     pub(crate) fn set_remote_secret(&mut self, secret: Secret) -> Result<()> {
-        Self::set_secret(&mut self.remote_secret, secret)
+        Self::set_secret(self.taken, &mut self.remote_secret, secret)
     }
 
     pub(crate) fn set_local_secret(&mut self, secret: Secret) -> Result<()> {
-        Self::set_secret(&mut self.local_secret, secret)
+        Self::set_secret(self.taken, &mut self.local_secret, secret)
     }
 
-    fn set_secret(slot: &mut Option<Secret>, secret: Secret) -> Result<()> {
+    fn set_secret(taken: bool, slot: &mut Option<Secret>, secret: Secret) -> Result<()> {
+        if taken {
+            return Err(Error::other(
+                "secret installed after the keys were derived".into(),
+            ));
+        }
         if slot.is_some() {
             return Err(Error::other("secret installed twice".into()));
         }
@@ -191,12 +201,29 @@ impl SecretsBuilder {
         Ok(())
     }
 
-    pub(crate) fn build(&self) -> Option<Secrets> {
+    /// Takes the secrets once both are installed.
+    pub(crate) fn take(&mut self) -> Option<Secrets> {
+        let suite = self.suite?;
+        if self.local_secret.is_none() || self.remote_secret.is_none() {
+            return None;
+        }
+        self.taken = true;
         Some(Secrets {
             version: self.version,
-            suite: self.suite?,
-            local: self.local_secret.clone()?,
-            remote: self.remote_secret.clone()?,
+            suite,
+            local: self.local_secret.take()?,
+            remote: self.remote_secret.take()?,
         })
+    }
+
+    /// Takes the 0-RTT secret, which only the client writes with and only the server reads with.
+    pub(crate) fn take_early(&mut self, side: Side) -> Option<(&'static CipherSuite, Secret)> {
+        let suite = self.suite?;
+        let secret = match side {
+            Side::Client => self.local_secret.take()?,
+            Side::Server => self.remote_secret.take()?,
+        };
+        self.taken = true;
+        Some((suite, secret))
     }
 }
