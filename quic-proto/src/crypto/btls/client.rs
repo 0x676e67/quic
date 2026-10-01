@@ -1,7 +1,6 @@
-use crate::crypto::btls::alpn::AlpnProtocols;
 use crate::crypto::btls::error::Result;
 use crate::crypto::btls::session_cache::Entry;
-use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
+use crate::crypto::btls::session_state::{QuicCallbacks, SessionState};
 use crate::crypto::btls::version::QuicVersion;
 use crate::crypto::btls::{Error, SessionCache, SimpleCache};
 use crate::{
@@ -11,8 +10,8 @@ use crate::{
 use btls::error::ErrorStack;
 use btls::ex_data::Index;
 use btls::ssl::{
-    Ssl, SslContext, SslContextBuilder, SslMethod, SslRef, SslSession, SslSessionCacheMode,
-    SslVerifyMode, SslVersion,
+    Ssl, SslContext, SslContextBuilder, SslRef, SslSession, SslSessionCacheMode, SslVerifyMode,
+    SslVersion,
 };
 use btls::x509::verify::X509CheckFlags;
 use bytes::{Bytes, BytesMut};
@@ -43,8 +42,6 @@ pub struct SessionSettings {
 /// Configuration for a client-side QUIC. Wraps around a BoringSSL [SslContext].
 pub struct Config {
     ctx: SslContext,
-    /// Encoded ALPN protocols that replace the ones of `ctx` for each connection.
-    alpn_protocols: Option<Vec<u8>>,
     session_cache: Arc<dyn SessionCache>,
     session_settings: SessionSettings,
 }
@@ -53,22 +50,13 @@ impl Config {
     /// The servers whose sessions the default [SessionCache] keeps.
     const SESSION_CACHE_SERVERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
-    /// Creates a new [Config] that verifies the server against the default trust store and
-    /// offers "h3".
-    pub fn new() -> Result<Self> {
-        let mut builder = SslContextBuilder::new(SslMethod::tls())?;
-        builder.set_default_verify_paths()?;
-        builder.set_verify(SslVerifyMode::PEER);
-        // QUIC requires ALPN (https://www.rfc-editor.org/rfc/rfc9001#section-8.1).
-        builder.set_alpn_protos(&AlpnProtocols::default().encode())?;
-        builder.set_info_callback(trace_info);
-        Self::from_builder(builder)
-    }
-
     /// Creates a new [Config] from a caller-provided [SslContextBuilder].
     ///
     /// The builder is the place for every TLS setting, including those that only exist on
     /// [SslContextBuilder], such as:
+    /// - [`SslContextBuilder::set_alpn_protos`], which QUIC requires
+    ///   ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)): without ALPN
+    ///   protocols, every handshake fails with `NO_APPLICATION_PROTOCOL`
     /// - [`SslContextBuilder::set_grease_enabled`]
     /// - [`SslContextBuilder::set_sigalgs_list`]
     /// - [`SslContextBuilder::set_extension_permutation`]
@@ -76,9 +64,9 @@ impl Config {
     /// - [`SslContextBuilder::set_keylog_callback`]
     ///
     /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
-    /// callbacks and the session cache callback, replacing any on the builder. The ALPN
-    /// protocols, which QUIC requires, and the verification settings and other callbacks of the
-    /// builder are kept, except that the server is verified if the builder verifies nothing.
+    /// callbacks and the session cache callback, replacing any on the builder. The verification
+    /// settings and other callbacks of the builder are kept, except that the server is verified
+    /// if the builder verifies nothing.
     pub fn from_builder(mut builder: SslContextBuilder) -> Result<Self> {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -93,7 +81,6 @@ impl Config {
 
         Ok(Self {
             ctx: builder.build(),
-            alpn_protocols: None,
             session_cache: Arc::new(SimpleCache::new(Self::SESSION_CACHE_SERVERS)),
             session_settings: SessionSettings::default(),
         })
@@ -123,14 +110,6 @@ impl Config {
     pub fn set_session_cache(&mut self, session_cache: Arc<dyn SessionCache>) {
         self.session_cache = session_cache;
     }
-
-    /// Sets the ALPN protocols the client offers, in place of those of the [SslContextBuilder].
-    /// QUIC requires ALPN (<https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>), so the
-    /// list must not be empty, and each protocol takes 1 to 255 bytes.
-    pub fn set_alpn(&mut self, alpn_protocols: &[Vec<u8>]) -> Result<()> {
-        self.alpn_protocols = Some(AlpnProtocols::try_from(alpn_protocols)?.encode());
-        Ok(())
-    }
 }
 
 impl crypto::ClientConfig for Config {
@@ -141,7 +120,11 @@ impl crypto::ClientConfig for Config {
         params: &TransportParameters,
     ) -> StdResult<Box<dyn crypto::Session>, ConnectError> {
         let version = QuicVersion::parse(version)?;
-        Ok(Session::new(self, version, server_name, params)?)
+        // Most failures become `EndpointStopping`, such as a builder without the ALPN protocols
+        // that QUIC requires, so log why.
+        let session = Session::new(self, version, server_name, params)
+            .inspect_err(|e| warn!("failed starting a btls session for {server_name}: {e}"))?;
+        Ok(session)
     }
 }
 
@@ -181,9 +164,6 @@ impl Session {
         }
 
         ssl.set_quic_transport_params(&encode_params(params))?;
-        if let Some(alpn_protocols) = &cfg.alpn_protocols {
-            ssl.set_alpn_protos(alpn_protocols)?;
-        }
 
         // Apply per-session settings.
         let settings = &cfg.session_settings;
@@ -420,15 +400,14 @@ fn encode_params(params: &TransportParameters) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use btls::ssl::NameType;
+    use btls::ssl::{NameType, SslMethod};
     use crypto::ClientConfig as _;
 
     #[test]
     fn start_session() {
-        let mut config =
-            Config::from_builder(SslContextBuilder::new(SslMethod::tls()).unwrap()).unwrap();
-        config.set_alpn(&[b"h3".to_vec()]).unwrap();
-        let config = Arc::new(config);
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.set_alpn_protos(b"\x02h3").unwrap();
+        let config = Arc::new(Config::from_builder(builder).unwrap());
         let params = TransportParameters {
             initial_src_cid: Some(ConnectionId::new(&[1])),
             ..TransportParameters::default()

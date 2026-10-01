@@ -1,6 +1,5 @@
 mod aead;
 mod alert;
-mod alpn;
 mod client;
 mod error;
 mod handshake_token;
