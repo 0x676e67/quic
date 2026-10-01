@@ -8,8 +8,8 @@ use crate::{
 };
 use btls::ex_data::Index;
 use btls::ssl::{
-    ErrorCode, NameType, QuicEncryptionLevel, QuicMethod, QuicMethodError, Ssl, Ssl3AlertLevel,
-    SslAlert, SslCipherRef, SslInfoCallbackMode, SslInfoCallbackValue, SslRef,
+    ErrorCode, NameType, QuicEncryptionLevel, QuicMethod, QuicMethodError, Ssl, SslAlert,
+    SslCipherRef, SslRef,
 };
 use btls::x509::X509;
 use std::any::Any;
@@ -17,7 +17,7 @@ use std::io::Cursor;
 use std::mem;
 use std::result::Result as StdResult;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
-use tracing::{error, trace, warn};
+use tracing::trace;
 
 /// A QUIC encryption level, which indexes the per-level state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -530,28 +530,6 @@ impl QuicMethod for QuicCallbacks {
         alert: SslAlert,
     ) -> StdResult<(), QuicMethodError> {
         QuicState::callback(ssl, |quic| quic.on_send_alert(level.try_into()?, alert))
-    }
-}
-
-/// Traces the progress of a handshake, for [`SslContextBuilder::set_info_callback`].
-///
-/// [`SslContextBuilder::set_info_callback`]: btls::ssl::SslContextBuilder::set_info_callback
-pub(crate) fn trace_info(ssl: &SslRef, mode: SslInfoCallbackMode, value: SslInfoCallbackValue) {
-    let state = ssl.state_string_long();
-    match value {
-        SslInfoCallbackValue::Alert(alert) => {
-            let direction = if mode == SslInfoCallbackMode::READ_ALERT {
-                "READ"
-            } else {
-                "WRITE"
-            };
-            if alert.alert_level() == Ssl3AlertLevel::WARNING {
-                warn!("SSL:ALERT:{direction}:{state}");
-            } else {
-                error!("SSL:ALERT:{direction}:{state}");
-            }
-        }
-        SslInfoCallbackValue::Unit => trace!("SSL:{mode:?}:{state}"),
     }
 }
 

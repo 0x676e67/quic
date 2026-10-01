@@ -1,73 +1,50 @@
-use crate::crypto::btls::alpn::AlpnProtocols;
-use crate::crypto::btls::error::{Error, Result};
+use crate::crypto::btls::error::Result;
 use crate::crypto::btls::retry;
 use crate::crypto::btls::secret::Secrets;
-use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
+use crate::crypto::btls::session_state::{QuicCallbacks, SessionState};
 use crate::crypto::btls::version::QuicVersion;
 use crate::{
     ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
 };
-use btls::ex_data::Index;
-use btls::ssl::{
-    AlpnError, Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslRef, SslVersion,
-};
+use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslVersion};
 use bytes::{Bytes, BytesMut};
 use std::any::Any;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use tracing::warn;
 
 /// Configuration for a server-side QUIC. Wraps around a BoringSSL [SslContext].
 pub struct Config {
     ctx: SslContext,
-    alpn_protocols: AlpnProtocols,
 }
 
 impl Config {
-    /// Creates a new [Config] that prefers its own cipher order, acknowledges SNI and does not
-    /// ask for client certificates.
-    pub fn new() -> Result<Self> {
-        let mut builder = SslContextBuilder::new(SslMethod::tls())?;
-        builder.set_default_verify_paths()?;
-        builder.set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
-        builder.set_servername_callback(|_, _| Ok(()));
-        builder.set_info_callback(trace_info);
-        Self::from_builder(builder)
-    }
-
     /// Creates a new [Config] from a caller-provided [SslContextBuilder], which holds the
-    /// certificates, client verification and every other TLS setting.
+    /// certificates, client verification, the ALPN protocols and every other TLS setting.
+    ///
+    /// QUIC requires ALPN ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)),
+    /// so the builder needs either [`SslContextBuilder::set_alpn_protos`], with which BoringSSL
+    /// selects the first protocol the client offers that the list contains, or
+    /// [`SslContextBuilder::set_alpn_select_callback`], such as with
+    /// [`select_next_proto`](btls::ssl::select_next_proto) to prefer the server's order. Without
+    /// either, every handshake fails with `NO_APPLICATION_PROTOCOL`.
     ///
     /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
-    /// callbacks and the ALPN selection of [`Config::set_alpn`], replacing any on the builder.
-    /// Other callbacks of the builder are kept.
+    /// callbacks, replacing any on the builder. Other callbacks of the builder are kept.
     pub fn from_builder(mut builder: SslContextBuilder) -> Result<Self> {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-        builder.set_alpn_select_callback(Session::select_alpn);
         builder.set_quic_method(QuicCallbacks)?;
         builder.set_early_data_enabled(true);
 
         Ok(Self {
             ctx: builder.build(),
-            alpn_protocols: AlpnProtocols::default(),
         })
     }
 
     /// Returns the underlying [SslContext] backing all created sessions.
     pub fn ctx(&self) -> &SslContext {
         &self.ctx
-    }
-
-    /// Sets the ALPN protocols that will be accepted by the server. QUIC requires that
-    /// ALPN be used (see <https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
-    ///
-    /// The list must not be empty, and each protocol takes 1 to 255 bytes. If this method is
-    /// not called, the server will default to accepting "h3".
-    pub fn set_alpn(&mut self, alpn_protocols: &[Vec<u8>]) -> Result<()> {
-        self.alpn_protocols = alpn_protocols.try_into()?;
-        Ok(())
     }
 }
 
@@ -100,10 +77,6 @@ impl crypto::ServerConfig for Config {
     }
 }
 
-/// The ALPN protocols the server accepts, for the ALPN callback.
-static ALPN_INDEX: LazyLock<Option<Index<Ssl, AlpnProtocols>>> =
-    LazyLock::new(|| Ssl::new_ex_index().ok());
-
 /// The [crypto::Session] implementation for BoringSSL.
 struct Session {
     state: SessionState,
@@ -135,24 +108,10 @@ impl Session {
             Err(e) => warn!("0-RTT disabled: failed decoding own transport parameters: {e}"),
         }
 
-        let index = ALPN_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
-        ssl.set_ex_data(index, cfg.alpn_protocols.clone());
-
         Ok(Box::new(Self {
             state: SessionState::new(ssl, Side::Server, version)?,
             handshake_data_sent: false,
         }))
-    }
-}
-
-impl Session {
-    /// Selects the ALPN protocol from the ones the client offered, for
-    /// [`SslContextBuilder::set_alpn_select_callback`].
-    fn select_alpn<'a>(ssl: &mut SslRef, offered: &'a [u8]) -> StdResult<&'a [u8], AlpnError> {
-        let alpn = (*ALPN_INDEX)
-            .and_then(|index| ssl.ex_data(index))
-            .ok_or(AlpnError::ALERT_FATAL)?;
-        alpn.select(offered).map_err(|_| AlpnError::ALERT_FATAL)
     }
 }
 

@@ -15,7 +15,10 @@ use quic::{
     TransportConfig, TransportErrorCode,
     btls::{
         pkey::{PKey, Private},
-        ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode},
+        ssl::{
+            AlpnError, SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode,
+            select_next_proto,
+        },
         x509::X509,
     },
     crypto::btls::{
@@ -32,7 +35,7 @@ async fn handshake_resumption_and_early_data() {
     // A second server has its own ticket keys, so it cannot resume the first one's sessions.
     let other_server = serve(server_endpoint(&pki, &leaf, false));
     let cache = Arc::new(RemovalTracker::default());
-    let client = client_endpoint_with(&pki, None, cache.clone());
+    let client = client_endpoint_with(client_builder(&pki, None), cache.clone());
 
     // Full handshake: there is no session to resume yet.
     let connecting = client.connect(server, "localhost").unwrap();
@@ -189,6 +192,54 @@ async fn peer_identity_with_client_auth() {
     client.wait_idle().await;
 }
 
+/// Both sides take their ALPN protocols from the builder, and a server without any fails the
+/// handshake, since QUIC requires ALPN (https://www.rfc-editor.org/rfc/rfc9001#section-8.1).
+#[tokio::test]
+async fn alpn_from_builder() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    let mut builder = client_builder(&pki, None);
+    builder.set_alpn_protos(b"\x01a\x01b\x01c").unwrap();
+    let client = client_endpoint_with(builder, Arc::new(SimpleCache::new(NonZeroUsize::MIN)));
+    let server = |configure: &dyn Fn(&mut SslContextBuilder)| {
+        let mut builder = server_builder(&pki, &leaf, false);
+        configure(&mut builder);
+        let crypto = QuicServerConfig::from_builder(builder).unwrap();
+        let config = ServerConfig::with_crypto(Arc::new(crypto));
+        serve(Endpoint::server(config, localhost()).unwrap())
+    };
+
+    // BoringSSL selects by the client's preference from the protocols of the builder, and a
+    // selection callback can prefer the server's order instead. The client's first protocol is
+    // in neither list, so neither result can come from the client alone.
+    let by_list = server(&|builder| builder.set_alpn_protos(b"\x01c\x01b").unwrap());
+    let by_callback = server(&|builder| {
+        builder.set_alpn_select_callback(|_, offered| {
+            select_next_proto(b"\x01c\x01b", offered).ok_or(AlpnError::NOACK)
+        })
+    });
+    for (server, protocol) in [(by_list, b"b"), (by_callback, b"c")] {
+        let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+        let data = conn.handshake_data().unwrap();
+        let data = data.downcast::<HandshakeData>().unwrap();
+        assert_eq!(data.protocol.as_deref(), Some(&protocol[..]));
+        conn.close(0u32.into(), b"done");
+    }
+
+    let without_alpn = server(&|_| {});
+    let err = client
+        .connect(without_alpn, "localhost")
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConnectionError::ConnectionClosed(close) if close.error_code == TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL)),
+        "{err:?}"
+    );
+
+    client.wait_idle().await;
+}
+
 /// A server flight may exceed the 16 KiB a server itself accepts per level.
 #[tokio::test]
 async fn large_certificate_chain() {
@@ -264,6 +315,9 @@ fn sending_max_streams_bidi(value: Vec<u8>) -> TransportConfig {
 
 /// The TLS alert for a local failure (https://www.rfc-editor.org/rfc/rfc8446#section-6.2).
 const INTERNAL_ERROR: u8 = 80;
+
+/// The TLS alert for an ALPN mismatch (https://www.rfc-editor.org/rfc/rfc7301#section-3.2).
+const NO_APPLICATION_PROTOCOL: u8 = 120;
 
 /// Returns whether `code` carries a TLS alert
 /// (https://www.rfc-editor.org/rfc/rfc9001#section-4.8).
@@ -341,7 +395,15 @@ fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
     Endpoint::server(config, localhost()).unwrap()
 }
 
+/// A server that accepts "h3", which BoringSSL selects from the ALPN protocols of the builder.
 fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig {
+    let mut builder = server_builder(pki, leaf, client_auth);
+    builder.set_alpn_protos(b"\x02h3").unwrap();
+    QuicServerConfig::from_builder(builder).unwrap()
+}
+
+/// A server builder without ALPN protocols.
+fn server_builder(pki: &Pki, leaf: &Leaf, client_auth: bool) -> SslContextBuilder {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.set_certificate(&leaf.cert).unwrap();
     builder.add_extra_chain_cert(pki.ca.clone()).unwrap();
@@ -350,30 +412,30 @@ fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig 
         builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
         builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
     }
-    QuicServerConfig::from_builder(builder).unwrap()
+    builder
 }
 
-/// A client that trusts `pki`. Its builder leaves verification off, which `from_builder` turns
-/// on, and it offers "h3" through [`QuicClientConfig::set_alpn`].
 fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
     let cache = SimpleCache::new(NonZeroUsize::MIN);
-    client_endpoint_with(pki, identity, Arc::new(cache))
+    client_endpoint_with(client_builder(pki, identity), Arc::new(cache))
 }
 
-fn client_endpoint_with(
-    pki: &Pki,
-    identity: Option<&Leaf>,
-    cache: Arc<dyn SessionCache>,
-) -> Endpoint {
+/// A client builder that trusts `pki` and offers "h3". It leaves verification off, which
+/// `from_builder` turns on.
+fn client_builder(pki: &Pki, identity: Option<&Leaf>) -> SslContextBuilder {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
+    builder.set_alpn_protos(b"\x02h3").unwrap();
     if let Some(leaf) = identity {
         builder.set_certificate(&leaf.cert).unwrap();
         builder.add_extra_chain_cert(pki.ca.clone()).unwrap();
         builder.set_private_key(&leaf.key).unwrap();
     }
+    builder
+}
+
+fn client_endpoint_with(builder: SslContextBuilder, cache: Arc<dyn SessionCache>) -> Endpoint {
     let mut crypto = QuicClientConfig::from_builder(builder).unwrap();
-    crypto.set_alpn(&[b"h3".to_vec()]).unwrap();
     crypto.set_session_cache(cache);
     let endpoint = Endpoint::client(localhost()).unwrap();
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
