@@ -16,7 +16,7 @@ use quic::{
     btls::{
         pkey::{PKey, Private},
         ssl::{
-            AlpnError, SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode,
+            AlpnError, ExtensionType, SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode,
             select_next_proto,
         },
         x509::X509,
@@ -235,6 +235,50 @@ async fn alpn_from_builder() {
     assert!(
         matches!(&err, ConnectionError::ConnectionClosed(close) if close.error_code == TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL)),
         "{err:?}"
+    );
+
+    client.wait_idle().await;
+}
+
+/// Drafts up to 32 carry the transport parameters in the legacy extension 0xffa5, later ones in
+/// the extension 57 (https://datatracker.ietf.org/doc/html/draft-ietf-quic-tls-33#section-8.2).
+#[tokio::test]
+async fn transport_parameters_codepoint() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    // Whether each ClientHello carries the legacy and the standard extension.
+    let codepoints = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder = server_builder(&pki, &leaf, false);
+    builder.set_alpn_protos(b"\x02h3").unwrap();
+    let seen = codepoints.clone();
+    builder.set_select_certificate_callback(move |hello| {
+        let legacy = hello.get_extension(ExtensionType::QUIC_TRANSPORT_PARAMETERS_LEGACY);
+        let standard = hello.get_extension(ExtensionType::QUIC_TRANSPORT_PARAMETERS_STANDARD);
+        seen.lock()
+            .unwrap()
+            .push((legacy.is_some(), standard.is_some()));
+        Ok(())
+    });
+    let crypto = QuicServerConfig::try_from(builder).unwrap();
+    let config = ServerConfig::with_crypto(Arc::new(crypto));
+    let server = serve(Endpoint::server(config, localhost()).unwrap());
+
+    let crypto = Arc::new(QuicClientConfig::try_from(client_builder(&pki, None)).unwrap());
+    let client = Endpoint::client(localhost()).unwrap();
+    // draft-32, draft-33 and version 1.
+    for version in [0xff00_0020, 0xff00_0021, 1] {
+        let mut config = ClientConfig::new(crypto.clone());
+        config.version(version);
+        let conn = client
+            .connect_with(config, server, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        conn.close(0u32.into(), b"done");
+    }
+    assert_eq!(
+        *codepoints.lock().unwrap(),
+        [(true, false), (false, true), (false, true)]
     );
 
     client.wait_idle().await;

@@ -85,16 +85,13 @@ impl QuicVersion {
         }
     }
 
-    /// Indicates whether this version uses the legacy TLS extension codepoint.
+    /// Indicates whether this version uses the legacy TLS extension codepoint 0xffa5. From
+    /// draft-33 on, the transport parameters use the codepoint 57 that IANA registered
+    /// (<https://datatracker.ietf.org/doc/html/draft-ietf-quic-tls-33#section-8.2>).
     pub(crate) fn uses_legacy_extension(&self) -> bool {
         match self {
-            Self::V1Draft29
-            | Self::V1Draft30
-            | Self::V1Draft31
-            | Self::V1Draft32
-            | Self::V1Draft33
-            | Self::V1Draft34 => true,
-            Self::V1 => false,
+            Self::V1Draft29 | Self::V1Draft30 | Self::V1Draft31 | Self::V1Draft32 => true,
+            Self::V1Draft33 | Self::V1Draft34 | Self::V1 => false,
         }
     }
 
