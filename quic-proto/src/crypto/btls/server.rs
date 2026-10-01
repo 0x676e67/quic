@@ -1,4 +1,4 @@
-use crate::crypto::btls::error::Result;
+use crate::crypto::btls::error::{Error, Result};
 use crate::crypto::btls::retry;
 use crate::crypto::btls::secret::Secrets;
 use crate::crypto::btls::session_state::{QuicCallbacks, SessionState};
@@ -14,24 +14,34 @@ use std::sync::Arc;
 use tracing::warn;
 
 /// Configuration for a server-side QUIC. Wraps around a BoringSSL [SslContext].
+///
+/// It is created with [`TryFrom`] from an [SslContextBuilder], which holds the certificates,
+/// client verification, the ALPN protocols and every other TLS setting.
+///
+/// QUIC requires ALPN ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)), so
+/// the builder needs either [`SslContextBuilder::set_alpn_protos`], with which BoringSSL selects
+/// the first protocol the client offers that the list contains, or
+/// [`SslContextBuilder::set_alpn_select_callback`], such as with
+/// [`select_next_proto`](btls::ssl::select_next_proto) to prefer the server's order. Without
+/// either, every handshake fails with `NO_APPLICATION_PROTOCOL`.
+///
+/// The conversion restricts the context to TLS 1.3, enables early data, and installs the QUIC
+/// callbacks, replacing any on the builder. Other callbacks of the builder are kept.
 pub struct Config {
     ctx: SslContext,
 }
 
 impl Config {
-    /// Creates a new [Config] from a caller-provided [SslContextBuilder], which holds the
-    /// certificates, client verification, the ALPN protocols and every other TLS setting.
-    ///
-    /// QUIC requires ALPN ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)),
-    /// so the builder needs either [`SslContextBuilder::set_alpn_protos`], with which BoringSSL
-    /// selects the first protocol the client offers that the list contains, or
-    /// [`SslContextBuilder::set_alpn_select_callback`], such as with
-    /// [`select_next_proto`](btls::ssl::select_next_proto) to prefer the server's order. Without
-    /// either, every handshake fails with `NO_APPLICATION_PROTOCOL`.
-    ///
-    /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
-    /// callbacks, replacing any on the builder. Other callbacks of the builder are kept.
-    pub fn from_builder(mut builder: SslContextBuilder) -> Result<Self> {
+    /// Returns the underlying [SslContext] backing all created sessions.
+    pub fn ctx(&self) -> &SslContext {
+        &self.ctx
+    }
+}
+
+impl TryFrom<SslContextBuilder> for Config {
+    type Error = Error;
+
+    fn try_from(mut builder: SslContextBuilder) -> Result<Self> {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_quic_method(QuicCallbacks)?;
@@ -40,11 +50,6 @@ impl Config {
         Ok(Self {
             ctx: builder.build(),
         })
-    }
-
-    /// Returns the underlying [SslContext] backing all created sessions.
-    pub fn ctx(&self) -> &SslContext {
-        &self.ctx
     }
 }
 

@@ -204,7 +204,7 @@ async fn alpn_from_builder() {
     let server = |configure: &dyn Fn(&mut SslContextBuilder)| {
         let mut builder = server_builder(&pki, &leaf, false);
         configure(&mut builder);
-        let crypto = QuicServerConfig::from_builder(builder).unwrap();
+        let crypto = QuicServerConfig::try_from(builder).unwrap();
         let config = ServerConfig::with_crypto(Arc::new(crypto));
         serve(Endpoint::server(config, localhost()).unwrap())
     };
@@ -268,7 +268,7 @@ async fn async_verification_fails_handshake() {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.set_custom_verify_callback(SslVerifyMode::PEER, |_| Err(SslVerifyError::Retry));
     builder.set_alpn_protos(b"\x02h3").unwrap();
-    let crypto = QuicClientConfig::from_builder(builder).unwrap();
+    let crypto = QuicClientConfig::try_from(builder).unwrap();
     let client = Endpoint::client(localhost()).unwrap();
 
     let connecting = client
@@ -399,7 +399,7 @@ fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
 fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig {
     let mut builder = server_builder(pki, leaf, client_auth);
     builder.set_alpn_protos(b"\x02h3").unwrap();
-    QuicServerConfig::from_builder(builder).unwrap()
+    QuicServerConfig::try_from(builder).unwrap()
 }
 
 /// A server builder without ALPN protocols.
@@ -421,7 +421,7 @@ fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
 }
 
 /// A client builder that trusts `pki` and offers "h3". It leaves verification off, which
-/// `from_builder` turns on.
+/// the conversion to [`QuicClientConfig`] turns on.
 fn client_builder(pki: &Pki, identity: Option<&Leaf>) -> SslContextBuilder {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
@@ -435,7 +435,7 @@ fn client_builder(pki: &Pki, identity: Option<&Leaf>) -> SslContextBuilder {
 }
 
 fn client_endpoint_with(builder: SslContextBuilder, cache: Arc<dyn SessionCache>) -> Endpoint {
-    let mut crypto = QuicClientConfig::from_builder(builder).unwrap();
+    let mut crypto = QuicClientConfig::try_from(builder).unwrap();
     crypto.set_session_cache(cache);
     let endpoint = Endpoint::client(localhost()).unwrap();
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
