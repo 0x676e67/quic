@@ -199,7 +199,7 @@ async fn alpn_from_builder() {
     let pki = Pki::new();
     let leaf = pki.issue("localhost");
     let mut builder = client_builder(&pki, None);
-    builder.set_alpn_protos(b"\x02h3\x02hq").unwrap();
+    builder.set_alpn_protos(b"\x01a\x01b\x01c").unwrap();
     let client = client_endpoint_with(builder, Arc::new(SimpleCache::new(NonZeroUsize::MIN)));
     let server = |configure: &dyn Fn(&mut SslContextBuilder)| {
         let mut builder = server_builder(&pki, &leaf, false);
@@ -210,14 +210,15 @@ async fn alpn_from_builder() {
     };
 
     // BoringSSL selects by the client's preference from the protocols of the builder, and a
-    // selection callback can prefer the server's order instead.
-    let by_list = server(&|builder| builder.set_alpn_protos(b"\x02hq\x02h3").unwrap());
+    // selection callback can prefer the server's order instead. The client's first protocol is
+    // in neither list, so neither result can come from the client alone.
+    let by_list = server(&|builder| builder.set_alpn_protos(b"\x01c\x01b").unwrap());
     let by_callback = server(&|builder| {
         builder.set_alpn_select_callback(|_, offered| {
-            select_next_proto(b"\x02hq\x02h3", offered).ok_or(AlpnError::NOACK)
+            select_next_proto(b"\x01c\x01b", offered).ok_or(AlpnError::NOACK)
         })
     });
-    for (server, protocol) in [(by_list, b"h3"), (by_callback, b"hq")] {
+    for (server, protocol) in [(by_list, b"b"), (by_callback, b"c")] {
         let conn = client.connect(server, "localhost").unwrap().await.unwrap();
         let data = conn.handshake_data().unwrap();
         let data = data.downcast::<HandshakeData>().unwrap();
