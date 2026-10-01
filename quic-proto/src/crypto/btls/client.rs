@@ -56,7 +56,9 @@ impl Config {
     /// [SslContextBuilder], such as:
     /// - [`SslContextBuilder::set_alpn_protos`], which QUIC requires
     ///   ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)): without ALPN
-    ///   protocols, every handshake fails with `NO_APPLICATION_PROTOCOL`
+    ///   protocols, BoringSSL cannot build the ClientHello, so the connection fails to start
+    ///   with [`ConnectError::EndpointStopping`] and the reason is logged
+    /// - the trust anchors, such as [`SslContextBuilder::set_default_verify_paths`]
     /// - [`SslContextBuilder::set_grease_enabled`]
     /// - [`SslContextBuilder::set_sigalgs_list`]
     /// - [`SslContextBuilder::set_extension_permutation`]
@@ -120,10 +122,13 @@ impl crypto::ClientConfig for Config {
         params: &TransportParameters,
     ) -> StdResult<Box<dyn crypto::Session>, ConnectError> {
         let version = QuicVersion::parse(version)?;
-        // Most failures become `EndpointStopping`, such as a builder without the ALPN protocols
-        // that QUIC requires, so log why.
-        let session = Session::new(self, version, server_name, params)
-            .inspect_err(|e| warn!("failed starting a btls session for {server_name}: {e}"))?;
+        // Failures other than an invalid server name become `EndpointStopping`, such as a
+        // builder without the ALPN protocols that QUIC requires, so log why.
+        let session = Session::new(self, version, server_name, params).inspect_err(|e| {
+            if !matches!(e, Error::ConnectError(_)) {
+                warn!("failed starting a btls session for {server_name}: {e}");
+            }
+        })?;
         Ok(session)
     }
 }
@@ -430,5 +435,10 @@ mod tests {
         assert!(matches!(err, Err(ConnectError::UnsupportedVersion)));
         let err = config.start_session(1, "bad\0name", &params);
         assert!(matches!(err, Err(ConnectError::InvalidServerName(_))));
+
+        // Without ALPN protocols, BoringSSL cannot build the ClientHello.
+        let config = Config::from_builder(SslContextBuilder::new(SslMethod::tls()).unwrap());
+        let err = Arc::new(config.unwrap()).start_session(1, "localhost", &params);
+        assert!(matches!(err, Err(ConnectError::EndpointStopping)));
     }
 }

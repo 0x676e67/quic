@@ -394,7 +394,7 @@ fn server_endpoint(pki: &Pki, leaf: &Leaf, client_auth: bool) -> Endpoint {
     Endpoint::server(config, localhost()).unwrap()
 }
 
-/// A server that offers "h3", selected by BoringSSL from the ALPN protocols of the builder.
+/// A server that accepts "h3", which BoringSSL selects from the ALPN protocols of the builder.
 fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig {
     let mut builder = server_builder(pki, leaf, client_auth);
     builder.set_alpn_protos(b"\x02h3").unwrap();
