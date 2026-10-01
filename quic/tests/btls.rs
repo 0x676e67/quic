@@ -2,7 +2,11 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
@@ -14,7 +18,9 @@ use quic::{
         ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode},
         x509::X509,
     },
-    crypto::btls::{HandshakeData, QuicClientConfig, QuicServerConfig},
+    crypto::btls::{
+        HandshakeData, QuicClientConfig, QuicServerConfig, SessionCache, SimpleCache, Zeroizing,
+    },
 };
 
 #[tokio::test]
@@ -25,7 +31,8 @@ async fn handshake_resumption_and_early_data() {
     let server = serve(server_endpoint(&pki, &leaf, false));
     // A second server has its own ticket keys, so it cannot resume the first one's sessions.
     let other_server = serve(server_endpoint(&pki, &leaf, false));
-    let client = client_endpoint(&pki, None);
+    let cache = Arc::new(RemovalTracker::default());
+    let client = client_endpoint_with(&pki, None, cache.clone());
 
     // Full handshake: there is no session to resume yet.
     let connecting = client.connect(server, "localhost").unwrap();
@@ -68,6 +75,8 @@ async fn handshake_resumption_and_early_data() {
     let response = request(&conn, b"retry").await.unwrap();
     check_response(&conn, b"retry", &response, &[]);
     conn.close(0u32.into(), b"done");
+    // The rejected ticket was used up, and the others of the server stay for other connections.
+    assert!(!cache.removed.load(Ordering::Relaxed));
 
     // An untrusted server rejects the 0-RTT stream too. The client verifies the server
     // certificate only after it resumes the handshake in 1-RTT, and that failure must close
@@ -94,33 +103,7 @@ async fn early_data_rejected_after_transport_change() {
     // A lower stream limit, configured or only sent on the wire.
     let mut configured = TransportConfig::default();
     configured.max_concurrent_bidi_streams(10u32.into());
-    let mut sent = TransportConfig::default();
-    let mut entries: Vec<_> = [
-        TransportParameterId::OriginalDestinationConnectionId,
-        TransportParameterId::MaxIdleTimeout,
-        TransportParameterId::StatelessResetToken,
-        TransportParameterId::MaxUdpPayloadSize,
-        TransportParameterId::InitialMaxData,
-        TransportParameterId::InitialMaxStreamDataBidiLocal,
-        TransportParameterId::InitialMaxStreamDataBidiRemote,
-        TransportParameterId::InitialMaxStreamDataUni,
-        TransportParameterId::InitialMaxStreamsUni,
-        TransportParameterId::AckDelayExponent,
-        TransportParameterId::MaxAckDelay,
-        TransportParameterId::DisableActiveMigration,
-        TransportParameterId::ActiveConnectionIdLimit,
-        TransportParameterId::InitialSourceConnectionId,
-        TransportParameterId::RetrySourceConnectionId,
-        TransportParameterId::MaxDatagramFrameSize,
-        TransportParameterId::GreaseQuicBit,
-    ]
-    .map(TransportParameterKind::Known)
-    .into();
-    entries.push(TransportParameterKind::Custom {
-        id: TransportParameterId::InitialMaxStreamsBidi as u64,
-        value: vec![10],
-    });
-    sent.transport_parameter_config(TransportParameterConfig::new(entries, true));
+    let sent = sending_max_streams_bidi(vec![10]);
 
     for limited in [configured, sent] {
         let pki = Pki::new();
@@ -160,6 +143,29 @@ async fn early_data_rejected_after_transport_change() {
     }
 }
 
+/// A malformed transport parameter fails the connection with TRANSPORT_PARAMETER_ERROR
+/// (https://www.rfc-editor.org/rfc/rfc9000#section-7.4).
+#[tokio::test]
+async fn malformed_transport_parameter() {
+    let pki = Pki::new();
+    let crypto = server_crypto(&pki, &pki.issue("localhost"), false);
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    // The prefix of a two-byte integer, without its second byte.
+    config.transport_config(Arc::new(sending_max_streams_bidi(vec![0x40])));
+    let server = serve(Endpoint::server(config, localhost()).unwrap());
+    let client = client_endpoint(&pki, None);
+
+    let err = client
+        .connect(server, "localhost")
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConnectionError::TransportError(e) if e.code == TransportErrorCode::TRANSPORT_PARAMETER_ERROR),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn peer_identity_with_client_auth() {
     let pki = Pki::new();
@@ -178,6 +184,25 @@ async fn peer_identity_with_client_auth() {
         &response,
         &pki.chain(&client_leaf).concat(),
     );
+    conn.close(0u32.into(), b"done");
+
+    client.wait_idle().await;
+}
+
+/// A server flight may exceed the 16 KiB a server itself accepts per level.
+#[tokio::test]
+async fn large_certificate_chain() {
+    let pki = Pki::new();
+    let names = ["localhost".to_owned()]
+        .into_iter()
+        .chain((0..1000).map(|i| format!("padding-{i}.example")));
+    let leaf = pki.issue_for(names.collect());
+    assert!(leaf.cert.to_der().unwrap().len() > 16 * 1024);
+    let server = serve(server_endpoint(&pki, &leaf, false));
+    let client = client_endpoint(&pki, None);
+
+    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+    assert_eq!(peer_chain(&conn), pki.chain(&leaf));
     conn.close(0u32.into(), b"done");
 
     client.wait_idle().await;
@@ -203,6 +228,38 @@ async fn async_verification_fails_handshake() {
         matches!(&err, ConnectionError::TransportError(e) if e.code == TransportErrorCode::crypto(INTERNAL_ERROR)),
         "{err:?}"
     );
+}
+
+/// A transport configuration that sends `value` as the raw initial_max_streams_bidi parameter.
+fn sending_max_streams_bidi(value: Vec<u8>) -> TransportConfig {
+    let mut entries: Vec<_> = [
+        TransportParameterId::OriginalDestinationConnectionId,
+        TransportParameterId::MaxIdleTimeout,
+        TransportParameterId::StatelessResetToken,
+        TransportParameterId::MaxUdpPayloadSize,
+        TransportParameterId::InitialMaxData,
+        TransportParameterId::InitialMaxStreamDataBidiLocal,
+        TransportParameterId::InitialMaxStreamDataBidiRemote,
+        TransportParameterId::InitialMaxStreamDataUni,
+        TransportParameterId::InitialMaxStreamsUni,
+        TransportParameterId::AckDelayExponent,
+        TransportParameterId::MaxAckDelay,
+        TransportParameterId::DisableActiveMigration,
+        TransportParameterId::ActiveConnectionIdLimit,
+        TransportParameterId::InitialSourceConnectionId,
+        TransportParameterId::RetrySourceConnectionId,
+        TransportParameterId::MaxDatagramFrameSize,
+        TransportParameterId::GreaseQuicBit,
+    ]
+    .map(TransportParameterKind::Known)
+    .into();
+    entries.push(TransportParameterKind::Custom {
+        id: TransportParameterId::InitialMaxStreamsBidi as u64,
+        value,
+    });
+    let mut config = TransportConfig::default();
+    config.transport_parameter_config(TransportParameterConfig::new(entries, true));
+    config
 }
 
 /// The TLS alert for a local failure (https://www.rfc-editor.org/rfc/rfc8446#section-6.2).
@@ -299,6 +356,15 @@ fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig 
 /// A client that trusts `pki`. Its builder leaves verification off, which `from_builder` turns
 /// on, and it offers "h3" through [`QuicClientConfig::set_alpn`].
 fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
+    let cache = SimpleCache::new(NonZeroUsize::MIN);
+    client_endpoint_with(pki, identity, Arc::new(cache))
+}
+
+fn client_endpoint_with(
+    pki: &Pki,
+    identity: Option<&Leaf>,
+    cache: Arc<dyn SessionCache>,
+) -> Endpoint {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
     if let Some(leaf) = identity {
@@ -308,6 +374,7 @@ fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
     }
     let mut crypto = QuicClientConfig::from_builder(builder).unwrap();
     crypto.set_alpn(&[b"h3".to_vec()]).unwrap();
+    crypto.set_session_cache(cache);
     let endpoint = Endpoint::client(localhost()).unwrap();
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
     endpoint
@@ -315,6 +382,41 @@ fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
 
 fn localhost() -> SocketAddr {
     (Ipv4Addr::LOCALHOST, 0).into()
+}
+
+/// A [SimpleCache] that notes whether sessions were removed without being taken.
+struct RemovalTracker {
+    cache: SimpleCache,
+    removed: AtomicBool,
+}
+
+impl Default for RemovalTracker {
+    fn default() -> Self {
+        Self {
+            cache: SimpleCache::new(NonZeroUsize::MIN),
+            removed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SessionCache for RemovalTracker {
+    fn put(&self, key: bytes::Bytes, value: Zeroizing<Vec<u8>>) {
+        self.cache.put(key, value);
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        self.cache.take(key)
+    }
+
+    fn remove(&self, key: &[u8]) {
+        self.removed.store(true, Ordering::Relaxed);
+        self.cache.remove(key);
+    }
+
+    fn clear(&self) {
+        self.removed.store(true, Ordering::Relaxed);
+        self.cache.clear();
+    }
 }
 
 /// A CA that issues the leaf certificates of a test.
@@ -336,8 +438,14 @@ impl Pki {
     }
 
     fn issue(&self, name: &str) -> Leaf {
+        self.issue_for(vec![name.into()])
+    }
+
+    /// Issues a leaf for `names`, the first of which is its common name.
+    fn issue_for(&self, names: Vec<String>) -> Leaf {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+        let name = names[0].clone();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
         // rcgen's default subject is the CA's, which would make the leaf look self-signed.
         params.distinguished_name = rcgen::DistinguishedName::new();
         params

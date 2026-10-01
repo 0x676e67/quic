@@ -1,8 +1,9 @@
 use crate::crypto::btls::alpn::AlpnProtocols;
 use crate::crypto::btls::error::Result;
+use crate::crypto::btls::session_cache::Entry;
 use crate::crypto::btls::session_state::{QuicCallbacks, SessionState, trace_info};
 use crate::crypto::btls::version::QuicVersion;
-use crate::crypto::btls::{Entry, Error, SessionCache, SimpleCache};
+use crate::crypto::btls::{Error, SessionCache, SimpleCache};
 use crate::{
     ConnectError, ConnectionId, Side, TransportError, crypto,
     transport_parameters::TransportParameters,
@@ -17,6 +18,8 @@ use btls::x509::verify::X509CheckFlags;
 use bytes::{Bytes, BytesMut};
 use std::any::Any;
 use std::io::Cursor;
+use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -47,6 +50,9 @@ pub struct Config {
 }
 
 impl Config {
+    /// The servers whose sessions the default [SessionCache] keeps.
+    const SESSION_CACHE_SERVERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+
     /// Creates a new [Config] that verifies the server against the default trust store and
     /// offers "h3".
     pub fn new() -> Result<Self> {
@@ -67,6 +73,7 @@ impl Config {
     /// - [`SslContextBuilder::set_sigalgs_list`]
     /// - [`SslContextBuilder::set_extension_permutation`]
     /// - [`SslContextBuilder::add_certificate_compression_algorithm`]
+    /// - [`SslContextBuilder::set_keylog_callback`]
     ///
     /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
     /// callbacks and the session cache callback, replacing any on the builder. The ALPN
@@ -87,7 +94,7 @@ impl Config {
         Ok(Self {
             ctx: builder.build(),
             alpn_protocols: None,
-            session_cache: Arc::new(SimpleCache::new(256)),
+            session_cache: Arc::new(SimpleCache::new(Self::SESSION_CACHE_SERVERS)),
             session_settings: SessionSettings::default(),
         })
     }
@@ -118,9 +125,10 @@ impl Config {
     }
 
     /// Sets the ALPN protocols the client offers, in place of those of the [SslContextBuilder].
-    /// QUIC requires ALPN (<https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
+    /// QUIC requires ALPN (<https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>), so the
+    /// list must not be empty, and each protocol takes 1 to 255 bytes.
     pub fn set_alpn(&mut self, alpn_protocols: &[Vec<u8>]) -> Result<()> {
-        self.alpn_protocols = Some(AlpnProtocols::from(alpn_protocols).encode());
+        self.alpn_protocols = Some(AlpnProtocols::try_from(alpn_protocols)?.encode());
         Ok(())
     }
 }
@@ -132,10 +140,8 @@ impl crypto::ClientConfig for Config {
         server_name: &str,
         params: &TransportParameters,
     ) -> StdResult<Box<dyn crypto::Session>, ConnectError> {
-        let version = QuicVersion::parse(version).unwrap();
-
-        Ok(Session::new(self, version, server_name, params)
-            .map_err(|_| ConnectError::EndpointStopping)?)
+        let version = QuicVersion::parse(version)?;
+        Ok(Session::new(self, version, server_name, params)?)
     }
 }
 
@@ -145,7 +151,6 @@ static TICKET_CACHE_INDEX: LazyLock<Option<Index<Ssl, TicketCache>>> =
 /// The [crypto::Session] implementation for BoringSSL.
 struct Session {
     state: SessionState,
-    tickets: TicketCache,
     zero_rtt_peer_params: Option<TransportParameters>,
     handshake_data_sent: bool,
 }
@@ -157,7 +162,7 @@ impl Session {
         server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<Self>> {
-        let mut ssl = Ssl::new(&cfg.ctx).unwrap();
+        let mut ssl = Ssl::new(&cfg.ctx)?;
 
         // Configure the TLS extension based on the QUIC version used.
         ssl.set_quic_use_legacy_codepoint(version.uses_legacy_extension());
@@ -165,22 +170,19 @@ impl Session {
         // Configure the SSL to be a client.
         ssl.set_connect_state();
 
-        // Configure verification for the server hostname.
-        set_verify_hostname(&mut ssl, server_name)
-            .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
+        // Verify the server certificate for the server name, and send it as SNI unless it is
+        // an IP address, which SNI does not allow
+        // (https://www.rfc-editor.org/rfc/rfc6066#section-3).
+        let invalid_name = |_| ConnectError::InvalidServerName(server_name.into());
+        let ip = server_name.parse::<IpAddr>().ok();
+        set_verify_hostname(&mut ssl, server_name, ip).map_err(invalid_name)?;
+        if ip.is_none() {
+            ssl.set_hostname(server_name).map_err(invalid_name)?;
+        }
 
-        // Set the SNI hostname.
-        // TODO: should we validate the hostname?
-        ssl.set_hostname(server_name)
-            .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
-
-        // Set the transport parameters.
-        ssl.set_quic_transport_params(&encode_params(params))
-            .map_err(|_| ConnectError::EndpointStopping)?;
-
+        ssl.set_quic_transport_params(&encode_params(params))?;
         if let Some(alpn_protocols) = &cfg.alpn_protocols {
-            ssl.set_alpn_protos(alpn_protocols)
-                .map_err(|_| ConnectError::EndpointStopping)?;
+            ssl.set_alpn_protos(alpn_protocols)?;
         }
 
         // Apply per-session settings.
@@ -189,8 +191,7 @@ impl Session {
             ssl.set_enable_ech_grease(true);
         }
         for proto in &settings.alps_protocols {
-            ssl.add_application_settings(proto)
-                .map_err(|_| ConnectError::EndpointStopping)?;
+            ssl.add_application_settings(proto)?;
         }
         if !settings.alps_protocols.is_empty() {
             ssl.set_alps_use_new_codepoint(settings.alps_use_new_codepoint);
@@ -201,10 +202,11 @@ impl Session {
             server_name: Bytes::copy_from_slice(server_name.as_bytes()),
         };
 
-        // If we have a cached session, use it.
+        // Resume a cached session. Taking it out of the cache keeps it to this connection, and
+        // BoringSSL does not offer it once expired.
         let mut zero_rtt_peer_params = None;
-        if let Some(entry) = tickets.cache.get(tickets.server_name.clone()) {
-            match Entry::decode(entry) {
+        if let Some(entry) = tickets.cache.take(&tickets.server_name) {
+            match Entry::decode(&entry) {
                 Ok(entry) => {
                     zero_rtt_peer_params = Some(entry.params);
                     // SAFETY: The handshake has not started, and the session was cached for
@@ -238,18 +240,20 @@ impl Session {
         }
 
         let index = TICKET_CACHE_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
-        ssl.set_ex_data(index, tickets.clone());
+        ssl.set_ex_data(index, tickets);
 
         let mut session = Box::new(Self {
             state: SessionState::new(ssl, Side::Client, version)?,
-            tickets,
             zero_rtt_peer_params,
             handshake_data_sent: false,
         });
 
         // Start the handshake in order to emit the Client Hello on the first
         // call to write_handshake.
-        session.state.advance_handshake()?;
+        session
+            .state
+            .advance_handshake()
+            .map_err(|e| Error::other(format!("failed starting the handshake: {e}")))?;
 
         Ok(session)
     }
@@ -261,10 +265,9 @@ impl Session {
             self.state.ssl.early_data_reason()
         );
 
+        // The rejected session left the cache when it was taken, and the other sessions of the
+        // server may still resume other connections.
         self.zero_rtt_peer_params = None;
-
-        // Removed the failed cache entry.
-        self.tickets.remove();
 
         // Now retry advancing the handshake, this time in 1-RTT mode.
         self.state.advance_handshake()
@@ -366,11 +369,6 @@ struct TicketCache {
 impl TicketCache {
     /// Caches a new session with the server transport parameters, which 0-RTT needs.
     fn put(&self, ssl: &SslRef, session: SslSession) {
-        if !session.early_data_capable() {
-            warn!("failed caching session: not early data capable");
-            return;
-        }
-
         // Get the server transport parameters.
         let params = match ssl.peer_quic_transport_params() {
             Some(params) => {
@@ -397,19 +395,19 @@ impl TicketCache {
             }
         }
     }
-
-    fn remove(&self) {
-        self.cache.remove(self.server_name.clone());
-    }
 }
 
-/// Verifies the server certificate for `server_name`, an IP address or a host name.
-fn set_verify_hostname(ssl: &mut SslRef, server_name: &str) -> StdResult<(), ErrorStack> {
+/// Verifies the server certificate for `ip`, or else for the host name `server_name`.
+fn set_verify_hostname(
+    ssl: &mut SslRef,
+    server_name: &str,
+    ip: Option<IpAddr>,
+) -> StdResult<(), ErrorStack> {
     let param = ssl.param_mut();
     param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
-    match server_name.parse() {
-        Ok(ip) => param.set_ip(ip),
-        Err(_) => param.set_host(server_name),
+    match ip {
+        Some(ip) => param.set_ip(ip),
+        None => param.set_host(server_name),
     }
 }
 
@@ -417,4 +415,41 @@ fn encode_params(params: &TransportParameters) -> Bytes {
     let mut out = BytesMut::with_capacity(128);
     params.write(&mut out);
     out.freeze()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btls::ssl::NameType;
+    use crypto::ClientConfig as _;
+
+    #[test]
+    fn start_session() {
+        let mut config =
+            Config::from_builder(SslContextBuilder::new(SslMethod::tls()).unwrap()).unwrap();
+        config.set_alpn(&[b"h3".to_vec()]).unwrap();
+        let config = Arc::new(config);
+        let params = TransportParameters {
+            initial_src_cid: Some(ConnectionId::new(&[1])),
+            ..TransportParameters::default()
+        };
+
+        // SNI carries host names, but not IP addresses.
+        for (server_name, sni) in [
+            ("localhost", Some("localhost")),
+            ("127.0.0.1", None),
+            ("::1", None),
+        ] {
+            let session =
+                Session::new(config.clone(), QuicVersion::V1, server_name, &params).unwrap();
+            assert_eq!(session.state.ssl.servername(NameType::HOST_NAME), sni);
+        }
+
+        let err = config
+            .clone()
+            .start_session(0x0bad_0bad, "localhost", &params);
+        assert!(matches!(err, Err(ConnectError::UnsupportedVersion)));
+        let err = config.start_session(1, "bad\0name", &params);
+        assert!(matches!(err, Err(ConnectError::InvalidServerName(_))));
+    }
 }

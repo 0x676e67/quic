@@ -12,9 +12,9 @@ use btls::ssl::{
     SslAlert, SslCipherRef, SslInfoCallbackMode, SslInfoCallbackValue, SslRef,
 };
 use btls::x509::X509;
-use bytes::{Buf, BytesMut};
 use std::any::Any;
 use std::io::Cursor;
+use std::mem;
 use std::result::Result as StdResult;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use tracing::{error, trace, warn};
@@ -87,12 +87,7 @@ impl SessionState {
     pub(crate) fn new(mut ssl: Ssl, side: Side, version: QuicVersion) -> Result<Self> {
         let quic = Arc::new(Mutex::new(QuicState {
             write_level: Level::Initial,
-            levels: [
-                LevelState::new(version, Level::Initial, &ssl),
-                LevelState::new(version, Level::EarlyData, &ssl),
-                LevelState::new(version, Level::Handshake, &ssl),
-                LevelState::new(version, Level::Application, &ssl),
-            ],
+            levels: std::array::from_fn(|_| LevelState::new(version)),
             error: None,
         }));
         let index = QUIC_STATE_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
@@ -150,13 +145,7 @@ impl SessionState {
     ) -> StdResult<Option<TransportParameters>, TransportError> {
         match self.ssl.peer_quic_transport_params() {
             Some(params) => {
-                let params = TransportParameters::read(self.side, &mut Cursor::new(params))
-                    .map_err(|e| {
-                        TransportError::new(
-                            alert_code(SslAlert::HANDSHAKE_FAILURE),
-                            format!("failed parsing transport params: {e:?}"),
-                        )
-                    })?;
+                let params = TransportParameters::read(self.side, &mut Cursor::new(params))?;
                 Ok(Some(params))
             }
             None => Ok(None),
@@ -168,12 +157,9 @@ impl SessionState {
         let read_level = self.ssl.quic_read_level();
         let provided = self.ssl.provide_quic_data(read_level, plaintext);
         self.check_error()?;
-        provided.map_err(|e| {
-            TransportError::new(
-                alert_code(SslAlert::HANDSHAKE_FAILURE),
-                format!("failed providing handshake data: {e:?}"),
-            )
-        })?;
+        // The data is always provided at the read level, so it only fails when BoringSSL would
+        // buffer more than a flight (https://www.rfc-editor.org/rfc/rfc9000#section-7.5).
+        provided.map_err(|e| TransportError::CRYPTO_BUFFER_EXCEEDED(format!("{e}")))?;
 
         self.advance_handshake()
     }
@@ -186,9 +172,12 @@ impl SessionState {
         // belongs to the level in effect before any switch below.
         let write_level = quic.write_level;
         let write_state = quic.level_state_mut(write_level);
-        if write_state.write_buffer.has_remaining() {
-            buf.extend_from_slice(&write_state.write_buffer);
-            write_state.write_buffer.clear();
+        // The buffer is freed until the level has data again.
+        let data = mem::take(&mut write_state.write_buffer);
+        if buf.is_empty() {
+            *buf = data;
+        } else {
+            buf.extend_from_slice(&data);
         }
 
         // Switch to the next level only once BoringSSL has installed both of its secrets.
@@ -350,7 +339,8 @@ impl SessionState {
                 Ok(())
             }
             _ => {
-                // Everything else is fatal.
+                // Everything else is fatal. BoringSSL reports failures caused by the peer with
+                // an alert, which `check_error` returned, so this one is local.
                 let reason = if code == ErrorCode::SSL {
                     // Error occurred within the SSL library. Get details from the ErrorStack.
                     format!("{code}: {:?}", btls::error::ErrorStack::get())
@@ -359,7 +349,7 @@ impl SessionState {
                 };
 
                 Err(TransportError::new(
-                    alert_code(SslAlert::HANDSHAKE_FAILURE),
+                    alert_code(SslAlert::INTERNAL_ERROR),
                     reason,
                 ))
             }
@@ -382,11 +372,6 @@ struct QuicState {
 
 // BoringSSL event handlers.
 impl QuicState {
-    #[inline]
-    fn level_state(&self, level: Level) -> &LevelState {
-        &self.levels[level as usize]
-    }
-
     #[inline]
     fn level_state_mut(&mut self, level: Level) -> &mut LevelState {
         &mut self.levels[level as usize]
@@ -434,16 +419,10 @@ impl QuicState {
             )));
         }
 
-        // Make sure we don't exceed the buffer capacity for the level.
-        let state = self.level_state_mut(level);
-        if state.write_buffer.len() + data.len() > state.write_buffer.capacity() {
-            return Err(Error::other(format!(
-                "add_handshake_data exceeded buffer capacity for level {level:?}"
-            )));
-        }
-
-        // Add the message to the level.
-        state.write_buffer.extend_from_slice(data);
+        // The data is BoringSSL's own flight, which `write_handshake` hands to the transport.
+        self.level_state_mut(level)
+            .write_buffer
+            .extend_from_slice(data);
         Ok(())
     }
 
@@ -578,17 +557,16 @@ pub(crate) fn trace_info(ssl: &SslRef, mode: SslInfoCallbackMode, value: SslInfo
 
 pub(crate) struct LevelState {
     pub(crate) builder: SecretsBuilder,
-    pub(crate) write_buffer: BytesMut,
+    /// Handshake data to write at the level, allocated once there is some.
+    pub(crate) write_buffer: Vec<u8>,
 }
 
 impl LevelState {
     #[inline]
-    fn new(version: QuicVersion, level: Level, ssl: &Ssl) -> Self {
-        let capacity = ssl.quic_max_handshake_flight_len(level.into());
-
+    fn new(version: QuicVersion) -> Self {
         Self {
             builder: SecretsBuilder::new(version),
-            write_buffer: BytesMut::with_capacity(capacity),
+            write_buffer: Vec::new(),
         }
     }
 }
@@ -646,6 +624,43 @@ mod tests {
                 .take()
                 .is_none()
         );
+    }
+
+    /// Handshake data is buffered on demand whatever its size, and a peer flight larger than
+    /// BoringSSL buffers fails with CRYPTO_BUFFER_EXCEEDED.
+    #[test]
+    fn handshake_buffers() {
+        let mut state = session();
+        let unallocated = |state: &SessionState| {
+            lock(&state.quic)
+                .levels
+                .iter()
+                .all(|level| level.write_buffer.capacity() == 0)
+        };
+        assert!(unallocated(&state));
+
+        // Beyond what the peer may send at the level, as a large certificate chain can be.
+        let flight = vec![1; 64 * 1024];
+        QuicCallbacks
+            .add_handshake_data(&mut state.ssl, QuicEncryptionLevel::INITIAL, &flight)
+            .unwrap();
+        let mut buf = Vec::new();
+        assert!(state.write_handshake(&mut buf).is_none());
+        assert_eq!(buf, flight);
+        assert!(unallocated(&state));
+
+        let err = state.read_handshake(&vec![0; 16 * 1024 + 1]).unwrap_err();
+        assert_eq!(err.code, crate::TransportErrorCode::CRYPTO_BUFFER_EXCEEDED);
+    }
+
+    /// A local failure has no alert, such as a client without the ALPN that QUIC requires.
+    #[test]
+    fn local_failure_is_internal_error() {
+        let mut state = session();
+        state.ssl.set_connect_state();
+        let err = state.advance_handshake().unwrap_err();
+        assert_eq!(err.code, alert_code(SslAlert::INTERNAL_ERROR));
+        assert!(err.reason.contains("NO_APPLICATION_PROTOCOL"), "{err}");
     }
 
     /// Each secret is dropped once the keys of its level are derived.

@@ -63,9 +63,10 @@ impl Config {
     /// Sets the ALPN protocols that will be accepted by the server. QUIC requires that
     /// ALPN be used (see <https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
     ///
-    /// If this method is not called, the server will default to accepting "h3".
+    /// The list must not be empty, and each protocol takes 1 to 255 bytes. If this method is
+    /// not called, the server will default to accepting "h3".
     pub fn set_alpn(&mut self, alpn_protocols: &[Vec<u8>]) -> Result<()> {
-        self.alpn_protocols = alpn_protocols.into();
+        self.alpn_protocols = alpn_protocols.try_into()?;
         Ok(())
     }
 }
@@ -82,6 +83,7 @@ impl crypto::ServerConfig for Config {
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16] {
+        // Never called with a version that `initial_keys` rejected.
         let version = QuicVersion::parse(version).unwrap();
         retry::retry_tag(&version, &orig_dst_cid, packet)
     }
@@ -91,6 +93,8 @@ impl crypto::ServerConfig for Config {
         version: u32,
         params: &TransportParameters,
     ) -> Box<dyn crypto::Session> {
+        // Never called with a version that `initial_keys` rejected. The session only fails to
+        // start when BoringSSL runs out of memory, which the trait cannot report.
         let version = QuicVersion::parse(version).unwrap();
         Session::new(self, version, params).unwrap()
     }
@@ -112,7 +116,7 @@ impl Session {
         version: QuicVersion,
         params: &TransportParameters,
     ) -> Result<Box<Self>> {
-        let mut ssl = Ssl::new(&cfg.ctx).unwrap();
+        let mut ssl = Ssl::new(&cfg.ctx)?;
 
         // Configure the TLS extension based on the QUIC version used.
         ssl.set_quic_use_legacy_codepoint(version.uses_legacy_extension());
@@ -121,8 +125,7 @@ impl Session {
         ssl.set_accept_state();
 
         // Set the transport parameters.
-        ssl.set_quic_transport_params(&encode_params(params))
-            .unwrap();
+        ssl.set_quic_transport_params(&encode_params(params))?;
 
         // BoringSSL accepts 0-RTT only under the context of the ticket, so 0-RTT is rejected
         // once the limits that a client remembers change. Without a context, BoringSSL issues

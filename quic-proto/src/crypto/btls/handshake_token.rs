@@ -5,6 +5,7 @@ use crate::crypto::btls::key::{AeadKey, Key};
 use crate::crypto::btls::secret::Secret;
 use crate::crypto::btls::suite::CipherSuite;
 
+/// A key for the tokens a server issues, see [`crypto::HandshakeTokenKey`].
 pub struct HandshakeTokenKey(Key);
 
 impl HandshakeTokenKey {
