@@ -1,10 +1,10 @@
-use crate::crypto::btls::alert::alert_code;
 use crate::crypto::btls::error::Result;
 use crate::crypto::btls::secret::{Secret, Secrets, SecretsBuilder};
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::{Error, HandshakeData, QuicVersion, retry};
 use crate::{
-    ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
+    ConnectionId, Side, TransportError, TransportErrorCode, crypto,
+    transport_parameters::TransportParameters,
 };
 use btls::ex_data::Index;
 use btls::ssl::{
@@ -357,6 +357,19 @@ impl SessionState {
     }
 }
 
+/// Returns the QUIC error code that carries a TLS alert
+/// (<https://www.rfc-editor.org/rfc/rfc9001#section-4.8>).
+fn alert_code(alert: SslAlert) -> TransportErrorCode {
+    // Alert descriptions are single bytes on the wire.
+    TransportErrorCode::crypto(alert.as_raw() as u8)
+}
+
+impl From<SslAlert> for TransportError {
+    fn from(alert: SslAlert) -> Self {
+        Self::new(alert_code(alert), alert.description().to_owned())
+    }
+}
+
 /// Locks `quic`, which stays usable if a thread panicked while holding it.
 fn lock(quic: &Mutex<QuicState>) -> MutexGuard<'_, QuicState> {
     quic.lock().unwrap_or_else(PoisonError::into_inner)
@@ -628,7 +641,7 @@ mod tests {
         assert!(unallocated(&state));
 
         let err = state.read_handshake(&vec![0; 16 * 1024 + 1]).unwrap_err();
-        assert_eq!(err.code, crate::TransportErrorCode::CRYPTO_BUFFER_EXCEEDED);
+        assert_eq!(err.code, TransportErrorCode::CRYPTO_BUFFER_EXCEEDED);
     }
 
     /// A local failure has no alert, such as a client without the ALPN that QUIC requires.

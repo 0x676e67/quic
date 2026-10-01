@@ -5,28 +5,21 @@ use btls::ssl::SslCipherRef;
 use std::fmt::{Debug, Formatter};
 use std::sync::LazyLock;
 
-// For AEAD_AES_128_GCM and AEAD_AES_256_GCM ... endpoints that do not send
-// packets larger than 2^11 bytes cannot protect more than 2^28 packets.
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-confidentiality-limit
-const AES_CONFIDENTIALITY_LIMIT: u64 = 2u64.pow(28);
+// AEAD usage limits, in packets (https://www.rfc-editor.org/rfc/rfc9001#section-6.6). Appendix B
+// allows larger AES-GCM limits only for packets of at most 2^11 bytes, which path MTU discovery
+// may exceed.
 
-// For AEAD_CHACHA20_POLY1305, the confidentiality limit is greater than the
-// number of possible packets (2^62) and so can be disregarded.
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-limits-on-aead-usage
+// AEAD_AES_128_GCM and AEAD_AES_256_GCM may protect at most 2^23 packets.
+const AES_CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
+
+// AEAD_CHACHA20_POLY1305 has a confidentiality limit above the number of possible packets (2^62).
 const CHACHA20_POLY1305_CONFIDENTIALITY_LIMIT: u64 = u64::MAX;
 
-// For AEAD_AES_128_GCM ... endpoints that do not attempt to remove
-// protection from packets larger than 2^11 bytes can attempt to remove
-// protection from at most 2^57 packets.
-// For AEAD_AES_256_GCM [the limit] is substantially larger than the limit for
-// AEAD_AES_128_GCM. However, this document recommends that the same limit be
-// applied to both functions as either limit is acceptably large.
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-integrity-limit
-const AES_INTEGRITY_LIMIT: u64 = 2u64.pow(57);
+// AEAD_AES_128_GCM and AEAD_AES_256_GCM may fail to remove protection from at most 2^52 packets.
+const AES_INTEGRITY_LIMIT: u64 = 1 << 52;
 
-// For AEAD_CHACHA20_POLY1305, the integrity limit is 2^36 invalid packets.
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-limits-on-aead-usage
-const CHACHA20_POLY1305_INTEGRITY_LIMIT: u64 = 2u64.pow(36);
+// AEAD_CHACHA20_POLY1305 may fail to remove protection from at most 2^36 packets.
+const CHACHA20_POLY1305_INTEGRITY_LIMIT: u64 = 1 << 36;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ID {
@@ -101,6 +94,24 @@ impl CipherSuite {
             id => Err(Error::invalid_input(format!(
                 "invalid cipher id: {id:#06x}"
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The limits of RFC 9001 §6.6, which `PacketKey` reports to the connection.
+    #[test]
+    fn aead_limits() {
+        for (suite, confidentiality, integrity) in [
+            (CipherSuite::aes128_gcm_sha256(), 1 << 23, 1 << 52),
+            (CipherSuite::aes256_gcm_sha384(), 1 << 23, 1 << 52),
+            (CipherSuite::chacha20_poly1305_sha256(), u64::MAX, 1 << 36),
+        ] {
+            assert_eq!(suite.confidentiality_limit, confidentiality, "{suite:?}");
+            assert_eq!(suite.integrity_limit, integrity, "{suite:?}");
         }
     }
 }
