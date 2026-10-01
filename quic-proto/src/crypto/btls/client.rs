@@ -40,53 +40,33 @@ pub struct SessionSettings {
 }
 
 /// Configuration for a client-side QUIC. Wraps around a BoringSSL [SslContext].
-pub struct Config {
+///
+/// It is created from an [SslContextBuilder] with [`TryFrom`]. The builder is the place for
+/// every TLS setting, including those that only exist on [SslContextBuilder], such as:
+/// - [`SslContextBuilder::set_alpn_protos`], which QUIC requires
+///   ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)): without ALPN
+///   protocols, BoringSSL cannot build the ClientHello, so the connection fails to start with
+///   [`ConnectError::EndpointStopping`] and the reason is logged
+/// - the trust anchors, such as [`SslContextBuilder::set_default_verify_paths`]
+/// - [`SslContextBuilder::set_grease_enabled`]
+/// - [`SslContextBuilder::set_sigalgs_list`]
+/// - [`SslContextBuilder::set_extension_permutation`]
+/// - [`SslContextBuilder::add_certificate_compression_algorithm`]
+/// - [`SslContextBuilder::set_keylog_callback`]
+///
+/// The conversion restricts the context to TLS 1.3, enables early data, and installs the QUIC
+/// callbacks and the session cache callback, replacing any on the builder. The verification
+/// settings and other callbacks of the builder are kept, except that the server is verified if
+/// the builder verifies nothing.
+pub struct QuicClientConfig {
     ctx: SslContext,
     session_cache: Arc<dyn SessionCache>,
     session_settings: SessionSettings,
 }
 
-impl Config {
+impl QuicClientConfig {
     /// The servers whose sessions the default [SessionCache] keeps.
     const SESSION_CACHE_SERVERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
-
-    /// Creates a new [Config] from a caller-provided [SslContextBuilder].
-    ///
-    /// The builder is the place for every TLS setting, including those that only exist on
-    /// [SslContextBuilder], such as:
-    /// - [`SslContextBuilder::set_alpn_protos`], which QUIC requires
-    ///   ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)): without ALPN
-    ///   protocols, BoringSSL cannot build the ClientHello, so the connection fails to start
-    ///   with [`ConnectError::EndpointStopping`] and the reason is logged
-    /// - the trust anchors, such as [`SslContextBuilder::set_default_verify_paths`]
-    /// - [`SslContextBuilder::set_grease_enabled`]
-    /// - [`SslContextBuilder::set_sigalgs_list`]
-    /// - [`SslContextBuilder::set_extension_permutation`]
-    /// - [`SslContextBuilder::add_certificate_compression_algorithm`]
-    /// - [`SslContextBuilder::set_keylog_callback`]
-    ///
-    /// This restricts the context to TLS 1.3, enables early data, and installs the QUIC
-    /// callbacks and the session cache callback, replacing any on the builder. The verification
-    /// settings and other callbacks of the builder are kept, except that the server is verified
-    /// if the builder verifies nothing.
-    pub fn from_builder(mut builder: SslContextBuilder) -> Result<Self> {
-        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-        builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-        if builder.verify_mode() == SslVerifyMode::NONE {
-            builder.set_verify(SslVerifyMode::PEER);
-        }
-        builder
-            .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
-        builder.set_new_session_callback(Session::on_new_session);
-        builder.set_quic_method(QuicCallbacks)?;
-        builder.set_early_data_enabled(true);
-
-        Ok(Self {
-            ctx: builder.build(),
-            session_cache: Arc::new(SimpleCache::new(Self::SESSION_CACHE_SERVERS)),
-            session_settings: SessionSettings::default(),
-        })
-    }
 
     /// Returns the underlying [SslContext] backing all created sessions.
     pub fn ctx(&self) -> &SslContext {
@@ -114,7 +94,30 @@ impl Config {
     }
 }
 
-impl crypto::ClientConfig for Config {
+impl TryFrom<SslContextBuilder> for QuicClientConfig {
+    type Error = Error;
+
+    fn try_from(mut builder: SslContextBuilder) -> Result<Self> {
+        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+        builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+        if builder.verify_mode() == SslVerifyMode::NONE {
+            builder.set_verify(SslVerifyMode::PEER);
+        }
+        builder
+            .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
+        builder.set_new_session_callback(Session::on_new_session);
+        builder.set_quic_method(QuicCallbacks)?;
+        builder.set_early_data_enabled(true);
+
+        Ok(Self {
+            ctx: builder.build(),
+            session_cache: Arc::new(SimpleCache::new(Self::SESSION_CACHE_SERVERS)),
+            session_settings: SessionSettings::default(),
+        })
+    }
+}
+
+impl crypto::ClientConfig for QuicClientConfig {
     fn start_session(
         self: Arc<Self>,
         version: u32,
@@ -145,7 +148,7 @@ struct Session {
 
 impl Session {
     fn new(
-        cfg: Arc<Config>,
+        cfg: Arc<QuicClientConfig>,
         version: QuicVersion,
         server_name: &str,
         params: &TransportParameters,
@@ -412,7 +415,7 @@ mod tests {
     fn start_session() {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
         builder.set_alpn_protos(b"\x02h3").unwrap();
-        let config = Arc::new(Config::from_builder(builder).unwrap());
+        let config = Arc::new(QuicClientConfig::try_from(builder).unwrap());
         let params = TransportParameters {
             initial_src_cid: Some(ConnectionId::new(&[1])),
             ..TransportParameters::default()
@@ -437,7 +440,7 @@ mod tests {
         assert!(matches!(err, Err(ConnectError::InvalidServerName(_))));
 
         // Without ALPN protocols, BoringSSL cannot build the ClientHello.
-        let config = Config::from_builder(SslContextBuilder::new(SslMethod::tls()).unwrap());
+        let config = QuicClientConfig::try_from(SslContextBuilder::new(SslMethod::tls()).unwrap());
         let err = Arc::new(config.unwrap()).start_session(1, "localhost", &params);
         assert!(matches!(err, Err(ConnectError::EndpointStopping)));
     }
