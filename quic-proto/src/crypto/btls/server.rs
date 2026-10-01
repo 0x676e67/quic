@@ -27,18 +27,18 @@ use tracing::warn;
 ///
 /// The conversion restricts the context to TLS 1.3, enables early data, and installs the QUIC
 /// callbacks, replacing any on the builder. Other callbacks of the builder are kept.
-pub struct Config {
+pub struct QuicServerConfig {
     ctx: SslContext,
 }
 
-impl Config {
+impl QuicServerConfig {
     /// Returns the underlying [SslContext] backing all created sessions.
     pub fn ctx(&self) -> &SslContext {
         &self.ctx
     }
 }
 
-impl TryFrom<SslContextBuilder> for Config {
+impl TryFrom<SslContextBuilder> for QuicServerConfig {
     type Error = Error;
 
     fn try_from(mut builder: SslContextBuilder) -> Result<Self> {
@@ -53,7 +53,7 @@ impl TryFrom<SslContextBuilder> for Config {
     }
 }
 
-impl crypto::ServerConfig for Config {
+impl crypto::ServerConfig for QuicServerConfig {
     fn initial_keys(
         &self,
         version: u32,
@@ -90,7 +90,7 @@ struct Session {
 
 impl Session {
     fn new(
-        cfg: Arc<Config>,
+        cfg: Arc<QuicServerConfig>,
         version: QuicVersion,
         params: &TransportParameters,
     ) -> Result<Box<Self>> {

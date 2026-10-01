@@ -58,13 +58,13 @@ pub struct SessionSettings {
 /// callbacks and the session cache callback, replacing any on the builder. The verification
 /// settings and other callbacks of the builder are kept, except that the server is verified if
 /// the builder verifies nothing.
-pub struct Config {
+pub struct QuicClientConfig {
     ctx: SslContext,
     session_cache: Arc<dyn SessionCache>,
     session_settings: SessionSettings,
 }
 
-impl Config {
+impl QuicClientConfig {
     /// The servers whose sessions the default [SessionCache] keeps.
     const SESSION_CACHE_SERVERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
@@ -94,7 +94,7 @@ impl Config {
     }
 }
 
-impl TryFrom<SslContextBuilder> for Config {
+impl TryFrom<SslContextBuilder> for QuicClientConfig {
     type Error = Error;
 
     fn try_from(mut builder: SslContextBuilder) -> Result<Self> {
@@ -117,7 +117,7 @@ impl TryFrom<SslContextBuilder> for Config {
     }
 }
 
-impl crypto::ClientConfig for Config {
+impl crypto::ClientConfig for QuicClientConfig {
     fn start_session(
         self: Arc<Self>,
         version: u32,
@@ -148,7 +148,7 @@ struct Session {
 
 impl Session {
     fn new(
-        cfg: Arc<Config>,
+        cfg: Arc<QuicClientConfig>,
         version: QuicVersion,
         server_name: &str,
         params: &TransportParameters,
@@ -415,7 +415,7 @@ mod tests {
     fn start_session() {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
         builder.set_alpn_protos(b"\x02h3").unwrap();
-        let config = Arc::new(Config::try_from(builder).unwrap());
+        let config = Arc::new(QuicClientConfig::try_from(builder).unwrap());
         let params = TransportParameters {
             initial_src_cid: Some(ConnectionId::new(&[1])),
             ..TransportParameters::default()
@@ -440,7 +440,7 @@ mod tests {
         assert!(matches!(err, Err(ConnectError::InvalidServerName(_))));
 
         // Without ALPN protocols, BoringSSL cannot build the ClientHello.
-        let config = Config::try_from(SslContextBuilder::new(SslMethod::tls()).unwrap());
+        let config = QuicClientConfig::try_from(SslContextBuilder::new(SslMethod::tls()).unwrap());
         let err = Arc::new(config.unwrap()).start_session(1, "localhost", &params);
         assert!(matches!(err, Err(ConnectError::EndpointStopping)));
     }

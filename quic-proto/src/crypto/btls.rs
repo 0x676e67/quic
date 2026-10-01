@@ -15,11 +15,11 @@ mod session_state;
 mod suite;
 mod version;
 
-pub use client::{Config as QuicClientConfig, SessionSettings};
+pub use client::{QuicClientConfig, SessionSettings};
 pub use error::{Error, Result};
 pub use handshake_token::HandshakeTokenKey;
 pub use hmac::HmacKey;
-pub use server::Config as QuicServerConfig;
+pub use server::QuicServerConfig;
 pub use session_cache::{NoSessionCache, SessionCache, SimpleCache};
 use version::QuicVersion;
 /// The wrapper of [SessionCache] values, which zeroes them on drop.
