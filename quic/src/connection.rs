@@ -152,7 +152,14 @@ impl Connecting {
     /// The dynamic type returned is determined by the configured
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
     /// be [`downcast`](Box::downcast) to a
-    /// [`crypto::rustls::HandshakeData`](crate::crypto::rustls::HandshakeData).
+    #[cfg_attr(
+        any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"),
+        doc = " [`crypto::rustls::HandshakeData`](crate::crypto::rustls::HandshakeData)."
+    )]
+    #[cfg_attr(
+        not(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")),
+        doc = " `crypto::rustls::HandshakeData`."
+    )]
     ///
     /// This operation is cancel-safe.
     pub async fn handshake_data(&mut self) -> Result<Box<dyn Any>, ConnectionError> {
@@ -684,7 +691,16 @@ impl Connection {
     ///
     /// The dynamic type returned is determined by the configured
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
-    /// be [`downcast`](Box::downcast) to a <code>Vec<[rustls::pki_types::CertificateDer]></code>
+    /// be [`downcast`](Box::downcast) to a
+    #[cfg_attr(
+        any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"),
+        doc = " `Vec` of [`CertificateDer`](rustls::pki_types::CertificateDer)."
+    )]
+    #[cfg_attr(
+        not(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")),
+        doc = " `Vec` of `CertificateDer`."
+    )]
+    /// For the `btls` session, it is a `Vec<btls::x509::X509>`, leaf certificate first.
     pub fn peer_identity(&self) -> Option<Box<dyn Any>> {
         self.0
             .state

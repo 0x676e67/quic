@@ -382,6 +382,42 @@ impl TransportParameters {
         Ok(())
     }
 
+    /// Encodes the parameters that [`Self::validate_resumption_from`] checks, for a TLS stack
+    /// that rejects 0-RTT when a ticket was issued under a different context
+    /// (https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1).
+    ///
+    /// A custom parameter list may omit a field or send another value for it, so the context
+    /// holds the values a client decodes from these parameters, not the fields.
+    #[cfg(feature = "btls")]
+    pub(crate) fn early_data_context(&self) -> Result<Vec<u8>, Error> {
+        let mut encoded = Vec::new();
+        self.write(&mut encoded);
+        let sent = Self::read(Side::Client, &mut encoded.as_slice())?;
+
+        let mut out = Vec::with_capacity(32);
+        for value in [
+            sent.active_connection_id_limit,
+            sent.initial_max_data,
+            sent.initial_max_stream_data_bidi_local,
+            sent.initial_max_stream_data_bidi_remote,
+            sent.initial_max_stream_data_uni,
+            sent.initial_max_streams_bidi,
+            sent.initial_max_streams_uni,
+        ] {
+            out.write(value);
+        }
+        // Tag the optional value, so that no two sets of parameters share an encoding.
+        match sent.max_datagram_frame_size {
+            Some(size) => {
+                out.put_u8(1);
+                out.write(size);
+            }
+            None => out.put_u8(0),
+        }
+        out.put_u8(sent.grease_quic_bit.into());
+        Ok(out)
+    }
+
     /// Maximum number of CIDs to issue to this peer
     ///
     /// Consider both a) the active_connection_id_limit from the other end; and
@@ -1224,6 +1260,87 @@ mod test {
         };
         high_limit.validate_resumption_from(&low_limit).unwrap();
         low_limit.validate_resumption_from(&high_limit).unwrap_err();
+    }
+
+    #[cfg(feature = "btls")]
+    #[test]
+    fn early_data_context() {
+        let params = TransportParameters {
+            initial_max_streams_uni: 16u32.into(),
+            ..TransportParameters::default()
+        };
+        let context = params.early_data_context().unwrap();
+        // Parameters that differ per connection leave the context unchanged.
+        let other_connection = TransportParameters {
+            initial_src_cid: Some(ConnectionId::new(&[1; 8])),
+            original_dst_cid: Some(ConnectionId::new(&[2; 8])),
+            stateless_reset_token: Some([3; RESET_TOKEN_SIZE].into()),
+            ..params.clone()
+        };
+        assert_eq!(other_connection.early_data_context().unwrap(), context);
+
+        for changed in [
+            TransportParameters {
+                initial_max_streams_uni: 32u32.into(),
+                ..params.clone()
+            },
+            TransportParameters {
+                max_datagram_frame_size: Some(0u32.into()),
+                ..params.clone()
+            },
+            TransportParameters {
+                grease_quic_bit: true,
+                ..params.clone()
+            },
+        ] {
+            assert_ne!(changed.early_data_context().unwrap(), context);
+        }
+    }
+
+    /// The context follows the limits a custom parameter list sends, which may differ from the
+    /// configured ones.
+    #[cfg(feature = "btls")]
+    #[test]
+    fn early_data_context_follows_sent_limits() {
+        let entries = |sent_streams_bidi: Option<u8>| {
+            let mut entries: Vec<_> = TransportParameterId::SUPPORTED
+                .iter()
+                .filter(|&&id| id != TransportParameterId::InitialMaxStreamsBidi)
+                .map(|&id| TransportParameterKind::Known(id))
+                .collect();
+            entries.push(match sent_streams_bidi {
+                Some(value) => TransportParameterKind::Custom {
+                    id: TransportParameterId::InitialMaxStreamsBidi as u64,
+                    value: vec![value],
+                },
+                None => TransportParameterKind::Known(TransportParameterId::InitialMaxStreamsBidi),
+            });
+            entries.push(TransportParameterKind::Grease);
+            TransportParameterConfig::new(entries, true)
+        };
+        let context = |tp_config: TransportParameterConfig| {
+            let mut config = TransportConfig::default();
+            config.max_concurrent_bidi_streams(20u32.into());
+            config.transport_parameter_config(tp_config);
+            let params = build_tp(&config);
+            assert_eq!(params.initial_max_streams_bidi, 20u32.into());
+            params.early_data_context().unwrap()
+        };
+
+        let configured = context(entries(None));
+        // The shuffle and the GREASE parameter do not change the context.
+        assert_eq!(context(entries(None)), configured);
+        // Sending a lower limit than the configured one, or omitting it, changes the context.
+        assert_ne!(context(entries(Some(10))), configured);
+        let omitted = TransportParameterId::SUPPORTED
+            .iter()
+            .filter(|&&id| id != TransportParameterId::InitialMaxStreamsBidi)
+            .map(|&id| TransportParameterKind::Known(id))
+            .collect();
+        assert_ne!(
+            context(TransportParameterConfig::new(omitted, false)),
+            configured
+        );
     }
 
     // -- Tests for deterministic transport parameter ordering --

@@ -25,6 +25,11 @@ aws-lc-rs-fips = ["proto/aws-lc-rs-fips"]
 # Enables BloomTokenLog, and uses it by default
 bloom = ["proto/bloom"]
 
+# Enable btls/BoringSSL crypto support
+# Also enables `Endpoint::client` and `Endpoint::server` conveniences.
+btls = ["proto/btls"]
+btls-prefix-symbols = ["proto/btls-prefix-symbols"]
+
 # Records how long locks are held, and warns if they are held >= 1ms
 lock_tracking = []
 
@@ -127,6 +132,10 @@ required-features = ["rustls-ring"]
 [[test]]
 name = "post_quantum"
 required-features = ["__rustls-post-quantum-test"]
+
+[[test]]
+name = "btls"
+required-features = ["btls", "runtime-tokio"]
 
 [[bench]]
 name = "bench"
