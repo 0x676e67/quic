@@ -56,10 +56,9 @@ pub struct SessionSettings {
 /// - [`SslContextBuilder::set_early_data_enabled`] to send 0-RTT data with the sessions that
 ///   allow it; without it, sessions are still resumed, in 1-RTT
 ///
-/// The conversion restricts the context to TLS 1.3 and installs the QUIC callbacks and the
-/// session cache callback, replacing any on the builder. The verification
-/// settings and other callbacks of the builder are kept, except that the server is verified if
-/// the builder verifies nothing.
+/// The conversion restricts the context to TLS 1.3 and installs the QUIC callbacks and the session
+/// cache callback, replacing any on the builder. The verification settings and other callbacks of
+/// the builder are kept, except that the server is verified if the builder verifies nothing.
 pub struct QuicClientConfig {
     ctx: SslContext,
     session_cache: Arc<dyn SessionCache>,
