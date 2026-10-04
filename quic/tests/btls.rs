@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -16,8 +16,8 @@ use quic::{
     btls::{
         pkey::{PKey, Private},
         ssl::{
-            AlpnError, ExtensionType, SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode,
-            select_next_proto,
+            AlpnError, ExtensionType, SslContextBuilder, SslInfoCallbackMode, SslMethod,
+            SslVerifyError, SslVerifyMode, select_next_proto,
         },
         x509::X509,
     },
@@ -247,7 +247,7 @@ async fn transport_parameters_codepoint() {
     let pki = Pki::new();
     let leaf = pki.issue("localhost");
     // Whether each ClientHello carries the legacy and the standard extension.
-    let codepoints = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let codepoints = Arc::new(Mutex::new(Vec::new()));
     let mut builder = server_builder(&pki, &leaf, false);
     builder.set_alpn_protos(b"\x02h3").unwrap();
     let seen = codepoints.clone();
@@ -282,6 +282,49 @@ async fn transport_parameters_codepoint() {
     );
 
     client.wait_idle().await;
+}
+
+/// 0-RTT needs both sides to enable early data on their builder. Without it on either side, the
+/// session still resumes, in 1-RTT.
+#[tokio::test]
+async fn early_data_from_builder() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    // Whether each handshake resumed a session, as the servers see it.
+    let resumed = Arc::new(Mutex::new(Vec::new()));
+    let server = |early_data: bool| {
+        let mut builder = server_builder(&pki, &leaf, false);
+        builder.set_alpn_protos(b"\x02h3").unwrap();
+        builder.set_early_data_enabled(early_data);
+        let seen = resumed.clone();
+        builder.set_info_callback(move |ssl, mode, _| {
+            if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+                seen.lock().unwrap().push(ssl.session_reused());
+            }
+        });
+        let crypto = QuicServerConfig::try_from(builder).unwrap();
+        let config = ServerConfig::with_crypto(Arc::new(crypto));
+        serve(Endpoint::server(config, localhost()).unwrap())
+    };
+
+    for (client_early_data, server_early_data) in [(false, true), (true, false)] {
+        let server = server(server_early_data);
+        let mut builder = client_builder(&pki, None);
+        builder.set_early_data_enabled(client_early_data);
+        let client = client_endpoint_with(builder, Arc::new(SimpleCache::new(NonZeroUsize::MIN)));
+
+        let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+        request(&conn, b"1-rtt").await.unwrap();
+        conn.close(0u32.into(), b"done");
+
+        let connecting = client.connect(server, "localhost").unwrap();
+        let conn = connecting.into_0rtt().expect_err("no 0-RTT").await.unwrap();
+        request(&conn, b"1-rtt").await.unwrap();
+        conn.close(0u32.into(), b"done");
+
+        client.wait_idle().await;
+    }
+    assert_eq!(*resumed.lock().unwrap(), [false, true, false, true]);
 }
 
 /// A server flight may exceed the 16 KiB a server itself accepts per level.
@@ -446,9 +489,10 @@ fn server_crypto(pki: &Pki, leaf: &Leaf, client_auth: bool) -> QuicServerConfig 
     QuicServerConfig::try_from(builder).unwrap()
 }
 
-/// A server builder without ALPN protocols.
+/// A server builder that enables 0-RTT, without ALPN protocols.
 fn server_builder(pki: &Pki, leaf: &Leaf, client_auth: bool) -> SslContextBuilder {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+    builder.set_early_data_enabled(true);
     builder.set_certificate(&leaf.cert).unwrap();
     builder.add_extra_chain_cert(pki.ca.clone()).unwrap();
     builder.set_private_key(&leaf.key).unwrap();
@@ -464,10 +508,11 @@ fn client_endpoint(pki: &Pki, identity: Option<&Leaf>) -> Endpoint {
     client_endpoint_with(client_builder(pki, identity), Arc::new(cache))
 }
 
-/// A client builder that trusts `pki` and offers "h3". It leaves verification off, which
-/// the conversion to [`QuicClientConfig`] turns on.
+/// A client builder that trusts `pki`, offers "h3" and enables 0-RTT. It leaves verification off,
+/// which the conversion to [`QuicClientConfig`] turns on.
 fn client_builder(pki: &Pki, identity: Option<&Leaf>) -> SslContextBuilder {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+    builder.set_early_data_enabled(true);
     builder.cert_store_mut().add_cert(pki.ca.clone()).unwrap();
     builder.set_alpn_protos(b"\x02h3").unwrap();
     if let Some(leaf) = identity {

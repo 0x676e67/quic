@@ -25,8 +25,13 @@ use tracing::warn;
 /// [`select_next_proto`](btls::ssl::select_next_proto) to prefer the server's order. Without
 /// either, every handshake fails with `NO_APPLICATION_PROTOCOL`.
 ///
-/// The conversion restricts the context to TLS 1.3, enables early data, and installs the QUIC
-/// callbacks, replacing any on the builder. Other callbacks of the builder are kept.
+/// 0-RTT is off unless the builder enables it with
+/// [`SslContextBuilder::set_early_data_enabled`]. The server then accepts 0-RTT from, and issues,
+/// tickets that allow it. Each connection binds them to the transport parameters that 0-RTT
+/// depends on, so 0-RTT is rejected once those change.
+///
+/// The conversion restricts the context to TLS 1.3 and installs the QUIC callbacks, replacing any
+/// on the builder. Other callbacks of the builder are kept.
 pub struct QuicServerConfig {
     ctx: SslContext,
 }
@@ -45,7 +50,6 @@ impl TryFrom<SslContextBuilder> for QuicServerConfig {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_quic_method(QuicCallbacks)?;
-        builder.set_early_data_enabled(true);
 
         Ok(Self {
             ctx: builder.build(),
