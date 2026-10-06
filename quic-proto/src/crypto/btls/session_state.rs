@@ -1,4 +1,5 @@
 use crate::crypto::btls::error::Result;
+use crate::crypto::btls::key::{DeferredKey, PacketKey};
 use crate::crypto::btls::secret::{Secret, Secrets, SecretsBuilder};
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::{Error, HandshakeData, QuicVersion, retry};
@@ -18,7 +19,7 @@ use std::fmt;
 use std::io::Cursor;
 use std::mem;
 use std::result::Result as StdResult;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use tracing::trace;
 
 /// A QUIC encryption level, which indexes the per-level state.
@@ -82,6 +83,8 @@ pub(crate) struct SessionState {
     /// `ssl`, so it must not be locked across calls into BoringSSL.
     quic: Arc<Mutex<QuicState>>,
     next_secrets: Option<Secrets>,
+    /// The 1-RTT keys handed out before the read secret, which `next_secrets` replaces.
+    pending_1rtt: Option<Pending1Rtt>,
     handshaking: bool,
 }
 
@@ -101,6 +104,7 @@ impl SessionState {
             side,
             quic,
             next_secrets: None,
+            pending_1rtt: None,
             early_data_rejected: false,
             handshaking: true,
         })
@@ -136,9 +140,22 @@ impl SessionState {
 
     #[inline]
     pub(crate) fn next_1rtt_keys(&mut self) -> Option<crypto::KeyPair<Box<dyn crypto::PacketKey>>> {
-        self.next_secrets
-            .as_mut()
-            .map(|secrets| secrets.next_packet_keys().unwrap().into_crypto())
+        if let Some(secrets) = self.next_secrets.as_mut() {
+            return Some(secrets.next_packet_keys().unwrap().into_crypto());
+        }
+
+        let pending = self.pending_1rtt.as_mut()?;
+        let local = pending
+            .local
+            .packet_key(self.version, pending.suite)
+            .unwrap();
+        pending.local.update(self.version, pending.suite).unwrap();
+        let remote = Arc::new(OnceLock::new());
+        pending.remote_packet.push(remote.clone());
+        Some(crypto::KeyPair {
+            local: Box::new(local),
+            remote: Box::new(DeferredKey::new(pending.suite, remote)),
+        })
     }
 
     #[inline]
@@ -182,15 +199,24 @@ impl SessionState {
             buf.extend_from_slice(&data);
         }
 
-        // Switch to the next level only once BoringSSL has installed both of its secrets.
-        // The server only learns the application read secret after the client Finished,
-        // so the application keys may become available several calls after the write
-        // secret did.
+        // Switch to the next level once BoringSSL has installed both of its secrets. The server
+        // only learns the application read secret after the client Finished, so its application
+        // keys come with the write secret and their remote halves follow the read secret, which
+        // lets it send 0.5-RTT data (https://www.rfc-editor.org/rfc/rfc9001#section-5.7).
         let next_write_level = write_level.next();
         if next_write_level == write_level {
             return None;
         }
-        let mut secrets = quic.level_state_mut(next_write_level).builder.take()?;
+        let builder = &mut quic.level_state_mut(next_write_level).builder;
+        let Some(mut secrets) = builder.take() else {
+            if next_write_level != Level::Application {
+                return None;
+            }
+            let (suite, local) = builder.take_local()?;
+            quic.write_level = next_write_level;
+            drop(quic);
+            return Some(self.defer_1rtt_remote_keys(suite, local));
+        };
         quic.write_level = next_write_level;
 
         // The secrets are only needed for this derivation, except that the application
@@ -202,6 +228,69 @@ impl SessionState {
         }
 
         Some(keys)
+    }
+
+    /// Returns the application keys of `local`, whose remote halves wait for the read secret.
+    fn defer_1rtt_remote_keys(
+        &mut self,
+        suite: &'static CipherSuite,
+        mut local: Secret,
+    ) -> crypto::Keys {
+        let remote_header = Arc::new(OnceLock::new());
+        let remote_packet = Arc::new(OnceLock::new());
+        let keys = crypto::Keys {
+            header: crypto::KeyPair {
+                local: local
+                    .header_key(self.version, suite)
+                    .unwrap()
+                    .as_crypto()
+                    .unwrap(),
+                remote: Box::new(DeferredKey::new(suite, remote_header.clone())),
+            },
+            packet: crypto::KeyPair {
+                local: Box::new(local.packet_key(self.version, suite).unwrap()),
+                remote: Box::new(DeferredKey::new(suite, remote_packet.clone())),
+            },
+        };
+        local.update(self.version, suite).unwrap();
+        self.pending_1rtt = Some(Pending1Rtt {
+            suite,
+            local,
+            remote_header,
+            remote_packet: vec![remote_packet],
+        });
+        keys
+    }
+
+    /// Sets the deferred application keys once BoringSSL installs the read secret.
+    fn complete_1rtt_keys(&mut self) {
+        if self.pending_1rtt.is_none() {
+            return;
+        }
+        let Some((suite, mut remote)) = lock(&self.quic)
+            .level_state_mut(Level::Application)
+            .builder
+            .take_remote()
+        else {
+            return;
+        };
+        let Some(pending) = self.pending_1rtt.take() else {
+            return;
+        };
+
+        // The builder rejects a read secret of another suite than the write secret.
+        let header = remote.header_key(self.version, suite).unwrap();
+        let _ = pending.remote_header.set(header.as_crypto().unwrap());
+        for packet in &pending.remote_packet {
+            let _ = packet.set(remote.packet_key(self.version, suite).unwrap());
+            remote.update(self.version, suite).unwrap();
+        }
+        self.next_secrets = Some(Secrets {
+            version: self.version,
+            suite,
+            local: pending.local,
+            remote,
+        });
     }
 
     #[inline]
@@ -285,6 +374,7 @@ impl SessionState {
             self.handshaking = !self.ssl.is_init_finished();
 
             self.check_error()?;
+            self.complete_1rtt_keys();
             self.check_ssl_result(result)?;
         }
 
@@ -554,6 +644,17 @@ impl QuicMethod for QuicCallbacks {
     }
 }
 
+/// The application keys of a server between its Finished and the client's, see
+/// [`SessionState::write_handshake`].
+struct Pending1Rtt {
+    suite: &'static CipherSuite,
+    /// The local secret of the generation that [`SessionState::next_1rtt_keys`] hands out next.
+    local: Secret,
+    remote_header: Arc<OnceLock<Box<dyn crypto::HeaderKey>>>,
+    /// The remote packet keys handed out so far, one per generation from the first.
+    remote_packet: Vec<Arc<OnceLock<PacketKey>>>,
+}
+
 pub(crate) struct LevelState {
     pub(crate) builder: SecretsBuilder,
     /// Handshake data to write at the level, allocated once there is some.
@@ -573,7 +674,11 @@ impl LevelState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::btls::{QuicClientConfig, QuicServerConfig};
+    use crate::crypto::{ClientConfig as _, ServerConfig as _, Session};
+    use btls::pkey::PKey;
     use btls::ssl::{SslCipher, SslContextBuilder, SslMethod};
+    use bytes::BytesMut;
 
     fn session() -> SessionState {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
@@ -743,5 +848,105 @@ mod tests {
         assert!(install(&mut state, true, QuicEncryptionLevel::HANDSHAKE, suite).is_err());
         let err = state.read_handshake(&[]).unwrap_err();
         assert!(err.reason.contains("after the keys were derived"), "{err}");
+    }
+
+    /// The server derives its 1-RTT keys with its Finished, so that it can send 0.5-RTT data,
+    /// while the 1-RTT packets of the client only decrypt after the client Finished
+    /// (https://www.rfc-editor.org/rfc/rfc9001#section-5.7).
+    #[test]
+    fn server_1rtt_read_keys_wait_for_client_finished() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = X509::from_der(identity.cert.der()).unwrap();
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        let key = PKey::private_key_from_der(&identity.signing_key.serialize_der()).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.set_alpn_protos(b"\x02h3").unwrap();
+        let server = Arc::new(QuicServerConfig::try_from(builder).unwrap());
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.cert_store_mut().add_cert(cert).unwrap();
+        builder.set_alpn_protos(b"\x02h3").unwrap();
+        let client = Arc::new(QuicClientConfig::try_from(builder).unwrap());
+
+        let params = TransportParameters {
+            initial_src_cid: Some(ConnectionId::new(&[1])),
+            ..TransportParameters::default()
+        };
+        let mut client = client.start_session(1, "localhost", &params).unwrap();
+        let mut server = server.start_session(1, &params);
+
+        let (keys, client_hello) = write(&mut *client);
+        assert!(keys.is_empty());
+        read(&mut *server, client_hello);
+        let (mut keys, server_flight) = write(&mut *server);
+        assert_eq!(keys.len(), 2);
+        let server_1rtt = keys.pop().unwrap();
+        let server_next = server.next_1rtt_keys().unwrap();
+        read(&mut *client, server_flight);
+        let (mut keys, client_finished) = write(&mut *client);
+        assert_eq!(keys.len(), 2);
+        let client_1rtt = keys.pop().unwrap();
+        let client_next = client.next_1rtt_keys().unwrap();
+
+        // 0.5-RTT data reaches the client, whose 1-RTT data the server cannot read yet.
+        assert!(reaches(&server_1rtt, &client_1rtt));
+        assert!(!reaches(&client_1rtt, &server_1rtt));
+
+        // The client Finished completes the keys already handed out, of each generation.
+        read(&mut *server, client_finished);
+        assert!(!server.is_handshaking());
+        assert!(reaches(&client_1rtt, &server_1rtt));
+        assert!(opens(&*client_next.local, &*server_next.remote));
+        assert!(opens(&*server_next.local, &*client_next.remote));
+        let client_next = client.next_1rtt_keys().unwrap();
+        let server_next = server.next_1rtt_keys().unwrap();
+        assert!(opens(&*client_next.local, &*server_next.remote));
+        assert!(opens(&*server_next.local, &*client_next.remote));
+    }
+
+    /// Writes the handshake data of `session`, one chunk per level, and the keys it switched to.
+    fn write(session: &mut dyn Session) -> (Vec<crypto::Keys>, Vec<Vec<u8>>) {
+        let (mut keys, mut chunks) = (Vec::new(), Vec::new());
+        loop {
+            let mut buf = Vec::new();
+            let next = session.write_handshake(&mut buf);
+            if !buf.is_empty() {
+                chunks.push(buf);
+            }
+            match next {
+                Some(next) => keys.push(next),
+                None => return (keys, chunks),
+            }
+        }
+    }
+
+    fn read(session: &mut dyn Session, chunks: Vec<Vec<u8>>) {
+        for chunk in chunks {
+            session.read_handshake(&chunk).unwrap();
+        }
+    }
+
+    /// Returns whether a packet that `from` protects comes out of `to` intact.
+    fn reaches(from: &crypto::Keys, to: &crypto::Keys) -> bool {
+        opens(&*from.packet.local, &*to.packet.remote)
+            && unmasks(&*from.header.local, &*to.header.remote)
+    }
+
+    /// Returns whether a payload that `seal` protects comes out of `open` intact.
+    fn opens(seal: &dyn crypto::PacketKey, open: &dyn crypto::PacketKey) -> bool {
+        let header = [0x43, 0, 0, 0, 7];
+        let mut buf = [&header[..], b"0.5-rtt", &[0; 16]].concat();
+        seal.encrypt(7, &mut buf, header.len());
+        let mut payload = BytesMut::from(&buf[header.len()..]);
+        open.decrypt(7, &header, &mut payload).is_ok() && payload[..] == *b"0.5-rtt"
+    }
+
+    /// Returns whether a header that `mask` protects comes out of `unmask` intact.
+    fn unmasks(mask: &dyn crypto::HeaderKey, unmask: &dyn crypto::HeaderKey) -> bool {
+        let packet: Vec<u8> = (0..32).collect();
+        let mut buf = packet.clone();
+        mask.encrypt(1, &mut buf);
+        unmask.decrypt(1, &mut buf);
+        buf == packet
     }
 }
