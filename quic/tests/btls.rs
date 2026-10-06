@@ -5,14 +5,14 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
 use quic::{
-    ClientConfig, ConnectError, Connection, ConnectionError, Endpoint, ReadError, ReadToEndError,
-    ServerConfig, TransportConfig, TransportErrorCode,
+    ClientConfig, ConnectError, Connection, ConnectionError, Endpoint, Incoming, ReadError,
+    ReadToEndError, ServerConfig, TransportConfig, TransportErrorCode,
     btls::{
         error::ErrorStack,
         pkey::{PKey, Private},
@@ -431,6 +431,39 @@ async fn handshake_data_after_early_data() {
     client.wait_idle().await;
 }
 
+/// A server that validates the client address with a Retry first, and a client that updates the
+/// 1-RTT keys several times, which both sides derive from the application secrets.
+#[tokio::test]
+async fn key_update_and_retry() {
+    let pki = Pki::new();
+    let endpoint = server_endpoint(&pki, &pki.issue("localhost"), false);
+    let server = endpoint.local_addr().unwrap();
+    let retries = Arc::new(AtomicUsize::new(0));
+    let retried = retries.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            if incoming.remote_address_validated() {
+                tokio::spawn(serve_connection(incoming));
+            } else {
+                retried.fetch_add(1, Ordering::Relaxed);
+                incoming.retry().unwrap();
+            }
+        }
+    });
+    let client = client_endpoint(&pki, None);
+
+    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+    assert_eq!(retries.load(Ordering::Relaxed), 1);
+    for round in 0..3u8 {
+        conn.force_key_update();
+        let msg = [round];
+        check_response(&conn, &msg, &request(&conn, &msg).await.unwrap(), &[]);
+    }
+    conn.close(0u32.into(), b"done");
+
+    client.wait_idle().await;
+}
+
 /// A server flight may exceed the 16 KiB a server itself accepts per level.
 #[tokio::test]
 async fn large_certificate_chain() {
@@ -522,24 +555,27 @@ fn serve(endpoint: Endpoint) -> SocketAddr {
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            tokio::spawn(async move {
-                let Ok(conn) = incoming.await else { return };
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    let Ok(request) = recv.read_to_end(1024).await else {
-                        return;
-                    };
-                    let mut response = request;
-                    response.extend(keying_material(&conn));
-                    if conn.peer_identity().is_some() {
-                        response.extend(peer_chain(&conn).concat());
-                    }
-                    send.write_all(&response).await.unwrap();
-                    send.finish().unwrap();
-                }
-            });
+            tokio::spawn(serve_connection(incoming));
         }
     });
     addr
+}
+
+/// Serves the bidirectional streams of one connection, see [`serve`].
+async fn serve_connection(incoming: Incoming) {
+    let Ok(conn) = incoming.await else { return };
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let Ok(request) = recv.read_to_end(1024).await else {
+            return;
+        };
+        let mut response = request;
+        response.extend(keying_material(&conn));
+        if conn.peer_identity().is_some() {
+            response.extend(peer_chain(&conn).concat());
+        }
+        send.write_all(&response).await.unwrap();
+        send.finish().unwrap();
+    }
 }
 
 async fn request(conn: &Connection, msg: &[u8]) -> Result<Vec<u8>, ReadToEndError> {
