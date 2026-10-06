@@ -6,12 +6,16 @@ use crate::crypto::btls::version::QuicVersion;
 use crate::{
     ConnectionId, Side, TransportError, crypto, transport_parameters::TransportParameters,
 };
-use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslVersion};
+use btls::error::ErrorStack;
+use btls::ssl::{Ssl, SslContext, SslContextBuilder, SslRef, SslVersion};
 use bytes::{Bytes, BytesMut};
 use std::any::Any;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use tracing::warn;
+
+/// Configures the [Ssl] of each connection, see [`QuicServerConfig::set_ssl_callback`].
+type SslCallback = dyn Fn(&mut SslRef) -> StdResult<(), ErrorStack> + Send + Sync;
 
 /// Configuration for a server-side QUIC. Wraps around a BoringSSL [SslContext].
 ///
@@ -34,12 +38,27 @@ use tracing::warn;
 /// on the builder. Other callbacks of the builder are kept.
 pub struct QuicServerConfig {
     ctx: SslContext,
+    ssl_callback: Option<Box<SslCallback>>,
 }
 
 impl QuicServerConfig {
     /// Returns the underlying [SslContext] backing all created sessions.
     pub fn ctx(&self) -> &SslContext {
         &self.ctx
+    }
+
+    /// Sets a callback that configures the [Ssl] of each connection with the settings that
+    /// BoringSSL has no [SslContextBuilder] counterpart for, such as
+    /// [`SslRef::add_application_settings`].
+    ///
+    /// It runs before the ClientHello is read, once the connection has its QUIC transport
+    /// parameters and 0-RTT context, which it should leave alone. An error fails the connection
+    /// with an `INTERNAL_ERROR` alert.
+    pub fn set_ssl_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut SslRef) -> StdResult<(), ErrorStack> + Send + Sync + 'static,
+    {
+        self.ssl_callback = Some(Box::new(callback));
     }
 }
 
@@ -53,6 +72,7 @@ impl TryFrom<SslContextBuilder> for QuicServerConfig {
 
         Ok(Self {
             ctx: builder.build(),
+            ssl_callback: None,
         })
     }
 }
@@ -117,8 +137,18 @@ impl Session {
             Err(e) => warn!("0-RTT disabled: failed decoding own transport parameters: {e}"),
         }
 
+        // The trait cannot report a failure to start, so the handshake fails on the ClientHello.
+        let configured = match &cfg.ssl_callback {
+            Some(callback) => callback(&mut ssl),
+            None => Ok(()),
+        };
+        let state = SessionState::new(ssl, Side::Server, version)?;
+        if let Err(e) = configured {
+            state.fail(format!("SSL callback failed: {e}"));
+        }
+
         Ok(Box::new(Self {
-            state: SessionState::new(ssl, Side::Server, version)?,
+            state,
             handshake_data_sent: false,
         }))
     }
