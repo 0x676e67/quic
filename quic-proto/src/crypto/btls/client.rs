@@ -24,25 +24,14 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use tracing::{trace, warn};
 
-/// Per-session settings that are applied to each new [Ssl] instance at handshake time.
-///
-/// These settings cannot be baked into the shared [SslContext] because they are either
-/// per-connection by nature (ECH GREASE) or use a per-`SSL` API (ALPS).
-#[derive(Clone, Default)]
-pub struct SessionSettings {
-    /// ALPS protocol payloads to advertise via `SSL_add_application_settings`.
-    /// Each entry is the raw protocol bytes (e.g. `b"h3"`).
-    pub alps_protocols: Vec<Vec<u8>>,
-    /// Whether to use the new ALPS codepoint (17613) instead of the old one (17513).
-    pub alps_use_new_codepoint: bool,
-    /// Whether to enable ECH GREASE on every outgoing ClientHello.
-    pub enable_ech_grease: bool,
-}
+/// Configures the [Ssl] of each connection, see [`QuicClientConfig::set_ssl_callback`].
+type SslCallback = dyn Fn(&mut SslRef, &str) -> StdResult<(), ErrorStack> + Send + Sync;
 
 /// Configuration for a client-side QUIC. Wraps around a BoringSSL [SslContext].
 ///
 /// It is created from an [SslContextBuilder] with [`TryFrom`]. The builder is the place for
-/// every TLS setting, including those that only exist on [SslContextBuilder], such as:
+/// every TLS setting that BoringSSL keeps on the context, including those that only exist on
+/// [SslContextBuilder], such as:
 /// - [`SslContextBuilder::set_alpn_protos`], which QUIC requires
 ///   ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)): without ALPN
 ///   protocols, BoringSSL cannot build the ClientHello, so the connection fails to start with
@@ -56,13 +45,16 @@ pub struct SessionSettings {
 /// - [`SslContextBuilder::set_early_data_enabled`] to send 0-RTT data with the sessions that
 ///   allow it; without it, sessions are still resumed, in 1-RTT
 ///
+/// Settings that BoringSSL only has per connection, such as ALPS and ECH, go in
+/// [`QuicClientConfig::set_ssl_callback`].
+///
 /// The conversion restricts the context to TLS 1.3 and installs the QUIC callbacks and the session
 /// cache callback, replacing any on the builder. The verification settings and other callbacks of
 /// the builder are kept, except that the server is verified if the builder verifies nothing.
 pub struct QuicClientConfig {
     ctx: SslContext,
     session_cache: Arc<dyn SessionCache>,
-    session_settings: SessionSettings,
+    ssl_callback: Option<Box<SslCallback>>,
 }
 
 impl QuicClientConfig {
@@ -74,14 +66,25 @@ impl QuicClientConfig {
         &self.ctx
     }
 
-    /// Returns the [SessionSettings] applied to each new TLS session.
-    pub fn session_settings(&self) -> &SessionSettings {
-        &self.session_settings
-    }
-
-    /// Returns the [SessionSettings] applied to each new TLS session, mutably.
-    pub fn session_settings_mut(&mut self) -> &mut SessionSettings {
-        &mut self.session_settings
+    /// Sets a callback that configures the [Ssl] of each connection with the settings that
+    /// BoringSSL has no [SslContextBuilder] counterpart for, such as
+    /// [`SslRef::add_application_settings`] and [`SslRef::set_enable_ech_grease`]. It receives
+    /// the server name, and an error fails the connection like other failures to start it.
+    ///
+    /// It runs before the ClientHello is built, once the connection has its QUIC transport
+    /// parameters, server name and certificate verification, which it should leave alone.
+    ///
+    /// A session resumes without authenticating either peer again, and the [SessionCache] keys
+    /// sessions by server name only. So whatever the callback sets for verification or client
+    /// authentication, such as [`SslRef::set_verify`] or [`SslRef::set_certificate`], must follow
+    /// from the server name alone, or the cache must be a [`NoSessionCache`].
+    ///
+    /// [`NoSessionCache`]: crate::crypto::btls::NoSessionCache
+    pub fn set_ssl_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut SslRef, &str) -> StdResult<(), ErrorStack> + Send + Sync + 'static,
+    {
+        self.ssl_callback = Some(Box::new(callback));
     }
 
     /// Gets the [SessionCache] used to cache all client sessions.
@@ -112,7 +115,7 @@ impl TryFrom<SslContextBuilder> for QuicClientConfig {
         Ok(Self {
             ctx: builder.build(),
             session_cache: Arc::new(SimpleCache::new(Self::SESSION_CACHE_SERVERS)),
-            session_settings: SessionSettings::default(),
+            ssl_callback: None,
         })
     }
 }
@@ -173,16 +176,8 @@ impl Session {
 
         ssl.set_quic_transport_params(&encode_params(params))?;
 
-        // Apply per-session settings.
-        let settings = &cfg.session_settings;
-        if settings.enable_ech_grease {
-            ssl.set_enable_ech_grease(true);
-        }
-        for proto in &settings.alps_protocols {
-            ssl.add_application_settings(proto)?;
-        }
-        if !settings.alps_protocols.is_empty() {
-            ssl.set_alps_use_new_codepoint(settings.alps_use_new_codepoint);
+        if let Some(callback) = &cfg.ssl_callback {
+            callback(&mut ssl, server_name)?;
         }
 
         let tickets = TicketCache {
@@ -199,8 +194,9 @@ impl Session {
                     zero_rtt_peer_params = Some(entry.params);
                     // SAFETY: The handshake has not started, and the session was cached for
                     // this server name through the session cache of this configuration, whose
-                    // verification it passed. A cache shared with a configuration that verifies
-                    // differently must not be used.
+                    // verification it passed. The SSL callback must not vary verification or
+                    // client authentication for a server name, and a cache shared with a
+                    // configuration that verifies or authenticates differently must not be used.
                     match unsafe { ssl.set_session(entry.session.as_ref()) } {
                         Ok(()) => {
                             trace!("attempting resumption for server: {}.", server_name);
