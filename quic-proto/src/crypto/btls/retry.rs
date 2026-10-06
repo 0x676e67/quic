@@ -83,6 +83,34 @@ mod test {
         ))
     }
 
+    /// The Retry of RFC 9001 for its client Initial
+    /// (https://www.rfc-editor.org/rfc/rfc9001#appendix-A.4).
+    #[test]
+    fn rfc9001_retry() {
+        let orig_dst_cid = ConnectionId::new(&hex!("8394c8f03e515708"));
+        let header = hex!("ff000000010008f067a5502a4262b5");
+        let token = hex!("746f6b656e");
+        let tag = hex!("04a265ba2eff4d829058fb3f0f2496ba");
+
+        let packet = [&header[..], &token].concat();
+        assert_eq!(retry_tag(&QuicVersion::V1, &orig_dst_cid, &packet), tag);
+
+        let mut payload = [&token[..], &tag].concat();
+        assert!(is_valid_retry(
+            &QuicVersion::V1,
+            &orig_dst_cid,
+            &header,
+            &payload
+        ));
+        payload[0] ^= 1;
+        assert!(!is_valid_retry(
+            &QuicVersion::V1,
+            &orig_dst_cid,
+            &header,
+            &payload
+        ));
+    }
+
     #[test]
     fn test_retry_tag() {
         let orig_dst_cid = ConnectionId::new(&hex!("e080ab63f82458c1fd4d64f66faa9216f3f8b481"));
