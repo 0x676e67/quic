@@ -14,7 +14,7 @@ mod session_state;
 mod suite;
 mod version;
 
-pub use client::{QuicClientConfig, SessionSettings};
+pub use client::QuicClientConfig;
 pub use error::{Error, Result};
 pub use handshake_token::HandshakeTokenKey;
 pub use hmac::HmacKey;

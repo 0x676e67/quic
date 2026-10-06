@@ -11,9 +11,10 @@ use std::{
 
 use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
 use quic::{
-    ClientConfig, Connection, ConnectionError, Endpoint, ReadError, ReadToEndError, ServerConfig,
-    TransportConfig, TransportErrorCode,
+    ClientConfig, ConnectError, Connection, ConnectionError, Endpoint, ReadError, ReadToEndError,
+    ServerConfig, TransportConfig, TransportErrorCode,
     btls::{
+        error::ErrorStack,
         pkey::{PKey, Private},
         ssl::{
             AlpnError, ExtensionType, SslContextBuilder, SslInfoCallbackMode, SslMethod,
@@ -325,6 +326,59 @@ async fn early_data_from_builder() {
         client.wait_idle().await;
     }
     assert_eq!(*resumed.lock().unwrap(), [false, true, false, true]);
+}
+
+/// The SSL callback sets up each connection before its ClientHello, with what BoringSSL only
+/// configures per connection, and its failure fails the connection.
+#[tokio::test]
+async fn ssl_callback() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    // Whether each ClientHello carries ALPS and ECH.
+    let extensions = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = server_builder(&pki, &leaf, false);
+    builder.set_alpn_protos(b"\x02h3").unwrap();
+    let seen = extensions.clone();
+    builder.set_select_certificate_callback(move |hello| {
+        let alps = hello.get_extension(ExtensionType::APPLICATION_SETTINGS);
+        let ech = hello.get_extension(ExtensionType::ENCRYPTED_CLIENT_HELLO);
+        seen.lock().unwrap().push((alps.is_some(), ech.is_some()));
+        Ok(())
+    });
+    let crypto = QuicServerConfig::try_from(builder).unwrap();
+    let config = ServerConfig::with_crypto(Arc::new(crypto));
+    let server = serve(Endpoint::server(config, localhost()).unwrap());
+    let client = Endpoint::client(localhost()).unwrap();
+
+    let server_names = Arc::new(Mutex::new(Vec::new()));
+    let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+    let names = server_names.clone();
+    crypto.set_ssl_callback(move |ssl, server_name| {
+        names.lock().unwrap().push(server_name.to_owned());
+        ssl.add_application_settings(b"h3")?;
+        ssl.set_alps_use_new_codepoint(true);
+        ssl.set_enable_ech_grease(true);
+        Ok(())
+    });
+    let config = ClientConfig::new(Arc::new(crypto));
+    let conn = client
+        .connect_with(config, server, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    conn.close(0u32.into(), b"done");
+    assert_eq!(*server_names.lock().unwrap(), ["localhost"]);
+    assert_eq!(*extensions.lock().unwrap(), [(true, true)]);
+
+    let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+    crypto.set_ssl_callback(|_, _| Err(ErrorStack::get()));
+    let config = ClientConfig::new(Arc::new(crypto));
+    let err = client
+        .connect_with(config, server, "localhost")
+        .unwrap_err();
+    assert!(matches!(err, ConnectError::EndpointStopping), "{err:?}");
+
+    client.wait_idle().await;
 }
 
 /// A server flight may exceed the 16 KiB a server itself accepts per level.
