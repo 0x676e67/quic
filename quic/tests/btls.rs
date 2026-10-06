@@ -464,6 +464,57 @@ async fn key_update_and_retry() {
     client.wait_idle().await;
 }
 
+/// A session cache shared between configurations only resumes a session with the configuration
+/// that verified it, since another may verify the server, or authenticate the client, differently.
+#[tokio::test]
+async fn session_cache_shared_between_configs() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    // Why each handshake did or did not use 0-RTT, as the server sees it.
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = server_builder(&pki, &leaf, false);
+    builder.set_alpn_protos(b"\x02h3").unwrap();
+    let seen = reasons.clone();
+    builder.set_info_callback(move |ssl, mode, _| {
+        if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+            seen.lock().unwrap().push(ssl.early_data_reason());
+        }
+    });
+    let crypto = QuicServerConfig::try_from(builder).unwrap();
+    let config = ServerConfig::with_crypto(Arc::new(crypto));
+    let server = serve(Endpoint::server(config, localhost()).unwrap());
+
+    let cache = Arc::new(SimpleCache::new(NonZeroUsize::new(2).unwrap()));
+    let config = || {
+        let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+        crypto.set_session_cache(cache.clone());
+        ClientConfig::new(Arc::new(crypto))
+    };
+    let (a, b) = (config(), config());
+    let client = Endpoint::client(localhost()).unwrap();
+
+    // A caches a session, which B does not find, and A then resumes.
+    for config in [&a, &b, &a] {
+        let conn = client
+            .connect_with(config.clone(), server, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        request(&conn, b"1-rtt").await.unwrap();
+        conn.close(0u32.into(), b"done");
+    }
+    assert_eq!(
+        *reasons.lock().unwrap(),
+        [
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::ACCEPTED,
+        ]
+    );
+
+    client.wait_idle().await;
+}
+
 /// A server flight may exceed the 16 KiB a server itself accepts per level.
 #[tokio::test]
 async fn large_certificate_chain() {

@@ -9,7 +9,11 @@ use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use zeroize::Zeroizing;
 
-/// A client-side session cache for the btls crypto provider, keyed by server name.
+/// A client-side session cache for the btls crypto provider.
+///
+/// Keys are opaque: they combine the server name with the configuration that cached the session,
+/// so a cache shared between configurations only resumes a session with the one that verified it.
+/// They are meaningless to another process.
 ///
 /// Values are encoded sessions, which hold resumption secrets. A session resumes at most one
 /// connection ([RFC 8446 §C.4](https://www.rfc-editor.org/rfc/rfc8446#appendix-C.4)), so
