@@ -17,8 +17,8 @@ use quic::{
         error::ErrorStack,
         pkey::{PKey, Private},
         ssl::{
-            AlpnError, ExtensionType, SslContextBuilder, SslInfoCallbackMode, SslMethod,
-            SslVerifyError, SslVerifyMode, select_next_proto,
+            AlpnError, EarlyDataReason, ExtensionType, SslContextBuilder, SslInfoCallbackMode,
+            SslMethod, SslVerifyError, SslVerifyMode, select_next_proto,
         },
         x509::X509,
     },
@@ -377,6 +377,56 @@ async fn ssl_callback() {
         .connect_with(config, server, "localhost")
         .unwrap_err();
     assert!(matches!(err, ConnectError::EndpointStopping), "{err:?}");
+
+    client.wait_idle().await;
+}
+
+/// The client reports its handshake data with the protocol the server selected, not the one of
+/// the session it attempts 0-RTT with.
+#[tokio::test]
+async fn handshake_data_after_early_data() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    // Why each handshake did or did not use 0-RTT, as the servers see it.
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let server = |alpn: &[u8]| {
+        let mut builder = server_builder(&pki, &leaf, false);
+        builder.set_alpn_protos(alpn).unwrap();
+        let seen = reasons.clone();
+        builder.set_info_callback(move |ssl, mode, _| {
+            if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+                seen.lock().unwrap().push(ssl.early_data_reason());
+            }
+        });
+        let crypto = QuicServerConfig::try_from(builder).unwrap();
+        let config = ServerConfig::with_crypto(Arc::new(crypto));
+        serve(Endpoint::server(config, localhost()).unwrap())
+    };
+    let h3 = server(b"\x02h3");
+    // Another server, with its own ticket keys, that only speaks hq.
+    let hq = server(b"\x02hq");
+    let mut builder = client_builder(&pki, None);
+    builder.set_alpn_protos(b"\x02h3\x02hq").unwrap();
+    let client = client_endpoint_with(builder, Arc::new(SimpleCache::new(NonZeroUsize::MIN)));
+
+    // A full handshake, then 0-RTT that h3 accepts, then 0-RTT that hq cannot resume.
+    for (server, protocol) in [(h3, b"h3"), (h3, b"h3"), (hq, b"hq")] {
+        let mut connecting = client.connect(server, "localhost").unwrap();
+        let data = connecting.handshake_data().await.unwrap();
+        let data = data.downcast::<HandshakeData>().unwrap();
+        assert_eq!(data.protocol.as_deref(), Some(&protocol[..]));
+        let conn = connecting.await.unwrap();
+        request(&conn, b"1-rtt").await.unwrap();
+        conn.close(0u32.into(), b"done");
+    }
+    assert_eq!(
+        *reasons.lock().unwrap(),
+        [
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::ACCEPTED,
+            EarlyDataReason::SESSION_NOT_RESUMED,
+        ]
+    );
 
     client.wait_idle().await;
 }
