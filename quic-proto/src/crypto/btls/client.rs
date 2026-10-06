@@ -30,7 +30,8 @@ type SslCallback = dyn Fn(&mut SslRef, &str) -> StdResult<(), ErrorStack> + Send
 /// Configuration for a client-side QUIC. Wraps around a BoringSSL [SslContext].
 ///
 /// It is created from an [SslContextBuilder] with [`TryFrom`]. The builder is the place for
-/// every TLS setting, including those that only exist on [SslContextBuilder], such as:
+/// every TLS setting that BoringSSL keeps on the context, including those that only exist on
+/// [SslContextBuilder], such as:
 /// - [`SslContextBuilder::set_alpn_protos`], which QUIC requires
 ///   ([RFC 9001 §8.1](https://www.rfc-editor.org/rfc/rfc9001#section-8.1)): without ALPN
 ///   protocols, BoringSSL cannot build the ClientHello, so the connection fails to start with
@@ -72,6 +73,13 @@ impl QuicClientConfig {
     ///
     /// It runs before the ClientHello is built, once the connection has its QUIC transport
     /// parameters, server name and certificate verification, which it should leave alone.
+    ///
+    /// A session resumes without authenticating either peer again, and the [SessionCache] keys
+    /// sessions by server name only. So whatever the callback sets for verification or client
+    /// authentication, such as [`SslRef::set_verify`] or [`SslRef::set_certificate`], must follow
+    /// from the server name alone, or the cache must be a [`NoSessionCache`].
+    ///
+    /// [`NoSessionCache`]: crate::crypto::btls::NoSessionCache
     pub fn set_ssl_callback<F>(&mut self, callback: F)
     where
         F: Fn(&mut SslRef, &str) -> StdResult<(), ErrorStack> + Send + Sync + 'static,
@@ -186,8 +194,9 @@ impl Session {
                     zero_rtt_peer_params = Some(entry.params);
                     // SAFETY: The handshake has not started, and the session was cached for
                     // this server name through the session cache of this configuration, whose
-                    // verification it passed. A cache shared with a configuration that verifies
-                    // differently must not be used.
+                    // verification it passed. The SSL callback must not vary verification or
+                    // client authentication for a server name, and a cache shared with a
+                    // configuration that verifies or authenticates differently must not be used.
                     match unsafe { ssl.set_session(entry.session.as_ref()) } {
                         Ok(()) => {
                             trace!("attempting resumption for server: {}.", server_name);
