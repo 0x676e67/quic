@@ -20,8 +20,8 @@ use std::io::Cursor;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::result::Result as StdResult;
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use tracing::{trace, warn};
 
 /// Configures the [Ssl] of each connection, see [`QuicClientConfig::set_ssl_callback`].
@@ -54,6 +54,9 @@ type SslCallback = dyn Fn(&mut SslRef, &str) -> StdResult<(), ErrorStack> + Send
 pub struct QuicClientConfig {
     ctx: SslContext,
     session_cache: Arc<dyn SessionCache>,
+    /// Keeps the sessions of this configuration apart from those of others in a shared
+    /// [SessionCache], since a session resumes without authenticating either peer again.
+    cache_scope: u64,
     ssl_callback: Option<Box<SslCallback>>,
 }
 
@@ -74,10 +77,11 @@ impl QuicClientConfig {
     /// It runs before the ClientHello is built, once the connection has its QUIC transport
     /// parameters, server name and certificate verification, which it should leave alone.
     ///
-    /// A session resumes without authenticating either peer again, and the [SessionCache] keys
-    /// sessions by server name only. So whatever the callback sets for verification or client
-    /// authentication, such as [`SslRef::set_verify`] or [`SslRef::set_certificate`], must follow
-    /// from the server name alone, or the cache must be a [`NoSessionCache`].
+    /// A session resumes without authenticating either peer again, and within a configuration
+    /// the [SessionCache] keys sessions by server name only. So whatever the callback sets for
+    /// verification or client authentication, such as [`SslRef::set_verify`] or
+    /// [`SslRef::set_certificate`], must follow from the server name alone, or the cache must be
+    /// a [`NoSessionCache`].
     ///
     /// [`NoSessionCache`]: crate::crypto::btls::NoSessionCache
     pub fn set_ssl_callback<F>(&mut self, callback: F)
@@ -93,6 +97,9 @@ impl QuicClientConfig {
     }
 
     /// Sets the [SessionCache] to be shared by all created client sessions.
+    ///
+    /// Other configurations may share the cache, but only resume the sessions they cached
+    /// themselves.
     pub fn set_session_cache(&mut self, session_cache: Arc<dyn SessionCache>) {
         self.session_cache = session_cache;
     }
@@ -112,9 +119,11 @@ impl TryFrom<SslContextBuilder> for QuicClientConfig {
         builder.set_new_session_callback(Session::on_new_session);
         builder.set_quic_method(QuicCallbacks)?;
 
+        static NEXT_CACHE_SCOPE: AtomicU64 = AtomicU64::new(0);
         Ok(Self {
             ctx: builder.build(),
             session_cache: Arc::new(SimpleCache::new(Self::SESSION_CACHE_SERVERS)),
+            cache_scope: NEXT_CACHE_SCOPE.fetch_add(1, Ordering::Relaxed),
             ssl_callback: None,
         })
     }
@@ -180,23 +189,24 @@ impl Session {
             callback(&mut ssl, server_name)?;
         }
 
+        let key = [&cfg.cache_scope.to_be_bytes()[..], server_name.as_bytes()].concat();
         let tickets = TicketCache {
             cache: cfg.session_cache.clone(),
-            server_name: Bytes::copy_from_slice(server_name.as_bytes()),
+            key: Bytes::from(key),
         };
 
         // Resume a cached session. Taking it out of the cache keeps it to this connection, and
         // BoringSSL does not offer it once expired.
         let mut zero_rtt_peer_params = None;
-        if let Some(entry) = tickets.cache.take(&tickets.server_name) {
+        if let Some(entry) = tickets.cache.take(&tickets.key) {
             match Entry::decode(&entry) {
                 Ok(entry) => {
                     zero_rtt_peer_params = Some(entry.params);
                     // SAFETY: The handshake has not started, and the session was cached for
-                    // this server name through the session cache of this configuration, whose
-                    // verification it passed. The SSL callback must not vary verification or
-                    // client authentication for a server name, and a cache shared with a
-                    // configuration that verifies or authenticates differently must not be used.
+                    // this server name by this configuration, whose verification it passed: the
+                    // cache scope keeps out the sessions of other configurations. The SSL
+                    // callback must not vary verification or client authentication for a server
+                    // name.
                     match unsafe { ssl.set_session(entry.session.as_ref()) } {
                         Ok(()) => {
                             trace!("attempting resumption for server: {}.", server_name);
@@ -351,7 +361,8 @@ impl crypto::Session for Session {
 #[derive(Clone)]
 struct TicketCache {
     cache: Arc<dyn SessionCache>,
-    server_name: Bytes,
+    /// The cache scope of the configuration, followed by the server name.
+    key: Bytes,
 }
 
 impl TicketCache {
@@ -377,7 +388,7 @@ impl TicketCache {
         // Encode the session cache entry, including both the session and the server params.
         let entry = Entry { session, params };
         match entry.encode() {
-            Ok(value) => self.cache.put(self.server_name.clone(), value),
+            Ok(value) => self.cache.put(self.key.clone(), value),
             Err(e) => {
                 warn!("failed caching session: unable to encode entry: {:?}", e);
             }
