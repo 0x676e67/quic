@@ -384,7 +384,7 @@ impl TransportParameters {
 
     /// Encodes the parameters that [`Self::validate_resumption_from`] checks, for a TLS stack
     /// that rejects 0-RTT when a ticket was issued under a different context
-    /// (https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1).
+    /// (<https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1>).
     ///
     /// A custom parameter list may omit a field or send another value for it, so the context
     /// holds the values a client decodes from these parameters, not the fields.
