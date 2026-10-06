@@ -19,7 +19,7 @@ use quic::{
         pkey::{PKey, Private},
         ssl::{
             AlpnError, EarlyDataReason, ExtensionType, SslContextBuilder, SslInfoCallbackMode,
-            SslMethod, SslVerifyError, SslVerifyMode, select_next_proto,
+            SslMethod, SslRef, SslVerifyError, SslVerifyMode, select_next_proto,
         },
         x509::X509,
     },
@@ -433,6 +433,90 @@ async fn handshake_data_after_early_data() {
     client.wait_idle().await;
 }
 
+/// Both sides report what the handshake negotiated, including the ALPS settings that each
+/// configures per connection, and a failing server SSL callback fails the handshake.
+#[tokio::test]
+async fn handshake_data_reports_negotiation() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    let alps = |ssl: &mut SslRef, settings: &[u8]| {
+        ssl.set_alps_use_new_codepoint(true);
+        ssl.add_application_settings(b"h3", Some(settings))
+    };
+    let mut crypto = server_crypto(&pki, &leaf, false);
+    crypto.set_ssl_callback(move |ssl| alps(ssl, b"server"));
+    let endpoint = Endpoint::server(ServerConfig::with_crypto(Arc::new(crypto)), localhost());
+    let endpoint = endpoint.unwrap();
+    let server = endpoint.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server_seen = seen.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let Ok(conn) = incoming.await else { continue };
+            server_seen.lock().unwrap().push(handshake_data(&conn));
+            tokio::spawn(serve_streams(conn));
+        }
+    });
+    let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+    crypto.set_ssl_callback(move |ssl, _| alps(ssl, b"client"));
+    crypto.set_session_cache(Arc::new(SimpleCache::new(NonZeroUsize::MIN)));
+    let client = Endpoint::client(localhost()).unwrap();
+    client.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+
+    // A full handshake, then 0-RTT with its session.
+    for (resumed, reason) in [
+        (false, EarlyDataReason::NO_SESSION_OFFERED),
+        (true, EarlyDataReason::ACCEPTED),
+    ] {
+        let conn = match client.connect(server, "localhost").unwrap().into_0rtt() {
+            Ok(conn) => conn,
+            Err(connecting) => connecting.await.unwrap(),
+        };
+        request(&conn, b"request").await.unwrap();
+        let client_data = handshake_data(&conn);
+        let server_data = seen.lock().unwrap().pop().unwrap();
+        assert!(client_data.cipher_suite.is_some());
+        assert_eq!(client_data.cipher_suite, server_data.cipher_suite);
+        assert!(client_data.group.is_some());
+        assert_eq!(client_data.group, server_data.group);
+        // Only the server authenticates with a certificate.
+        assert!(client_data.peer_signature_algorithm.is_some());
+        assert_eq!(server_data.peer_signature_algorithm, None);
+        for data in [&client_data, &server_data] {
+            assert_eq!(data.resumed, resumed);
+            assert_eq!(data.early_data_reason, reason);
+            assert!(!data.ech_accepted);
+        }
+        assert_eq!(
+            client_data.peer_application_settings.as_deref(),
+            Some(&b"server"[..])
+        );
+        assert_eq!(
+            server_data.peer_application_settings.as_deref(),
+            Some(&b"client"[..])
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    let mut crypto = server_crypto(&pki, &leaf, false);
+    crypto.set_ssl_callback(|ssl| ssl.set_curves_list("unknown"));
+    let failing =
+        serve(Endpoint::server(ServerConfig::with_crypto(Arc::new(crypto)), localhost()).unwrap());
+    // Another client, since a connection the server closes drains without an RTT sample.
+    let other = client_endpoint(&pki, None);
+    let err = other
+        .connect(failing, "localhost")
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConnectionError::ConnectionClosed(close) if close.error_code == TransportErrorCode::crypto(INTERNAL_ERROR)),
+        "{err:?}"
+    );
+
+    client.wait_idle().await;
+}
+
 /// A server that validates the client address with a Retry first, and a client that updates the
 /// 1-RTT keys several times, which both sides derive from the application secrets.
 #[tokio::test]
@@ -698,7 +782,13 @@ fn serve(endpoint: Endpoint) -> SocketAddr {
 
 /// Serves the bidirectional streams of one connection, see [`serve`].
 async fn serve_connection(incoming: Incoming) {
-    let Ok(conn) = incoming.await else { return };
+    if let Ok(conn) = incoming.await {
+        serve_streams(conn).await;
+    }
+}
+
+/// Serves the bidirectional streams of `conn`, see [`serve`].
+async fn serve_streams(conn: Connection) {
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
         let Ok(request) = recv.read_to_end(1024).await else {
             return;
@@ -740,6 +830,13 @@ fn keying_material(conn: &Connection) -> [u8; 32] {
     conn.export_keying_material(without_context, b"EXPORTER-test", b"")
         .unwrap();
     out
+}
+
+fn handshake_data(conn: &Connection) -> Box<HandshakeData> {
+    conn.handshake_data()
+        .unwrap()
+        .downcast::<HandshakeData>()
+        .unwrap()
 }
 
 fn peer_chain(conn: &Connection) -> Vec<Vec<u8>> {

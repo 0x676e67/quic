@@ -76,6 +76,8 @@ impl QuicClientConfig {
     ///
     /// It runs before the ClientHello is built, once the connection has its QUIC transport
     /// parameters, server name and certificate verification, which it should leave alone.
+    /// What the handshake then negotiated, such as the server's ALPS settings, is in
+    /// [`HandshakeData`](super::HandshakeData).
     ///
     /// A session resumes without authenticating either peer again, and within a configuration
     /// the [SessionCache] keys sessions by server name only. So whatever the callback sets for

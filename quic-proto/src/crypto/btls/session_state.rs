@@ -134,6 +134,13 @@ impl SessionState {
             Some(Box::new(HandshakeData {
                 protocol: alpn_protocol,
                 server_name: sni_name,
+                cipher_suite: self.ssl.current_cipher().map(|cipher| cipher.protocol_id()),
+                group: self.ssl.curve(),
+                peer_signature_algorithm: self.ssl.peer_signature_algorithm(),
+                resumed: self.ssl.session_reused(),
+                early_data_reason: self.ssl.early_data_reason(),
+                ech_accepted: self.ssl.ech_accepted(),
+                peer_application_settings: self.ssl.peer_application_settings().map(Vec::from),
             }))
         }
     }
@@ -384,6 +391,13 @@ impl SessionState {
             return self.check_ssl_result(result);
         }
         Ok(())
+    }
+
+    /// Fails the handshake with an `INTERNAL_ERROR` alert at the next call into it.
+    pub(crate) fn fail(&self, reason: String) {
+        lock(&self.quic).error.get_or_insert_with(|| {
+            TransportError::new(alert_code(SslAlert::INTERNAL_ERROR), reason)
+        });
     }
 
     #[inline]
