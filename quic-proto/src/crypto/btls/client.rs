@@ -298,8 +298,12 @@ impl crypto::Session for Session {
         }
 
         // Only indicate that handshake data is available once, when the server has selected
-        // the ALPN protocol.
-        if !self.handshake_data_sent && self.state.ssl.selected_alpn_protocol().is_some() {
+        // the ALPN protocol. During 0-RTT, BoringSSL reports the protocol of the session
+        // instead, which the server only confirms by accepting 0-RTT, and may replace by
+        // rejecting it.
+        let ssl = &self.state.ssl;
+        let predicted = ssl.in_early_data() && !ssl.early_data_accepted();
+        if !self.handshake_data_sent && !predicted && ssl.selected_alpn_protocol().is_some() {
             self.handshake_data_sent = true;
             return Ok(true);
         }
