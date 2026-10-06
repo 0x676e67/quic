@@ -660,6 +660,37 @@ mod tests {
         assert_eq!(body[..], payload);
     }
 
+    /// A key update of the secret of the ChaCha20-Poly1305 sample
+    /// (https://www.rfc-editor.org/rfc/rfc9001#appendix-A.5), and the generations of packet keys
+    /// that follow from it.
+    #[test]
+    fn key_update() {
+        let suite = CipherSuite::chacha20_poly1305_sha256();
+        let secret = Secret::from(&hex!(
+            "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"
+        ));
+        let mut updated = secret.clone();
+        updated.update(QuicVersion::V1, suite).unwrap();
+        assert_eq!(
+            updated.slice(),
+            hex!("1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9")
+        );
+
+        // Each call hands out the current generation and moves on to the next one.
+        let mut secrets = Secrets {
+            version: QuicVersion::V1,
+            suite,
+            local: secret.clone(),
+            remote: secret,
+        };
+        let current = secrets.next_packet_keys().unwrap();
+        assert_eq!(current.local.iv().slice(), hex!("e0459b3474bdd0e44a41c144"));
+        let next = secrets.next_packet_keys().unwrap();
+        let expected = updated.packet_key(QuicVersion::V1, suite).unwrap();
+        assert_eq!(next.local.iv().slice(), expected.iv().slice());
+        assert_eq!(next.remote.iv().slice(), expected.iv().slice());
+    }
+
     #[test]
     fn debug_omits_key_material() {
         let suite = CipherSuite::aes128_gcm_sha256();
