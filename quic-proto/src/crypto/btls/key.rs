@@ -11,6 +11,7 @@ use bytes::BytesMut;
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::result::Result as StdResult;
+use std::sync::{Arc, OnceLock};
 
 const SAMPLE_LEN: usize = 16; // 128-bits.
 
@@ -81,6 +82,79 @@ impl Keys {
             header: self.header.as_crypto()?,
             packet: self.packet.into_crypto(),
         })
+    }
+}
+
+/// A remote key handed out before BoringSSL installs its secret, as a server's 1-RTT read key
+/// is until the client Finished. Until the key is set, packets fail to decrypt and are dropped,
+/// as [RFC 9001 §5.7](https://www.rfc-editor.org/rfc/rfc9001#section-5.7) allows.
+pub(crate) struct DeferredKey<T> {
+    suite: &'static CipherSuite,
+    key: Arc<OnceLock<T>>,
+}
+
+impl<T> DeferredKey<T> {
+    pub(crate) fn new(suite: &'static CipherSuite, key: Arc<OnceLock<T>>) -> Self {
+        Self { suite, key }
+    }
+}
+
+impl crypto::HeaderKey for DeferredKey<Box<dyn crypto::HeaderKey>> {
+    #[inline]
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        // Without the key, the header stays protected and the packet fails to decrypt.
+        if let Some(key) = self.key.get() {
+            key.decrypt(pn_offset, packet)
+        }
+    }
+
+    #[inline]
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        if let Some(key) = self.key.get() {
+            key.encrypt(pn_offset, packet)
+        }
+    }
+
+    #[inline]
+    fn sample_size(&self) -> usize {
+        SAMPLE_LEN
+    }
+}
+
+impl crypto::PacketKey for DeferredKey<PacketKey> {
+    #[inline]
+    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
+        if let Some(key) = self.key.get() {
+            key.encrypt(packet, buf, header_len)
+        }
+    }
+
+    #[inline]
+    fn decrypt(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut BytesMut,
+    ) -> StdResult<(), crypto::CryptoError> {
+        self.key
+            .get()
+            .ok_or(crypto::CryptoError)?
+            .decrypt(packet, header, payload)
+    }
+
+    #[inline]
+    fn tag_len(&self) -> usize {
+        self.suite.aead.tag_len
+    }
+
+    #[inline]
+    fn confidentiality_limit(&self) -> u64 {
+        self.suite.confidentiality_limit
+    }
+
+    #[inline]
+    fn integrity_limit(&self) -> u64 {
+        self.suite.integrity_limit
     }
 }
 

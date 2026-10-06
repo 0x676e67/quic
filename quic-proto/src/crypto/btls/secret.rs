@@ -5,6 +5,7 @@ use crate::crypto::btls::macros::secret_array;
 use crate::crypto::btls::suite::CipherSuite;
 use crate::crypto::btls::version::QuicVersion;
 use crate::{ConnectionId, Side};
+use std::mem;
 
 const MAX_SECRET_LEN: usize = hkdf::DIGEST_BLOCK_LEN;
 
@@ -149,10 +150,8 @@ impl Secrets {
 pub(crate) struct SecretsBuilder {
     version: QuicVersion,
     suite: Option<&'static CipherSuite>,
-    local_secret: Option<Secret>,
-    remote_secret: Option<Secret>,
-    /// Whether the secrets were taken: nothing derives keys from one installed later.
-    taken: bool,
+    local: Slot,
+    remote: Slot,
 }
 
 impl SecretsBuilder {
@@ -160,9 +159,8 @@ impl SecretsBuilder {
         Self {
             version,
             suite: None,
-            local_secret: None,
-            remote_secret: None,
-            taken: false,
+            local: Slot::Empty,
+            remote: Slot::Empty,
         }
     }
 
@@ -178,52 +176,82 @@ impl SecretsBuilder {
         }
     }
 
-    // BoringSSL installs each secret at most once per level
-    // (see `SSL_QUIC_METHOD` in `openssl/ssl.h`).
     pub(crate) fn set_remote_secret(&mut self, secret: Secret) -> Result<()> {
-        Self::set_secret(self.taken, &mut self.remote_secret, secret)
+        self.remote.install(secret)
     }
 
     pub(crate) fn set_local_secret(&mut self, secret: Secret) -> Result<()> {
-        Self::set_secret(self.taken, &mut self.local_secret, secret)
-    }
-
-    fn set_secret(taken: bool, slot: &mut Option<Secret>, secret: Secret) -> Result<()> {
-        if taken {
-            return Err(Error::other(
-                "secret installed after the keys were derived".into(),
-            ));
-        }
-        if slot.is_some() {
-            return Err(Error::other("secret installed twice".into()));
-        }
-        *slot = Some(secret);
-        Ok(())
+        self.local.install(secret)
     }
 
     /// Takes the secrets once both are installed.
     pub(crate) fn take(&mut self) -> Option<Secrets> {
         let suite = self.suite?;
-        if self.local_secret.is_none() || self.remote_secret.is_none() {
+        if !self.local.is_installed() || !self.remote.is_installed() {
             return None;
         }
-        self.taken = true;
         Some(Secrets {
             version: self.version,
             suite,
-            local: self.local_secret.take()?,
-            remote: self.remote_secret.take()?,
+            local: self.local.take()?,
+            remote: self.remote.take()?,
         })
+    }
+
+    /// Takes the local secret alone, as a server does with the 1-RTT one before the client
+    /// Finished.
+    pub(crate) fn take_local(&mut self) -> Option<(&'static CipherSuite, Secret)> {
+        Some((self.suite?, self.local.take()?))
+    }
+
+    /// Takes the remote secret alone, see [`Self::take_local`].
+    pub(crate) fn take_remote(&mut self) -> Option<(&'static CipherSuite, Secret)> {
+        Some((self.suite?, self.remote.take()?))
     }
 
     /// Takes the 0-RTT secret, which only the client writes with and only the server reads with.
     pub(crate) fn take_early(&mut self, side: Side) -> Option<(&'static CipherSuite, Secret)> {
-        let suite = self.suite?;
-        let secret = match side {
-            Side::Client => self.local_secret.take()?,
-            Side::Server => self.remote_secret.take()?,
-        };
-        self.taken = true;
-        Some((suite, secret))
+        match side {
+            Side::Client => self.take_local(),
+            Side::Server => self.take_remote(),
+        }
+    }
+}
+
+/// The secret of one direction of a level. BoringSSL installs each at most once per level
+/// (see `SSL_QUIC_METHOD` in `openssl/ssl.h`).
+enum Slot {
+    Empty,
+    Installed(Secret),
+    /// The keys were derived, and nothing derives keys from a secret installed later.
+    Taken,
+}
+
+impl Slot {
+    fn install(&mut self, secret: Secret) -> Result<()> {
+        match self {
+            Self::Empty => {
+                *self = Self::Installed(secret);
+                Ok(())
+            }
+            Self::Installed(_) => Err(Error::other("secret installed twice".into())),
+            Self::Taken => Err(Error::other(
+                "secret installed after the keys were derived".into(),
+            )),
+        }
+    }
+
+    fn is_installed(&self) -> bool {
+        matches!(self, Self::Installed(_))
+    }
+
+    fn take(&mut self) -> Option<Secret> {
+        if !self.is_installed() {
+            return None;
+        }
+        match mem::replace(self, Self::Taken) {
+            Self::Installed(secret) => Some(secret),
+            _ => None,
+        }
     }
 }
