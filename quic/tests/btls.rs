@@ -355,7 +355,7 @@ async fn ssl_callback() {
     let names = server_names.clone();
     crypto.set_ssl_callback(move |ssl, server_name| {
         names.lock().unwrap().push(server_name.to_owned());
-        ssl.add_application_settings(b"h3")?;
+        ssl.add_application_settings(b"h3", None)?;
         ssl.set_alps_use_new_codepoint(true);
         ssl.set_enable_ech_grease(true);
         Ok(())

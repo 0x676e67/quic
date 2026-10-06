@@ -281,7 +281,7 @@ version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03367707e92796b190a4207d4d39b0a4271d574503d2969c2b0cfbf5c87658ee"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cc",
  "cmake",
  "dunce",
@@ -412,6 +412,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.73.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 2.0.1",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -442,7 +459,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?rev=ab50fb630c22760880a6d5bbeebd4089a2abf06e#ab50fb630c22760880a6d5bbeebd4089a2abf06e"
+source = "git+https://github.com/0x676e67/btls?rev=202c4ba6f88d1f17b7737b3b751704f54e88d1af#202c4ba6f88d1f17b7737b3b751704f54e88d1af"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -454,9 +471,9 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?rev=ab50fb630c22760880a6d5bbeebd4089a2abf06e#ab50fb630c22760880a6d5bbeebd4089a2abf06e"
+source = "git+https://github.com/0x676e67/btls?rev=202c4ba6f88d1f17b7737b3b751704f54e88d1af#202c4ba6f88d1f17b7737b3b751704f54e88d1af"
 dependencies = [
- "bindgen",
+ "bindgen 0.73.2",
  "cmake",
  "fs_extra",
  "fslock",
