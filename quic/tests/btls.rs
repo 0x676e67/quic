@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
@@ -26,6 +27,7 @@ use quic::{
         HandshakeData, QuicClientConfig, QuicServerConfig, SessionCache, SimpleCache, Zeroizing,
     },
 };
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn handshake_resumption_and_early_data() {
@@ -458,6 +460,88 @@ async fn key_update_and_retry() {
         conn.force_key_update();
         let msg = [round];
         check_response(&conn, &msg, &request(&conn, &msg).await.unwrap(), &[]);
+    }
+    conn.close(0u32.into(), b"done");
+
+    client.wait_idle().await;
+}
+
+/// After 0-RTT is rejected, new streams reuse the IDs of rejected ones, whose handles must not act
+/// on them.
+#[tokio::test]
+async fn rejected_0rtt_stream_ids_reused() {
+    let pki = Pki::new();
+    let leaf = pki.issue("localhost");
+    let server = serve(server_endpoint(&pki, &leaf, false));
+    // Another server cannot resume the first one's sessions, so it rejects 0-RTT. Its small stream
+    // window and late reads keep both halves of the new streams blocked while the rejected
+    // handles are used and dropped.
+    let mut transport = TransportConfig::default();
+    transport.stream_receive_window(8u32.into());
+    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto(&pki, &leaf, false)));
+    config.transport_config(Arc::new(transport));
+    let endpoint = Endpoint::server(config, localhost()).unwrap();
+    let other_server = endpoint.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let Ok(conn) = incoming.await else { continue };
+            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let Ok(request) = recv.read_to_end(1024).await else {
+                        return;
+                    };
+                    let _ = send.write_all(&request).await;
+                    let _ = send.finish();
+                });
+            }
+        }
+    });
+    let client = client_endpoint(&pki, None);
+    let conn = client.connect(server, "localhost").unwrap().await.unwrap();
+    request(&conn, b"ticket").await.unwrap();
+    conn.close(0u32.into(), b"done");
+
+    let conn = client
+        .connect(other_server, "localhost")
+        .unwrap()
+        .into_0rtt()
+        .expect("resumable ticket");
+    let mut rejected = Vec::new();
+    for stop in [true, false] {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"0-rtt").await.unwrap();
+        if stop {
+            recv.stop(0u32.into()).unwrap();
+        }
+        rejected.push((send, recv));
+    }
+    conn.authenticated().await.unwrap();
+    let mut exchanges = Vec::new();
+    for (send, _) in &rejected {
+        let (mut send_1rtt, mut recv_1rtt) = conn.open_bi().await.unwrap();
+        assert_eq!(send_1rtt.id(), send.id());
+        // Separate tasks, so that waking one half does not poll the other.
+        exchanges.push(tokio::spawn(async move {
+            send_1rtt.write_all(&[7; 64]).await.unwrap();
+            send_1rtt.finish().unwrap();
+        }));
+        exchanges.push(tokio::spawn(async move {
+            assert_eq!(recv_1rtt.read_to_end(1024).await.unwrap(), [7; 64]);
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for (send, _) in &mut rejected {
+        assert!(send.finish().is_err());
+        assert!(send.set_priority(1).is_err());
+        assert!(send.priority().is_err());
+    }
+    drop(rejected);
+    for exchange in exchanges {
+        timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("1-RTT exchange")
+            .unwrap();
     }
     conn.close(0u32.into(), b"done");
 
