@@ -6,6 +6,7 @@ use crate::{
     ConnectionId, Side, TransportError, TransportErrorCode, crypto,
     transport_parameters::TransportParameters,
 };
+use btls::error::ErrorStack;
 use btls::ex_data::Index;
 use btls::ssl::{
     ErrorCode, NameType, QuicEncryptionLevel, QuicMethod, QuicMethodError, Ssl, SslAlert,
@@ -13,6 +14,7 @@ use btls::ssl::{
 };
 use btls::x509::X509;
 use std::any::Any;
+use std::fmt;
 use std::io::Cursor;
 use std::mem;
 use std::result::Result as StdResult;
@@ -297,7 +299,9 @@ impl SessionState {
     #[inline]
     pub(crate) fn check_error(&self) -> StdResult<(), TransportError> {
         if let Some(error) = &lock(&self.quic).error {
-            return Err(error.clone());
+            let mut error = error.clone();
+            error.reason = drain_error_queue(&error.reason);
+            return Err(error);
         }
         Ok(())
     }
@@ -327,7 +331,7 @@ impl SessionState {
                 // handshake would stall until the idle timeout.
                 Err(TransportError::new(
                     alert_code(SslAlert::INTERNAL_ERROR),
-                    format!("unsupported asynchronous operation: {code}"),
+                    drain_error_queue(format!("unsupported asynchronous operation: {code}")),
                 ))
             }
             ErrorCode::EARLY_DATA_REJECTED => {
@@ -341,16 +345,9 @@ impl SessionState {
             _ => {
                 // Everything else is fatal. BoringSSL reports failures caused by the peer with
                 // an alert, which `check_error` returned, so this one is local.
-                let reason = if code == ErrorCode::SSL {
-                    // Error occurred within the SSL library. Get details from the ErrorStack.
-                    format!("{code}: {:?}", btls::error::ErrorStack::get())
-                } else {
-                    format!("{code}")
-                };
-
                 Err(TransportError::new(
                     alert_code(SslAlert::INTERNAL_ERROR),
-                    reason,
+                    drain_error_queue(code),
                 ))
             }
         }
@@ -367,6 +364,17 @@ fn alert_code(alert: SslAlert) -> TransportErrorCode {
 impl From<SslAlert> for TransportError {
     fn from(alert: SslAlert) -> Self {
         Self::new(alert_code(alert), alert.description().to_owned())
+    }
+}
+
+/// Appends the errors that BoringSSL queued on this thread to `reason`, and clears the queue so
+/// that they do not show up in a later failure of an unrelated call.
+fn drain_error_queue(reason: impl fmt::Display) -> String {
+    let errors = ErrorStack::get();
+    if errors.errors().is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}: {errors}")
     }
 }
 
@@ -572,6 +580,44 @@ mod tests {
         builder.set_quic_method(QuicCallbacks).unwrap();
         let ssl = Ssl::new(&builder.build()).unwrap();
         SessionState::new(ssl, Side::Client, QuicVersion::V1).unwrap()
+    }
+
+    /// A failure that BoringSSL reports with an alert leaves nothing on the error queue of the
+    /// thread, where it would show up in the next failure of an unrelated call.
+    #[test]
+    fn alert_drains_error_queue() {
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.set_quic_method(QuicCallbacks).unwrap();
+        builder.set_alpn_protos(b"\x02h3").unwrap();
+        let mut client = SessionState::new(
+            Ssl::new(&builder.build()).unwrap(),
+            Side::Client,
+            QuicVersion::V1,
+        )
+        .unwrap();
+        client.ssl.set_connect_state();
+        client.ssl.set_quic_transport_params(b"\x00\x00").unwrap();
+        client.advance_handshake().unwrap();
+        let mut client_hello = Vec::new();
+        assert!(client.write_handshake(&mut client_hello).is_none());
+
+        // A server without a certificate rejects the ClientHello with an alert.
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        builder.set_quic_method(QuicCallbacks).unwrap();
+        let mut server = SessionState::new(
+            Ssl::new(&builder.build()).unwrap(),
+            Side::Server,
+            QuicVersion::V1,
+        )
+        .unwrap();
+        server.ssl.set_accept_state();
+        server.ssl.set_quic_transport_params(b"\x00\x00").unwrap();
+        let err = server.read_handshake(&client_hello).unwrap_err();
+        assert_eq!(err.code, alert_code(SslAlert::INTERNAL_ERROR));
+        // The queued reason goes into the error instead.
+        assert!(err.reason.contains("NO_CERTIFICATE_SET"), "{err}");
+        let left = ErrorStack::get();
+        assert!(left.errors().is_empty(), "{left}");
     }
 
     /// Installs a zero secret the way BoringSSL does, with a cipher suite by its IANA number.
