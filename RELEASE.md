@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.12.3](https://github.com/0x676e67/quic/compare/v0.12.2..v0.12.3) - 2026-10-06
+
+### Bug Fixes
+
+- *(proto)* Drop the nonexistent log feature from the docs.rs metadata ([#81](https://github.com/0x676e67/quic/issues/81)) - ([356dbf8](https://github.com/0x676e67/quic/commit/356dbf885293c64e47e076e40fe7b21e55aaec42))
+
 ## [0.12.2](https://github.com/0x676e67/quic/compare/v0.12.1..v0.12.2) - 2026-09-20
 
 ### Bug Fixes
