@@ -20,6 +20,17 @@ use crate::{
     transport_parameters::TransportParameters,
 };
 
+/// Whether opening a locally-initiated stream is blocked by the peer's stream limit
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamsBlocked {
+    /// No open has been refused since the limit last rose
+    No,
+    /// An open was refused, and a STREAMS_BLOCKED frame is yet to be queued
+    Unreported,
+    /// An open was refused, and a STREAMS_BLOCKED frame has been queued
+    Reported,
+}
+
 /// Wrapper around `Recv` that facilitates reusing `Recv` instances
 #[derive(Debug)]
 pub(super) enum StreamRecv {
@@ -138,7 +149,7 @@ pub struct StreamsState {
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
     /// Whether the locally-initiated stream limit has been hit, per direction
-    pub(super) streams_blocked: [bool; 2],
+    pub(super) streams_blocked: [StreamsBlocked; 2],
     /// Value of `max_data` for which a `DATA_BLOCKED` frame was most recently queued
     ///
     /// A new frame is only queued once the peer has raised the limit.
@@ -187,7 +198,7 @@ impl StreamsState {
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
-            streams_blocked: [false, false],
+            streams_blocked: [StreamsBlocked::No; 2],
             data_blocked_limit: None,
         };
 
@@ -206,6 +217,15 @@ impl StreamsState {
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
         self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
         self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        // A server may try to open a stream, e.g. to send 0.5-RTT data, before the client's
+        // transport parameters arrive. Wake it as a MAX_STREAMS frame would.
+        for dir in Dir::iter() {
+            let blocked = &mut self.streams_blocked[dir as usize];
+            if *blocked != StreamsBlocked::No && self.next[dir as usize] < self.max[dir as usize] {
+                *blocked = StreamsBlocked::No;
+                self.events.push_back(StreamEvent::Available { dir });
+            }
+        }
         self.received_max_data(params.initial_max_data);
         for i in 0..self.max_remote[Dir::Bi as usize] {
             let id = StreamId::new(!self.side, Dir::Bi, i);
@@ -241,6 +261,11 @@ impl StreamsState {
                 }
             }
             self.next[dir as usize] = 0;
+            // A STREAMS_BLOCKED sent in 0-RTT was lost too, so report it again if the limit in
+            // the peer's transport parameters still blocks
+            if self.streams_blocked[dir as usize] == StreamsBlocked::Reported {
+                self.streams_blocked[dir as usize] = StreamsBlocked::Unreported;
+            }
 
             // If 0-RTT was rejected, any flow control frames we sent were lost.
             if self.flow_control_adjusted {
@@ -411,6 +436,14 @@ impl StreamsState {
             .is_some_and(|s| s.can_send_flow_control())
     }
 
+    /// Whether a `STREAMS_BLOCKED` frame could be sent for `dir`
+    ///
+    /// An open must have been refused at the current limit
+    /// (<https://www.rfc-editor.org/rfc/rfc9000#section-13.3>).
+    pub(crate) fn can_send_streams_blocked(&self, dir: Dir) -> bool {
+        self.streams_blocked[dir as usize] == StreamsBlocked::Reported
+    }
+
     /// Whether a `DATA_BLOCKED` frame could be sent
     pub(crate) fn can_send_data_blocked(&self) -> bool {
         self.data_blocked_limit == Some(self.max_data)
@@ -553,9 +586,9 @@ impl StreamsState {
 
         // STREAMS_BLOCKED
         for dir in Dir::iter() {
-            if self.streams_blocked[dir as usize] {
+            if self.streams_blocked[dir as usize] == StreamsBlocked::Unreported {
                 pending.streams_blocked[dir as usize] = true;
-                self.streams_blocked[dir as usize] = false;
+                self.streams_blocked[dir as usize] = StreamsBlocked::Reported;
             }
 
             if !pending.streams_blocked[dir as usize] || buf.len() + 9 >= max_size {
@@ -563,6 +596,10 @@ impl StreamsState {
             }
 
             pending.streams_blocked[dir as usize] = false;
+            // The peer may have raised the limit since the frame was queued
+            if !self.can_send_streams_blocked(dir) {
+                continue;
+            }
             retransmits.get_or_create().streams_blocked[dir as usize] = true;
             let limit = self.max[dir as usize];
             trace!(limit, "STREAMS_BLOCKED ({:?})", dir);
@@ -784,7 +821,7 @@ impl StreamsState {
         let current = &mut self.max[dir as usize];
         if count > *current {
             *current = count;
-            self.streams_blocked[dir as usize] = false;
+            self.streams_blocked[dir as usize] = StreamsBlocked::No;
             self.events.push_back(StreamEvent::Available { dir });
         }
 
@@ -1054,6 +1091,107 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    /// A client blocked in 0-RTT, after reporting it, can open again once the server's transport
+    /// parameters leave room: raised when 0-RTT is accepted, or the same once it is rejected.
+    #[test]
+    fn blocked_0rtt_opens_resume() {
+        let state = ConnState::Established;
+        let open = |streams: &mut StreamsState| {
+            Streams {
+                state: streams,
+                conn_state: &state,
+            }
+            .open(Dir::Uni)
+        };
+        let params = |uni: u32| TransportParameters {
+            initial_max_streams_uni: uni.into(),
+            ..TransportParameters::default()
+        };
+        let blocked_in_0rtt = || {
+            let mut client = make(Side::Client);
+            client.set_params(&params(1));
+            assert!(open(&mut client).is_some());
+            assert_eq!(open(&mut client), None);
+            let mut stats = FrameStats::default();
+            client.write_control_frames(
+                &mut Vec::new(),
+                &mut Retransmits::default(),
+                &mut ThinRetransmits::default(),
+                &mut stats,
+                1200,
+            );
+            assert_eq!(stats.streams_blocked_uni, 1);
+            client
+        };
+        let available = Some(StreamEvent::Available { dir: Dir::Uni });
+
+        let mut accepted = blocked_in_0rtt();
+        accepted.set_params(&params(2));
+        assert_eq!(accepted.poll(), available);
+        assert!(open(&mut accepted).is_some());
+
+        let mut rejected = blocked_in_0rtt();
+        rejected.zero_rtt_rejected();
+        rejected.set_params(&params(1));
+        assert_eq!(rejected.poll(), available);
+        assert!(open(&mut rejected).is_some());
+    }
+
+    /// STREAMS_BLOCKED is only sent, or resent, while the limit it carries blocks
+    /// (https://www.rfc-editor.org/rfc/rfc9000#section-13.3).
+    #[test]
+    fn streams_blocked_only_while_blocked() {
+        let state = ConnState::Established;
+        let open = |streams: &mut StreamsState| {
+            Streams {
+                state: streams,
+                conn_state: &state,
+            }
+            .open(Dir::Uni)
+        };
+        let params = |uni: u32| TransportParameters {
+            initial_max_streams_uni: uni.into(),
+            ..TransportParameters::default()
+        };
+        let write = |streams: &mut StreamsState, pending: &mut Retransmits| {
+            let (mut buf, mut stats) = (Vec::new(), FrameStats::default());
+            streams.write_control_frames(
+                &mut buf,
+                pending,
+                &mut ThinRetransmits::default(),
+                &mut stats,
+                1200,
+            );
+            assert_eq!(stats.streams_blocked_uni, u64::from(!buf.is_empty()));
+            buf
+        };
+
+        // A lost frame is not resent once MAX_STREAMS lifted the limit, not even when the new
+        // limit is used up, since no open was refused at it.
+        let mut client = make(Side::Client);
+        client.set_params(&params(1));
+        assert!(open(&mut client).is_some());
+        assert_eq!(open(&mut client), None);
+        let mut pending = Retransmits::default();
+        assert_eq!(write(&mut client, &mut pending), [0x17, 1]);
+        pending.streams_blocked[Dir::Uni as usize] = true;
+        client.received_max_streams(Dir::Uni, 2).unwrap();
+        assert!(open(&mut client).is_some());
+        assert!(pending.is_empty(&client));
+        assert!(write(&mut client, &mut pending).is_empty());
+
+        // One sent in rejected 0-RTT is sent again with the limit that still blocks.
+        let mut client = make(Side::Client);
+        client.set_params(&params(1));
+        assert!(open(&mut client).is_some());
+        assert_eq!(open(&mut client), None);
+        assert_eq!(write(&mut client, &mut Retransmits::default()), [0x17, 1]);
+        client.zero_rtt_rejected();
+        client.set_params(&params(0));
+        assert_eq!(client.poll(), None);
+        assert_eq!(write(&mut client, &mut Retransmits::default()), [0x17, 0]);
     }
 
     #[test]
