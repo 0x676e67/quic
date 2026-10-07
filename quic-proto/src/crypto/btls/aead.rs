@@ -3,66 +3,31 @@ use crate::crypto::btls::key::{Key, Nonce, Tag};
 use btls::aead::{Algorithm, StatelessAeadCtx};
 use std::sync::LazyLock;
 
-const AES_128_GCM_KEY_LEN: usize = 16;
-const AES_256_GCM_KEY_LEN: usize = 32;
-const CHACHA20_POLY1305_KEY_LEN: usize = 32;
-
-const AES_GCM_NONCE_LEN: usize = 12;
-const POLY1305_NONCE_LEN: usize = 12;
-
-pub(crate) const AES_GCM_TAG_LEN: usize = 16;
-const POLY1305_TAG_LEN: usize = 16;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ID {
-    Aes128Gcm,
-    Aes256Gcm,
-    Chacha20Poly1305,
-}
-
-/// Wrapper around an BoringSSL EVP_AEAD.
+/// A BoringSSL AEAD, with the lengths it takes and produces.
 pub(crate) struct Aead {
     alg: Algorithm,
-    pub(crate) id: ID,
     pub(crate) key_len: usize,
     pub(crate) tag_len: usize,
     pub(crate) nonce_len: usize,
 }
 
-impl PartialEq for Aead {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
+static AES128_GCM: LazyLock<Aead> = LazyLock::new(|| Aead::new(Algorithm::aes_128_gcm()));
 
-impl Eq for Aead {}
+static AES256_GCM: LazyLock<Aead> = LazyLock::new(|| Aead::new(Algorithm::aes_256_gcm()));
 
-static AES128_GCM: LazyLock<Aead> = LazyLock::new(|| Aead {
-    alg: Algorithm::aes_128_gcm(),
-    id: ID::Aes128Gcm,
-    key_len: AES_128_GCM_KEY_LEN,
-    tag_len: AES_GCM_TAG_LEN,
-    nonce_len: AES_GCM_NONCE_LEN,
-});
-
-static AES256_GCM: LazyLock<Aead> = LazyLock::new(|| Aead {
-    alg: Algorithm::aes_256_gcm(),
-    id: ID::Aes256Gcm,
-    key_len: AES_256_GCM_KEY_LEN,
-    tag_len: AES_GCM_TAG_LEN,
-    nonce_len: AES_GCM_NONCE_LEN,
-});
-
-static CHACHA20_POLY1305: LazyLock<Aead> = LazyLock::new(|| Aead {
-    alg: Algorithm::chacha20_poly1305(),
-    id: ID::Chacha20Poly1305,
-    key_len: CHACHA20_POLY1305_KEY_LEN,
-    tag_len: POLY1305_TAG_LEN,
-    nonce_len: POLY1305_NONCE_LEN,
-});
+static CHACHA20_POLY1305: LazyLock<Aead> =
+    LazyLock::new(|| Aead::new(Algorithm::chacha20_poly1305()));
 
 impl Aead {
+    fn new(alg: Algorithm) -> Self {
+        Self {
+            key_len: alg.key_length(),
+            tag_len: alg.max_tag_len(),
+            nonce_len: alg.nonce_len(),
+            alg,
+        }
+    }
+
     #[inline]
     pub(crate) fn aes128_gcm() -> &'static Self {
         &AES128_GCM

@@ -1,9 +1,11 @@
 use crate::ConnectionId;
+use crate::crypto::btls::QuicVersion;
 use crate::crypto::btls::key::{AeadKey, Key, Nonce};
 use crate::crypto::btls::suite::CipherSuite;
-use crate::crypto::btls::{QuicVersion, aead};
 
-const TAG_LEN: usize = aead::AES_GCM_TAG_LEN;
+/// The length of the Retry Integrity Tag
+/// (<https://www.rfc-editor.org/rfc/rfc9001#section-5.8>).
+const TAG_LEN: usize = 16;
 
 #[inline]
 pub(crate) fn retry_tag(
