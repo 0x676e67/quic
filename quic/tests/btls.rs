@@ -7,10 +7,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use proto::{TransportParameterConfig, TransportParameterId, TransportParameterKind};
+use bytes::BytesMut;
+use proto::{
+    ConnectionHandle, DatagramEvent, Dir, EndpointConfig, Event, StreamEvent,
+    TransportParameterConfig, TransportParameterId, TransportParameterKind,
+};
 use quic::{
     ClientConfig, ConnectError, Connection, ConnectionError, Endpoint, Incoming, ReadError,
     ReadToEndError, ServerConfig, TransportConfig, TransportErrorCode,
@@ -643,6 +647,74 @@ async fn rejected_0rtt_stream_ids_reused() {
     client.wait_idle().await;
 }
 
+/// A server sends 0.5-RTT data before the client Finished, on a stream it opens before the client's
+/// transport parameters arrive, as a ClientHello with a post-quantum key share spans two Initial
+/// packets. Datagrams are delivered one by one, so the order does not depend on scheduling.
+#[test]
+fn half_rtt_data_before_client_finished() {
+    let pki = Pki::new();
+    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto(
+        &pki,
+        &pki.issue("localhost"),
+        false,
+    )));
+    let mut server = Peer::new(Some(server_config), 4433);
+    let mut client = Peer::new(None, 4434);
+    let mut builder = client_builder(&pki, None);
+    builder.set_curves_list("X25519MLKEM768").unwrap();
+    let crypto = QuicClientConfig::try_from(builder).unwrap();
+    let mut now = Instant::now();
+    client.conn = Some(
+        client
+            .endpoint
+            .connect(
+                now,
+                ClientConfig::new(Arc::new(crypto)),
+                server.addr,
+                "localhost",
+            )
+            .unwrap(),
+    );
+
+    let mut client_hello = client.transmit(&mut now);
+    assert_eq!(client_hello.len(), 2);
+    let rest = client_hello.split_off(1);
+
+    // The server has no stream credit before the client's transport parameters.
+    server.receive(now, client.addr, client_hello);
+    assert_eq!(server.conn().streams().open(Dir::Uni), None);
+    server.receive(now, client.addr, rest);
+    let events: Vec<_> = std::iter::from_fn(|| server.conn().poll()).collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::Available { dir: Dir::Uni })
+        )),
+        "{events:?}"
+    );
+    let id = server.conn().streams().open(Dir::Uni).unwrap();
+    let mut send = server.conn().send_stream(id);
+    send.write(GREETING).unwrap();
+    send.finish().unwrap();
+
+    // The client completes its handshake and reads the data that the server sent with its own
+    // flight, while the server still waits for the client Finished.
+    let flight = server.transmit(&mut now);
+    client.receive(now, server.addr, flight);
+    assert!(!client.conn().is_handshaking());
+    assert!(server.conn().is_handshaking());
+    let id = client.conn().streams().accept(Dir::Uni).unwrap();
+    let mut recv = client.conn().recv_stream(id);
+    let mut chunks = recv.read(true).unwrap();
+    assert_eq!(chunks.next(usize::MAX).unwrap().unwrap().bytes, GREETING);
+    let _ = chunks.finalize();
+
+    // The client Finished completes the server's handshake.
+    let finished = client.transmit(&mut now);
+    server.receive(now, client.addr, finished);
+    assert!(!server.conn().is_handshaking());
+}
+
 /// A session cache shared between configurations only resumes a session with the configuration
 /// that verified it, since another may verify the server, or authenticate the client, differently.
 #[tokio::test]
@@ -1014,6 +1086,78 @@ fn client_endpoint_with(builder: SslContextBuilder, cache: Arc<dyn SessionCache>
     let endpoint = Endpoint::client(localhost()).unwrap();
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
     endpoint
+}
+
+const GREETING: &[u8] = b"0.5-rtt";
+
+/// An endpoint of [`half_rtt_data_before_client_finished`], whose datagrams the test delivers.
+struct Peer {
+    endpoint: proto::Endpoint,
+    addr: SocketAddr,
+    conn: Option<(ConnectionHandle, proto::Connection)>,
+}
+
+impl Peer {
+    fn new(server_config: Option<ServerConfig>, port: u16) -> Self {
+        Self {
+            endpoint: proto::Endpoint::new(
+                Arc::new(EndpointConfig::default()),
+                server_config.map(Arc::new),
+                false,
+            ),
+            addr: (Ipv4Addr::LOCALHOST, port).into(),
+            conn: None,
+        }
+    }
+
+    fn conn(&mut self) -> &mut proto::Connection {
+        &mut self.conn.as_mut().unwrap().1
+    }
+
+    /// Returns the datagrams that the connection sends, advancing `now` through the pacing
+    /// delays between them but not as far as a loss timer.
+    fn transmit(&mut self, now: &mut Instant) -> Vec<BytesMut> {
+        let deadline = *now + Duration::from_millis(100);
+        let mut datagrams = Vec::new();
+        let mut buf = Vec::new();
+        loop {
+            while let Some(transmit) = self.conn().poll_transmit(*now, 1, &mut buf) {
+                datagrams.push(BytesMut::from(&buf[..transmit.size]));
+                buf.clear();
+            }
+            match self.conn().poll_timeout() {
+                Some(timeout) if timeout <= deadline => {
+                    *now = timeout.max(*now);
+                    self.conn().handle_timeout(*now);
+                }
+                _ => return datagrams,
+            }
+        }
+    }
+
+    /// Hands `datagrams` from `remote` to the endpoint, accepting a new connection.
+    fn receive(&mut self, now: Instant, remote: SocketAddr, datagrams: Vec<BytesMut>) {
+        for datagram in datagrams {
+            let mut buf = Vec::new();
+            match self
+                .endpoint
+                .handle(now, remote, None, None, datagram, &mut buf)
+            {
+                Some(DatagramEvent::NewConnection(incoming)) => {
+                    let conn = self.endpoint.accept(incoming, now, &mut buf, None);
+                    self.conn = Some(conn.unwrap());
+                }
+                Some(DatagramEvent::ConnectionEvent(_, event)) => self.conn().handle_event(event),
+                Some(DatagramEvent::Response(_)) | None => {}
+            }
+            let (ch, conn) = self.conn.as_mut().unwrap();
+            while let Some(event) = conn.poll_endpoint_events() {
+                if let Some(event) = self.endpoint.handle_event(*ch, event) {
+                    conn.handle_event(event);
+                }
+            }
+        }
+    }
 }
 
 fn localhost() -> SocketAddr {
