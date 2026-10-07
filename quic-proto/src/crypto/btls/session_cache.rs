@@ -20,7 +20,8 @@ use zeroize::Zeroizing;
 /// [`SessionCache::take`] removes the value it returns.
 pub trait SessionCache: Send + Sync {
     /// Adds a session for `key`, next to the ones already cached for it.
-    fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>);
+    /// `session` provides the native metadata for this ticket; `value` is opaque resumption data.
+    fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>, session: SslSession);
 
     /// Removes and returns a session for `key`, preferably the newest.
     fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>>;
@@ -86,7 +87,7 @@ fn split_len_prefixed<'a>(encoded: &mut &'a [u8]) -> Result<&'a [u8]> {
 pub struct NoSessionCache;
 
 impl SessionCache for NoSessionCache {
-    fn put(&self, _: Bytes, _: Zeroizing<Vec<u8>>) {}
+    fn put(&self, _: Bytes, _: Zeroizing<Vec<u8>>, _: SslSession) {}
 
     fn take(&self, _: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         None
@@ -117,16 +118,20 @@ impl SimpleCache {
     fn lock(&self) -> MutexGuard<'_, LruCache<Bytes, VecDeque<Zeroizing<Vec<u8>>>>> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
 
-impl SessionCache for SimpleCache {
-    fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>) {
+    fn insert(&self, key: Bytes, value: Zeroizing<Vec<u8>>) {
         let mut cache = self.lock();
         let sessions = cache.get_or_insert_mut(key, VecDeque::new);
         if sessions.len() == Self::SESSIONS_PER_SERVER {
             sessions.pop_front();
         }
         sessions.push_back(value);
+    }
+}
+
+impl SessionCache for SimpleCache {
+    fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>, _: SslSession) {
+        self.insert(key, value);
     }
 
     fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
@@ -173,15 +178,15 @@ mod tests {
 
         // The newest two sessions of a server are kept, and each is taken once, newest first.
         for v in 1..=3 {
-            cache.put(Bytes::from_static(b"a"), value(v));
+            cache.insert(Bytes::from_static(b"a"), value(v));
         }
         assert_eq!(take(b"a"), Some(3));
         assert_eq!(take(b"a"), Some(2));
         assert_eq!(take(b"a"), None);
 
         // Another server evicts the least recently used one.
-        cache.put(Bytes::from_static(b"a"), value(1));
-        cache.put(Bytes::from_static(b"b"), value(2));
+        cache.insert(Bytes::from_static(b"a"), value(1));
+        cache.insert(Bytes::from_static(b"b"), value(2));
         assert_eq!(take(b"a"), None);
         assert_eq!(take(b"b"), Some(2));
     }

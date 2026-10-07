@@ -19,7 +19,8 @@ use quic::{
         pkey::{PKey, Private},
         ssl::{
             AlpnError, EarlyDataReason, ExtensionType, SslContextBuilder, SslInfoCallbackMode,
-            SslMethod, SslRef, SslVerifyError, SslVerifyMode, select_next_proto,
+            SslMethod, SslRef, SslSession, SslVerifyError, SslVerifyMode, SslVersion,
+            select_next_proto,
         },
         x509::X509,
     },
@@ -359,6 +360,10 @@ async fn ssl_callback() {
         names.lock().unwrap().push(server_name.to_owned());
         ssl.add_application_settings(b"h3", None)?;
         ssl.set_alps_use_new_codepoint(true);
+        Ok(())
+    });
+    crypto.set_session_callback(|ssl, selected| {
+        assert!(!selected);
         ssl.set_enable_ech_grease(true);
         Ok(())
     });
@@ -372,13 +377,19 @@ async fn ssl_callback() {
     assert_eq!(*server_names.lock().unwrap(), ["localhost"]);
     assert_eq!(*extensions.lock().unwrap(), [(true, true)]);
 
-    let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
-    crypto.set_ssl_callback(|_, _| Err(ErrorStack::get()));
-    let config = ClientConfig::new(Arc::new(crypto));
-    let err = client
-        .connect_with(config, server, "localhost")
-        .unwrap_err();
-    assert!(matches!(err, ConnectError::EndpointStopping), "{err:?}");
+    for after_selection in [false, true] {
+        let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+        if after_selection {
+            crypto.set_session_callback(|_, _| Err(ErrorStack::get()));
+        } else {
+            crypto.set_ssl_callback(|_, _| Err(ErrorStack::get()));
+        }
+        let config = ClientConfig::new(Arc::new(crypto));
+        let err = client
+            .connect_with(config, server, "localhost")
+            .unwrap_err();
+        assert!(matches!(err, ConnectError::EndpointStopping), "{err:?}");
+    }
 
     client.wait_idle().await;
 }
@@ -652,19 +663,69 @@ async fn session_cache_shared_between_configs() {
     let config = ServerConfig::with_crypto(Arc::new(crypto));
     let server = serve(Endpoint::server(config, localhost()).unwrap());
 
-    let cache = Arc::new(SimpleCache::new(NonZeroUsize::new(2).unwrap()));
+    let cache = Arc::new(RemovalTracker {
+        cache: SimpleCache::new(NonZeroUsize::new(8).unwrap()),
+        removed: AtomicBool::new(false),
+        corrupt: AtomicBool::new(false),
+        tickets: AtomicUsize::new(0),
+    });
+    let callbacks = Arc::new(Mutex::new(Vec::new()));
     let config = || {
         let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
         crypto.set_session_cache(cache.clone());
-        ClientConfig::new(Arc::new(crypto))
+        let seen = callbacks.clone();
+        crypto.set_ssl_callback(move |ssl, _| {
+            assert!(ssl.session().is_none());
+            seen.lock().unwrap().push(None);
+            Ok(())
+        });
+        let seen = callbacks.clone();
+        crypto.set_session_callback(move |ssl, selected| {
+            assert_eq!(ssl.session().is_some(), selected);
+            seen.lock().unwrap().push(Some(selected));
+            Ok(())
+        });
+        crypto
     };
     let (a, b) = (config(), config());
+    let cloned = a.clone();
+    let mut unverified = a.clone();
+    unverified.set_verify_hostname(false);
+    let mut verified = unverified.clone();
+    verified.set_verify_hostname(true);
+    let mut changed_callback = a.clone();
+    changed_callback.set_ssl_callback(|ssl, _| {
+        assert!(ssl.session().is_none());
+        Ok(())
+    });
+    let mut changed_session_callback = a.clone();
+    let seen = callbacks.clone();
+    changed_session_callback.set_session_callback(move |ssl, selected| {
+        assert_eq!(ssl.session().is_some(), selected);
+        seen.lock().unwrap().push(Some(selected));
+        Ok(())
+    });
     let client = Endpoint::client(localhost()).unwrap();
 
-    // A caches a session, which B does not find, and A then resumes.
-    for config in [&a, &b, &a] {
+    // Clones resume within the same scope; new configurations and changed policies do not.
+    // A malformed cached entry falls back to a full handshake and reports no selection.
+    for (crypto, corrupt) in [
+        (&a, false),
+        (&cloned, false),
+        (&b, false),
+        (&a, true),
+        (&unverified, false),
+        (&verified, false),
+        (&changed_callback, false),
+        (&changed_session_callback, false),
+    ] {
+        cache.corrupt.store(corrupt, Ordering::Relaxed);
         let conn = client
-            .connect_with(config.clone(), server, "localhost")
+            .connect_with(
+                ClientConfig::new(Arc::new(crypto.clone())),
+                server,
+                "localhost",
+            )
             .unwrap()
             .await
             .unwrap();
@@ -675,9 +736,61 @@ async fn session_cache_shared_between_configs() {
         *reasons.lock().unwrap(),
         [
             EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::NO_SESSION_OFFERED,
             EarlyDataReason::ACCEPTED,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            EarlyDataReason::NO_SESSION_OFFERED,
         ]
+    );
+    assert_eq!(
+        *callbacks.lock().unwrap(),
+        [
+            None,
+            Some(false),
+            None,
+            Some(true),
+            None,
+            Some(false),
+            None,
+            Some(false),
+            None,
+            Some(false),
+            None,
+            Some(false),
+            Some(false),
+            None,
+            Some(false),
+        ]
+    );
+    assert!(cache.tickets.load(Ordering::Relaxed) >= 8);
+
+    // Re-enabling name verification must not resume a ticket authenticated without it.
+    let conn = client
+        .connect_with(
+            ClientConfig::new(Arc::new(unverified)),
+            server,
+            "wrong.localhost",
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    request(&conn, b"name unchecked").await.unwrap();
+    conn.close(0u32.into(), b"done");
+    let err = client
+        .connect_with(
+            ClientConfig::new(Arc::new(verified)),
+            server,
+            "wrong.localhost",
+        )
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConnectionError::TransportError(e) if is_tls_alert(e.code)),
+        "{err:?}"
     );
 
     client.wait_idle().await;
@@ -911,6 +1024,8 @@ fn localhost() -> SocketAddr {
 struct RemovalTracker {
     cache: SimpleCache,
     removed: AtomicBool,
+    corrupt: AtomicBool,
+    tickets: AtomicUsize,
 }
 
 impl Default for RemovalTracker {
@@ -918,17 +1033,29 @@ impl Default for RemovalTracker {
         Self {
             cache: SimpleCache::new(NonZeroUsize::MIN),
             removed: AtomicBool::new(false),
+            corrupt: AtomicBool::new(false),
+            tickets: AtomicUsize::new(0),
         }
     }
 }
 
 impl SessionCache for RemovalTracker {
-    fn put(&self, key: bytes::Bytes, value: Zeroizing<Vec<u8>>) {
-        self.cache.put(key, value);
+    fn put(&self, key: bytes::Bytes, value: Zeroizing<Vec<u8>>, session: SslSession) {
+        assert_eq!(session.protocol_version(), SslVersion::TLS1_3);
+        assert!(session.time() > 0);
+        assert!(session.timeout() > 0);
+        self.tickets.fetch_add(1, Ordering::Relaxed);
+        self.cache.put(key, value, session);
     }
 
     fn take(&self, key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-        self.cache.take(key)
+        self.cache.take(key).map(|value| {
+            if self.corrupt.load(Ordering::Relaxed) {
+                Zeroizing::new(vec![0])
+            } else {
+                value
+            }
+        })
     }
 
     fn remove(&self, key: &[u8]) {
