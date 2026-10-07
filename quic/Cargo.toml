@@ -137,6 +137,10 @@ required-features = ["__rustls-post-quantum-test"]
 name = "btls"
 required-features = ["btls", "runtime-tokio"]
 
+[[test]]
+name = "btls_rustls"
+required-features = ["btls", "rustls-ring", "runtime-tokio"]
+
 [[bench]]
 name = "bench"
 harness = false
