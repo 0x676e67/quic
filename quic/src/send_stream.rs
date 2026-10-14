@@ -183,6 +183,9 @@ impl SendStream {
     /// incorrect assumptions about the stream's state.
     pub fn finish(&mut self) -> Result<(), ClosedStream> {
         let mut conn = self.conn.state.lock("finish");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Err(ClosedStream::default());
+        }
         match conn.inner.send_stream(self.stream).finish() {
             Ok(()) => {
                 conn.wake();
@@ -223,6 +226,9 @@ impl SendStream {
     /// impact on performance.
     pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
         let mut conn = self.conn.state.lock("SendStream::set_priority");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Err(ClosedStream::default());
+        }
         conn.inner.send_stream(self.stream).set_priority(priority)?;
         Ok(())
     }
@@ -230,6 +236,9 @@ impl SendStream {
     /// Get the priority of the send stream
     pub fn priority(&self) -> Result<i32, ClosedStream> {
         let mut conn = self.conn.state.lock("SendStream::priority");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Err(ClosedStream::default());
+        }
         conn.inner.send_stream(self.stream).priority()
     }
 
@@ -355,11 +364,15 @@ impl tokio::io::AsyncWrite for SendStream {
 impl Drop for SendStream {
     fn drop(&mut self) {
         let mut conn = self.conn.state.lock("SendStream::drop");
+        // A stream of rejected 0-RTT is gone, and a stream opened since may reuse its ID and waker
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return;
+        }
 
         // clean up any previously registered wakers
         conn.blocked_writers.remove(&self.stream);
 
-        if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
+        if conn.error.is_some() {
             return;
         }
         match conn.inner.send_stream(self.stream).finish() {

@@ -20,6 +20,7 @@ async-io = "2"
 assert_matches = "1.1"
 aws-lc-rs = { version = "1.9", default-features = false }
 bencher = "0.1.5"
+btls = "0.5.5"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc = "3"
@@ -56,6 +57,7 @@ url = "2"
 wasm-bindgen-test = { version = "0.3.76" }
 web-time = "1"
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
+zeroize = "1.9"
 cfg_aliases = "0.2"
 
 [profile.bench]
@@ -76,3 +78,7 @@ unused_qualifications = "warn"
 manual_let_else = "warn"
 or_fun_call = "warn"
 use_self = "warn"
+
+# The QUIC APIs of btls ahead of their release (https://github.com/0x676e67/btls/pull/217).
+[patch.crates-io]
+btls = { git = "https://github.com/0x676e67/btls", rev = "21d5feaf1330dfbef4e611a49461932220551d96" }
