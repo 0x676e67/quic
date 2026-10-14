@@ -754,7 +754,7 @@ impl TransportParameters {
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
                 TransportParameterId::InitialRtt => {
                     let value = r.get::<VarInt>()?;
-                    if side.is_client() || len != value.size() || params.initial_rtt_tp.is_some() {
+                    if side.is_client() || params.initial_rtt_tp.is_some() {
                         return Err(Error::Malformed);
                     }
                     params.initial_rtt_tp = Some(value);
@@ -765,7 +765,7 @@ impl TransportParameters {
                             match id {
                                 $(TransportParameterId::$id => {
                                     let value = r.get::<VarInt>()?;
-                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    if got.$name { return Err(Error::Malformed); }
                                     params.$name = value.into();
                                     got.$name = true;
                                 })*
@@ -1189,6 +1189,46 @@ mod test {
                 TransportParameters::read(Side::Server, &mut buf.as_slice()),
                 Err(Error::IllegalValue)
             );
+        }
+    }
+
+    #[test]
+    fn read_nonminimal_integer_parameters() {
+        // Integer values need not use the shortest encoding (RFC 9000, Section 16).
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-16
+        let encodings: [&[u8]; 3] = [&[0x40, 7], &[0x80, 0, 0, 7], &[0xc0, 0, 0, 0, 0, 0, 0, 7]];
+        for (id, expected) in [
+            (
+                TransportParameterId::InitialMaxData,
+                TransportParameters {
+                    initial_max_data: 7u32.into(),
+                    initial_max_streams_uni: 9u32.into(),
+                    ..TransportParameters::default()
+                },
+            ),
+            (
+                TransportParameterId::InitialRtt,
+                TransportParameters {
+                    initial_rtt_tp: Some(7u32.into()),
+                    initial_max_streams_uni: 9u32.into(),
+                    ..TransportParameters::default()
+                },
+            ),
+        ] {
+            for encoding in encodings {
+                let mut buf = Vec::new();
+                buf.write_var(id as u64);
+                buf.write_var(encoding.len() as u64);
+                buf.extend_from_slice(encoding);
+                // A following parameter also verifies the encoded value's consumption.
+                buf.write_var(TransportParameterId::InitialMaxStreamsUni as u64);
+                buf.write_var(1);
+                buf.write_var(9);
+                assert_eq!(
+                    TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap(),
+                    expected
+                );
+            }
         }
     }
 
