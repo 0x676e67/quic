@@ -37,6 +37,12 @@ use proto::{
 };
 
 /// In-progress connection attempt future
+///
+/// Resolves into a [`Connection`] once the TLS handshake completes. In TLS 1.3, peer
+/// certificates arrive with handshake completion, so they are only available via
+/// [`Connection::peer_identity()`]. [`Connection`] is a lightweight handle, so completing the
+/// handshake imposes no extra cost; use [`Connection::close()`] to reject peers that fail
+/// custom validation.
 #[derive(Debug)]
 pub struct Connecting {
     conn: Option<ConnectionRef>,
@@ -160,6 +166,8 @@ impl Connecting {
         not(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")),
         doc = " `crypto::rustls::HandshakeData`."
     )]
+    ///
+    /// Peer certificates are not available at this stage; see [`Connection::peer_identity()`].
     ///
     /// This operation is cancel-safe.
     pub async fn handshake_data(&mut self) -> Result<Box<dyn Any>, ConnectionError> {
@@ -701,6 +709,10 @@ impl Connection {
         doc = " `Vec` of `CertificateDer`."
     )]
     /// For the `btls` session, it is a `Vec<btls::x509::X509>`, leaf certificate first.
+    ///
+    /// For custom asynchronous validation (e.g. checking a certificate against an external
+    /// database), call this after awaiting [`Connecting`] and use [`close()`][Self::close] to
+    /// reject untrusted peers.
     pub fn peer_identity(&self) -> Option<Box<dyn Any>> {
         self.0
             .state
