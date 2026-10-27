@@ -2,6 +2,8 @@ use crate::crypto::btls::Error;
 use crate::crypto::btls::error::Result;
 use crate::{Side, transport_parameters::TransportParameters};
 use btls::ssl::SslSession;
+#[cfg(doc)]
+use btls::ssl::SslSessionRef;
 use bytes::{Buf, BufMut, Bytes};
 use lru::LruCache;
 use std::collections::VecDeque;
@@ -12,15 +14,18 @@ use zeroize::Zeroizing;
 /// A client-side session cache for the btls crypto provider.
 ///
 /// Keys are opaque: they combine the server name with the configuration that cached the session,
-/// so a cache shared between configurations only resumes a session with the one that verified it.
-/// They are meaningless to another process.
+/// so a cache shared between configurations only resumes a session with the one that verified it,
+/// or its clones. They are meaningless to another process.
 ///
 /// Values are encoded sessions, which hold resumption secrets. A session resumes at most one
 /// connection ([RFC 8446 §C.4](https://www.rfc-editor.org/rfc/rfc8446#appendix-C.4)), so
 /// [`SessionCache::take`] removes the value it returns.
 pub trait SessionCache: Send + Sync {
     /// Adds a session for `key`, next to the ones already cached for it.
-    /// `session` provides the native metadata for this ticket; `value` is opaque resumption data.
+    ///
+    /// `session` is the session that `value` encodes, for reading its metadata, such as its
+    /// [`time`](SslSessionRef::time) and [`timeout`](SslSessionRef::timeout). It holds the same
+    /// resumption secret, so keep it no longer than `value`.
     fn put(&self, key: Bytes, value: Zeroizing<Vec<u8>>, session: SslSession);
 
     /// Removes and returns a session for `key`, preferably the newest.

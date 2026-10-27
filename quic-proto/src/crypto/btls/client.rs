@@ -27,9 +27,6 @@ use tracing::{trace, warn};
 /// Configures the [Ssl] of each connection, see [`QuicClientConfig::set_ssl_callback`].
 type SslCallback = dyn Fn(&mut SslRef, &str) -> StdResult<(), ErrorStack> + Send + Sync;
 
-/// Configures the [Ssl] after cached session selection.
-type SessionCallback = dyn Fn(&mut SslRef, bool) -> StdResult<(), ErrorStack> + Send + Sync;
-
 static NEXT_CACHE_SCOPE: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for a client-side QUIC. Wraps around a BoringSSL [SslContext].
@@ -56,7 +53,7 @@ static NEXT_CACHE_SCOPE: AtomicU64 = AtomicU64::new(0);
 /// The conversion restricts the context to TLS 1.3 and installs the QUIC callbacks and the session
 /// cache callback, replacing any on the builder. The verification settings and other callbacks of
 /// the builder are kept, except that the server is verified if the builder verifies nothing.
-/// Clones share cached sessions until a name policy or connection callback is changed.
+/// Clones share cached sessions until a name policy or the SSL callback is changed.
 #[derive(Clone)]
 pub struct QuicClientConfig {
     ctx: SslContext,
@@ -67,7 +64,6 @@ pub struct QuicClientConfig {
     server_name_indication: bool,
     verify_hostname: bool,
     ssl_callback: Option<Arc<SslCallback>>,
-    session_callback: Option<Arc<SessionCallback>>,
 }
 
 impl QuicClientConfig {
@@ -89,7 +85,7 @@ impl QuicClientConfig {
     }
 
     /// Controls the automatic certificate name check for the server name or IP. Enabled by default.
-    /// Does not change chain verification or remove name constraints set on the context or in
+    /// Does not change chain verification or remove host or IP checks set on the context or in
     /// callbacks. Changing it isolates cached sessions.
     pub fn set_verify_hostname(&mut self, enabled: bool) {
         if self.verify_hostname != enabled {
@@ -112,7 +108,8 @@ impl QuicClientConfig {
     /// the [SessionCache] keys sessions by server name only. So whatever the callback sets for
     /// verification or client authentication, such as [`SslRef::set_verify`] or
     /// [`SslRef::set_certificate`], must follow from the server name alone, or the cache must be
-    /// a [`NoSessionCache`].
+    /// a [`NoSessionCache`]. A session that it sets itself resumes without 0-RTT, which needs the
+    /// server transport parameters that only the cache keeps.
     /// Replacing the callback isolates sessions cached under the previous callback.
     ///
     /// [`NoSessionCache`]: crate::crypto::btls::NoSessionCache
@@ -124,22 +121,6 @@ impl QuicClientConfig {
         self.cache_scope = NEXT_CACHE_SCOPE.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Configures the connection after cached session selection and before the ClientHello.
-    /// The boolean reports whether setting a cached session succeeded, not whether the server
-    /// will resume it. An error fails the connection before it starts.
-    /// Replacing the callback isolates sessions cached under the previous callback.
-    ///
-    /// Use this for settings that depend on session selection, such as requesting new tickets.
-    /// It must not change verification or client authentication; configure those on the context
-    /// or with [`Self::set_ssl_callback`] so cached sessions remain tied to their original policy.
-    pub fn set_session_callback<F>(&mut self, callback: F)
-    where
-        F: Fn(&mut SslRef, bool) -> StdResult<(), ErrorStack> + Send + Sync + 'static,
-    {
-        self.session_callback = Some(Arc::new(callback));
-        self.cache_scope = NEXT_CACHE_SCOPE.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Gets the [SessionCache] used to cache all client sessions.
     pub fn get_session_cache(&self) -> Arc<dyn SessionCache> {
         self.session_cache.clone()
@@ -147,8 +128,8 @@ impl QuicClientConfig {
 
     /// Sets the [SessionCache] to be shared by all created client sessions.
     ///
-    /// Clones share a configuration's session scope. Other configurations may share the cache,
-    /// but only resume the sessions they cached themselves.
+    /// Other configurations may share the cache, but only resume the sessions that they or their
+    /// clones cached.
     pub fn set_session_cache(&mut self, session_cache: Arc<dyn SessionCache>) {
         self.session_cache = session_cache;
     }
@@ -175,7 +156,6 @@ impl TryFrom<SslContextBuilder> for QuicClientConfig {
             server_name_indication: true,
             verify_hostname: true,
             ssl_callback: None,
-            session_callback: None,
         })
     }
 }
@@ -251,19 +231,17 @@ impl Session {
         // Resume a cached session. Taking it out of the cache keeps it to this connection, and
         // BoringSSL does not offer it once expired.
         let mut zero_rtt_peer_params = None;
-        let mut session_selected = false;
         if let Some(entry) = tickets.cache.take(&tickets.key) {
             match Entry::decode(&entry) {
                 Ok(entry) => {
-                    zero_rtt_peer_params = Some(entry.params);
                     // SAFETY: The handshake has not started, and the session was cached for
-                    // this server name by this configuration, whose verification it passed: the
-                    // cache scope keeps out the sessions of other configurations. The SSL
-                    // callback must not vary verification or client authentication for a server
-                    // name.
+                    // this server name by this configuration or a clone, whose verification it
+                    // passed: the cache scope keeps out the sessions of other configurations. The
+                    // SSL callback must not vary verification or client authentication for a
+                    // server name.
                     match unsafe { ssl.set_session(entry.session.as_ref()) } {
                         Ok(()) => {
-                            session_selected = true;
+                            zero_rtt_peer_params = Some(entry.params);
                             trace!("attempting resumption for server: {}.", server_name);
                         }
                         Err(e) => {
@@ -288,8 +266,11 @@ impl Session {
             );
         }
 
-        if let Some(callback) = &cfg.session_callback {
-            callback(&mut ssl, session_selected)?;
+        // A session that the SSL callback set comes without the server transport parameters
+        // that 0-RTT must respect (https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1), so it
+        // resumes in 1-RTT only.
+        if zero_rtt_peer_params.is_none() && ssl.session().is_some() {
+            ssl.set_early_data_enabled(false);
         }
 
         let index = TICKET_CACHE_INDEX.ok_or_else(|| Error::other("no ex_data index".into()))?;
@@ -502,8 +483,13 @@ mod tests {
             assert_eq!(session.state.ssl.servername(NameType::HOST_NAME), sni);
         }
 
+        // Clones share the cache scope, which only a changed name policy rotates.
         let mut without_sni = config.as_ref().clone();
+        without_sni.set_server_name_indication(true);
+        without_sni.set_verify_hostname(true);
+        assert_eq!(without_sni.cache_scope, config.cache_scope);
         without_sni.set_server_name_indication(false);
+        assert_ne!(without_sni.cache_scope, config.cache_scope);
         let session =
             Session::new(Arc::new(without_sni), QuicVersion::V1, "localhost", &params).unwrap();
         assert_eq!(session.state.ssl.servername(NameType::HOST_NAME), None);
