@@ -17,7 +17,7 @@ use std::{
 #[cfg(all(
     not(wasm_browser),
     any(feature = "runtime-tokio", feature = "runtime-smol"),
-    any(feature = "aws-lc-rs", feature = "ring"),
+    any(feature = "aws-lc-rs", feature = "ring", feature = "btls"),
 ))]
 use crate::runtime::default_runtime;
 use crate::{
@@ -35,7 +35,7 @@ use rustc_hash::FxHashMap;
 #[cfg(all(
     not(wasm_browser),
     any(feature = "runtime-tokio", feature = "runtime-smol"),
-    any(feature = "aws-lc-rs", feature = "ring"),
+    any(feature = "aws-lc-rs", feature = "ring", feature = "btls"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Notify, futures::Notified, mpsc};
@@ -95,7 +95,7 @@ impl Endpoint {
     #[cfg(all(
         not(wasm_browser),
         any(feature = "runtime-tokio", feature = "runtime-smol"),
-        any(feature = "aws-lc-rs", feature = "ring"), // `EndpointConfig::default()` is only available with these
+        any(feature = "aws-lc-rs", feature = "ring", feature = "btls"), // `EndpointConfig::default()` is only available with these
     ))]
     pub fn client(addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
@@ -137,7 +137,7 @@ impl Endpoint {
     #[cfg(all(
         not(wasm_browser),
         any(feature = "runtime-tokio", feature = "runtime-smol"),
-        any(feature = "aws-lc-rs", feature = "ring"), // `EndpointConfig::default()` is only available with these
+        any(feature = "aws-lc-rs", feature = "ring", feature = "btls"), // `EndpointConfig::default()` is only available with these
     ))]
     pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;

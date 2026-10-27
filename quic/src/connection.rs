@@ -158,7 +158,14 @@ impl Connecting {
     /// The dynamic type returned is determined by the configured
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
     /// be [`downcast`](Box::downcast) to a
-    /// [`crypto::rustls::HandshakeData`](crate::crypto::rustls::HandshakeData).
+    #[cfg_attr(
+        any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"),
+        doc = " [`crypto::rustls::HandshakeData`](crate::crypto::rustls::HandshakeData)."
+    )]
+    #[cfg_attr(
+        not(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")),
+        doc = " `crypto::rustls::HandshakeData`."
+    )]
     ///
     /// Peer certificates are not available at this stage; see [`Connection::peer_identity()`].
     ///
@@ -692,7 +699,16 @@ impl Connection {
     ///
     /// The dynamic type returned is determined by the configured
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
-    /// be [`downcast`](Box::downcast) to a <code>Vec<[rustls::pki_types::CertificateDer]></code>.
+    /// be [`downcast`](Box::downcast) to a
+    #[cfg_attr(
+        any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"),
+        doc = " `Vec` of [`CertificateDer`](rustls::pki_types::CertificateDer)."
+    )]
+    #[cfg_attr(
+        not(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")),
+        doc = " `Vec` of `CertificateDer`."
+    )]
+    /// For the `btls` session, it is a `Vec<btls::x509::X509>`, leaf certificate first.
     ///
     /// For custom asynchronous validation (e.g. checking a certificate against an external
     /// database), call this after awaiting [`Connecting`] and use [`close()`][Self::close] to
