@@ -1,6 +1,7 @@
 //! End-to-end handshakes over the btls crypto backend.
 
 use std::{
+    collections::HashSet,
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     sync::{
@@ -364,10 +365,6 @@ async fn ssl_callback() {
         names.lock().unwrap().push(server_name.to_owned());
         ssl.add_application_settings(b"h3", None)?;
         ssl.set_alps_use_new_codepoint(true);
-        Ok(())
-    });
-    crypto.set_session_callback(|ssl, selected| {
-        assert!(!selected);
         ssl.set_enable_ech_grease(true);
         Ok(())
     });
@@ -381,19 +378,13 @@ async fn ssl_callback() {
     assert_eq!(*server_names.lock().unwrap(), ["localhost"]);
     assert_eq!(*extensions.lock().unwrap(), [(true, true)]);
 
-    for after_selection in [false, true] {
-        let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
-        if after_selection {
-            crypto.set_session_callback(|_, _| Err(ErrorStack::get()));
-        } else {
-            crypto.set_ssl_callback(|_, _| Err(ErrorStack::get()));
-        }
-        let config = ClientConfig::new(Arc::new(crypto));
-        let err = client
-            .connect_with(config, server, "localhost")
-            .unwrap_err();
-        assert!(matches!(err, ConnectError::EndpointStopping), "{err:?}");
-    }
+    let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+    crypto.set_ssl_callback(|_, _| Err(ErrorStack::get()));
+    let config = ClientConfig::new(Arc::new(crypto));
+    let err = client
+        .connect_with(config, server, "localhost")
+        .unwrap_err();
+    assert!(matches!(err, ConnectError::EndpointStopping), "{err:?}");
 
     client.wait_idle().await;
 }
@@ -716,13 +707,16 @@ fn half_rtt_data_before_client_finished() {
 }
 
 /// A session cache shared between configurations only resumes a session with the configuration
-/// that verified it, since another may verify the server, or authenticate the client, differently.
+/// that verified it, or its clones, since another may verify the server, or authenticate the
+/// client, differently. Changing the name policy or the SSL callback of a clone counts as another.
 #[tokio::test]
 async fn session_cache_shared_between_configs() {
     let pki = Pki::new();
     let leaf = pki.issue("localhost");
-    // Why each handshake did or did not use 0-RTT, as the server sees it.
+    // Why each handshake did or did not use 0-RTT, and whether its ClientHello has SNI, as the
+    // server sees it.
     let reasons = Arc::new(Mutex::new(Vec::new()));
+    let sni = Arc::new(Mutex::new(Vec::new()));
     let mut builder = server_builder(&pki, &leaf, false);
     builder.set_alpn_protos(b"\x02h3").unwrap();
     let seen = reasons.clone();
@@ -731,66 +725,62 @@ async fn session_cache_shared_between_configs() {
             seen.lock().unwrap().push(ssl.early_data_reason());
         }
     });
+    let seen = sni.clone();
+    builder.set_select_certificate_callback(move |hello| {
+        let server_name = hello.get_extension(ExtensionType::SERVER_NAME);
+        seen.lock().unwrap().push(server_name.is_some());
+        Ok(())
+    });
     let crypto = QuicServerConfig::try_from(builder).unwrap();
     let config = ServerConfig::with_crypto(Arc::new(crypto));
     let server = serve(Endpoint::server(config, localhost()).unwrap());
 
-    let cache = Arc::new(RemovalTracker {
-        cache: SimpleCache::new(NonZeroUsize::new(8).unwrap()),
-        removed: AtomicBool::new(false),
-        corrupt: AtomicBool::new(false),
-        tickets: AtomicUsize::new(0),
-    });
-    let callbacks = Arc::new(Mutex::new(Vec::new()));
+    let cache = Arc::new(RemovalTracker::new(NonZeroUsize::new(8).unwrap()));
     let config = || {
         let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
         crypto.set_session_cache(cache.clone());
-        let seen = callbacks.clone();
-        crypto.set_ssl_callback(move |ssl, _| {
-            assert!(ssl.session().is_none());
-            seen.lock().unwrap().push(None);
-            Ok(())
-        });
-        let seen = callbacks.clone();
-        crypto.set_session_callback(move |ssl, selected| {
-            assert_eq!(ssl.session().is_some(), selected);
-            seen.lock().unwrap().push(Some(selected));
-            Ok(())
-        });
+        crypto.set_ssl_callback(|_, _| Ok(()));
         crypto
     };
     let (a, b) = (config(), config());
     let cloned = a.clone();
+    let mut unchanged = a.clone();
+    unchanged.set_server_name_indication(true);
+    unchanged.set_verify_hostname(true);
     let mut unverified = a.clone();
     unverified.set_verify_hostname(false);
     let mut verified = unverified.clone();
     verified.set_verify_hostname(true);
     let mut changed_callback = a.clone();
-    changed_callback.set_ssl_callback(|ssl, _| {
-        assert!(ssl.session().is_none());
-        Ok(())
-    });
-    let mut changed_session_callback = a.clone();
-    let seen = callbacks.clone();
-    changed_session_callback.set_session_callback(move |ssl, selected| {
-        assert_eq!(ssl.session().is_some(), selected);
-        seen.lock().unwrap().push(Some(selected));
-        Ok(())
-    });
+    changed_callback.set_ssl_callback(|_, _| Ok(()));
+    let mut no_sni = a.clone();
+    no_sni.set_server_name_indication(false);
     let client = Endpoint::client(localhost()).unwrap();
 
-    // Clones resume within the same scope; new configurations and changed policies do not.
-    // A malformed cached entry falls back to a full handshake and reports no selection.
-    for (crypto, corrupt) in [
-        (&a, false),
-        (&cloned, false),
-        (&b, false),
-        (&a, true),
-        (&unverified, false),
-        (&verified, false),
-        (&changed_callback, false),
-        (&changed_session_callback, false),
-    ] {
+    // Each configuration, whether the cache corrupts the entry it takes, which falls back to a full
+    // handshake, and the expected 0-RTT reason and SNI.
+    let steps = [
+        (&a, false, EarlyDataReason::NO_SESSION_OFFERED, true),
+        (&cloned, false, EarlyDataReason::ACCEPTED, true),
+        (&b, false, EarlyDataReason::NO_SESSION_OFFERED, true),
+        (&a, true, EarlyDataReason::NO_SESSION_OFFERED, true),
+        (&unchanged, false, EarlyDataReason::ACCEPTED, true),
+        (
+            &unverified,
+            false,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            true,
+        ),
+        (&verified, false, EarlyDataReason::NO_SESSION_OFFERED, true),
+        (
+            &changed_callback,
+            false,
+            EarlyDataReason::NO_SESSION_OFFERED,
+            true,
+        ),
+        (&no_sni, false, EarlyDataReason::NO_SESSION_OFFERED, false),
+    ];
+    for (crypto, corrupt, _, _) in steps {
         cache.corrupt.store(corrupt, Ordering::Relaxed);
         let conn = client
             .connect_with(
@@ -804,42 +794,24 @@ async fn session_cache_shared_between_configs() {
         request(&conn, b"1-rtt").await.unwrap();
         conn.close(0u32.into(), b"done");
     }
-    assert_eq!(
-        *reasons.lock().unwrap(),
-        [
-            EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::ACCEPTED,
-            EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::NO_SESSION_OFFERED,
-            EarlyDataReason::NO_SESSION_OFFERED,
-        ]
-    );
-    assert_eq!(
-        *callbacks.lock().unwrap(),
-        [
-            None,
-            Some(false),
-            None,
-            Some(true),
-            None,
-            Some(false),
-            None,
-            Some(false),
-            None,
-            Some(false),
-            None,
-            Some(false),
-            Some(false),
-            None,
-            Some(false),
-        ]
-    );
-    assert!(cache.tickets.load(Ordering::Relaxed) >= 8);
+    assert_eq!(*reasons.lock().unwrap(), steps.map(|step| step.2));
+    assert_eq!(*sni.lock().unwrap(), steps.map(|step| step.3));
 
-    // Re-enabling name verification must not resume a ticket authenticated without it.
+    // Each ticket is a session of its own, which allows 0-RTT like the server.
+    {
+        let sessions = cache.sessions.lock().unwrap();
+        assert!(sessions.len() >= 9);
+        for session in sessions.iter() {
+            assert_eq!(session.protocol_version(), SslVersion::TLS1_3);
+            assert!(session.time() > 0 && session.timeout() > 0);
+            assert!(session.early_data_capable());
+        }
+        let ids = sessions.iter().map(|session| session.id());
+        assert_eq!(ids.collect::<HashSet<_>>().len(), sessions.len());
+    }
+
+    // Re-enabling name verification must not resume a ticket authenticated without it, and turning
+    // SNI off leaves verification on.
     let conn = client
         .connect_with(
             ClientConfig::new(Arc::new(unverified)),
@@ -851,19 +823,59 @@ async fn session_cache_shared_between_configs() {
         .unwrap();
     request(&conn, b"name unchecked").await.unwrap();
     conn.close(0u32.into(), b"done");
-    let err = client
-        .connect_with(
-            ClientConfig::new(Arc::new(verified)),
-            server,
-            "wrong.localhost",
-        )
-        .unwrap()
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, ConnectionError::TransportError(e) if is_tls_alert(e.code)),
-        "{err:?}"
-    );
+    for crypto in [verified, no_sni] {
+        let err = client
+            .connect_with(
+                ClientConfig::new(Arc::new(crypto)),
+                server,
+                "wrong.localhost",
+            )
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConnectionError::TransportError(e) if is_tls_alert(e.code)),
+            "{err:?}"
+        );
+    }
+
+    client.wait_idle().await;
+}
+
+/// A session that the SSL callback sets comes without cached transport parameters, so it resumes
+/// in 1-RTT instead of offering 0-RTT that the connection cannot bound.
+#[tokio::test]
+async fn session_set_by_ssl_callback() {
+    let pki = Pki::new();
+    let server = serve(server_endpoint(&pki, &pki.issue("localhost"), false));
+    // The cache hands out no usable entry, only the callback resumes.
+    let cache = Arc::new(RemovalTracker::default());
+    cache.corrupt.store(true, Ordering::Relaxed);
+    let mut crypto = QuicClientConfig::try_from(client_builder(&pki, None)).unwrap();
+    crypto.set_session_cache(cache.clone());
+    let sessions = cache.clone();
+    crypto.set_ssl_callback(move |ssl, _| {
+        if let Some(session) = sessions.sessions.lock().unwrap().last() {
+            // SAFETY: The session comes from this configuration, for this server name.
+            unsafe { ssl.set_session(session)? };
+        }
+        Ok(())
+    });
+    let client = Endpoint::client(localhost()).unwrap();
+    client.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+
+    for (resumed, reason) in [
+        (false, EarlyDataReason::NO_SESSION_OFFERED),
+        (true, EarlyDataReason::DISABLED),
+    ] {
+        let connecting = client.connect(server, "localhost").unwrap();
+        let conn = connecting.into_0rtt().expect_err("0-RTT").await.unwrap();
+        request(&conn, b"1-rtt").await.unwrap();
+        let data = handshake_data(&conn);
+        assert_eq!(data.resumed, resumed);
+        assert_eq!(data.early_data_reason, reason);
+        conn.close(0u32.into(), b"done");
+    }
 
     client.wait_idle().await;
 }
@@ -1164,31 +1176,37 @@ fn localhost() -> SocketAddr {
     (Ipv4Addr::LOCALHOST, 0).into()
 }
 
-/// A [SimpleCache] that notes whether sessions were removed without being taken.
+/// A [SimpleCache] that notes whether sessions were removed without being taken, keeps the
+/// sessions it caches for inspection, and on request hands out malformed values.
 struct RemovalTracker {
     cache: SimpleCache,
     removed: AtomicBool,
     corrupt: AtomicBool,
-    tickets: AtomicUsize,
+    /// Checked by the tests rather than in `put`, since a panic in BoringSSL's new session
+    /// callback aborts the process.
+    sessions: Mutex<Vec<SslSession>>,
+}
+
+impl RemovalTracker {
+    fn new(servers: NonZeroUsize) -> Self {
+        Self {
+            cache: SimpleCache::new(servers),
+            removed: AtomicBool::new(false),
+            corrupt: AtomicBool::new(false),
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Default for RemovalTracker {
     fn default() -> Self {
-        Self {
-            cache: SimpleCache::new(NonZeroUsize::MIN),
-            removed: AtomicBool::new(false),
-            corrupt: AtomicBool::new(false),
-            tickets: AtomicUsize::new(0),
-        }
+        Self::new(NonZeroUsize::MIN)
     }
 }
 
 impl SessionCache for RemovalTracker {
     fn put(&self, key: bytes::Bytes, value: Zeroizing<Vec<u8>>, session: SslSession) {
-        assert_eq!(session.protocol_version(), SslVersion::TLS1_3);
-        assert!(session.time() > 0);
-        assert!(session.timeout() > 0);
-        self.tickets.fetch_add(1, Ordering::Relaxed);
+        self.sessions.lock().unwrap().push(session.clone());
         self.cache.put(key, value, session);
     }
 
