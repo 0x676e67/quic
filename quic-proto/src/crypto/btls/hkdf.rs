@@ -2,7 +2,6 @@ use crate::crypto::btls::error::Result;
 use btls::hash::MessageDigest;
 use btls::hkdf::HkdfSuite;
 use bytes::{BufMut, BytesMut};
-use std::sync::LazyLock;
 
 /// The block size of SHA-256, which bounds the secrets and keys derived here.
 pub(crate) const DIGEST_BLOCK_LEN: usize = 64;
@@ -11,20 +10,16 @@ pub(crate) const DIGEST_BLOCK_LEN: usize = 64;
 /// creating the initial secrets for
 /// [QUIC](https://www.rfc-editor.org/rfc/rfc9001#section-5.2) and
 /// [TLS_1.3](https://datatracker.ietf.org/doc/html/rfc9001#name-initial-secrets).
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub(crate) struct Hkdf(MessageDigest);
-
-static SHA256: LazyLock<Hkdf> = LazyLock::new(|| Hkdf(MessageDigest::sha256()));
-
-static SHA384: LazyLock<Hkdf> = LazyLock::new(|| Hkdf(MessageDigest::sha384()));
 
 impl Hkdf {
     pub(crate) fn sha256() -> Self {
-        *SHA256
+        Self(MessageDigest::sha256())
     }
 
     pub(crate) fn sha384() -> Self {
-        *SHA384
+        Self(MessageDigest::sha384())
     }
 
     /// The size of the digest in bytes.

@@ -28,7 +28,6 @@ pub(crate) enum ID {
     Chacha20Poly1305Sha256,
 }
 
-#[derive(Eq, PartialEq)]
 pub(crate) struct CipherSuite {
     pub(crate) id: ID,
     pub(crate) hkdf: Hkdf,
@@ -36,6 +35,14 @@ pub(crate) struct CipherSuite {
     pub(crate) confidentiality_limit: u64,
     pub(crate) integrity_limit: u64,
 }
+
+impl PartialEq for CipherSuite {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for CipherSuite {}
 
 impl Debug for CipherSuite {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
