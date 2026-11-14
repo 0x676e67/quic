@@ -289,6 +289,12 @@ impl ConnectionInner {
                         .for_each(Waker::wake),
                     DatagramReceived => state.datagram_received.drain(..).for_each(Waker::wake),
                     DatagramsUnblocked => state.datagrams_unblocked.drain(..).for_each(Waker::wake),
+                    // The Tokio frontend uses this to drive `RemoteAddressWatcher`.
+                    // Compio has no watcher yet; `remote_address()` still reads the
+                    // current path straight from the state machine.
+                    PathUpdated => {}
+                    // `proto::Event` is non-exhaustive.
+                    _ => {}
                 }
             }
 

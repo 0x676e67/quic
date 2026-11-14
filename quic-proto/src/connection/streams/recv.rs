@@ -57,21 +57,22 @@ impl Recv {
             ));
         }
 
-        if let Some(final_offset) = self.final_offset() {
-            if end > final_offset || (frame.fin && end != final_offset) {
-                debug!(end, final_offset, "final size error");
-                return Err(TransportError::FINAL_SIZE_ERROR(""));
-            }
+        if let Some(final_offset) = self.final_offset()
+            && (end > final_offset || (frame.fin && end != final_offset))
+        {
+            debug!(end, final_offset, "final size error");
+            return Err(TransportError::FINAL_SIZE_ERROR(""));
         }
 
         let new_bytes = self.credit_consumed_by(end, received, max_data)?;
 
         // Stopped streams don't need to wait for the actual data, they just need to know
         // how much there was.
-        if frame.fin && !self.stopped {
-            if let RecvState::Recv { ref mut size } = self.state {
-                *size = Some(end);
-            }
+        if frame.fin
+            && !self.stopped
+            && let RecvState::Recv { size } = &mut self.state
+        {
+            *size = Some(end);
         }
 
         self.end = self.end.max(end);
@@ -93,8 +94,11 @@ impl Recv {
 
         self.stopped = true;
         self.assembler.clear();
-        // Issue flow control credit for unread data
-        let read_credits = self.end - self.assembler.bytes_read();
+        // Issue flow control credit for unread data, unless a reset already did
+        let read_credits = match self.state {
+            RecvState::ResetRecvd { .. } => 0,
+            _ => self.end - self.assembler.bytes_read(),
+        };
         // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
         // fiddly to distinguish that from the case where we've received a FIN but are missing some
         // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is
@@ -265,13 +269,12 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
-
+        let recv = get_or_insert_recv(entry.get_mut(), streams.stream_receive_window);
+        if recv.stopped {
+            return Err(ReadableError::ClosedStream);
+        }
         recv.assembler.ensure_ordering(ordered)?;
+        let recv = entry.remove().unwrap().into_inner(); // initialized above
         Ok(Self {
             id,
             ordered,
@@ -286,10 +289,10 @@ impl<'a> Chunks<'a> {
     ///
     /// Should call finalize() when done calling this.
     pub fn next(&mut self, max_length: usize) -> Result<Option<Chunk>, ReadError> {
-        let rs = match self.state {
-            ChunksState::Readable(ref mut rs) => rs,
+        let rs = match &mut self.state {
+            ChunksState::Readable(rs) => rs,
             ChunksState::Reset(error_code) => {
-                return Err(ReadError::Reset(error_code));
+                return Err(ReadError::Reset(*error_code));
             }
             ChunksState::Finished => {
                 return Ok(None);

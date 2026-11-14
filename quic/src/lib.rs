@@ -59,6 +59,8 @@ pub(crate) use web_time::{Duration, Instant};
 
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
+#[cfg(feature = "btls")]
+pub use proto::btls;
 pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
@@ -75,8 +77,8 @@ pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
-    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError,
+    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram,
+    RemoteAddressWatcher, SendDatagram, SendDatagramError,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};

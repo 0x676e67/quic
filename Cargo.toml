@@ -4,8 +4,9 @@ default-members = ["quic", "quic-proto", "bench", "perf"]
 resolver = "2"
 
 [workspace.package]
+version = "0.12.2"
 rust-version = "1.88.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 authors = ["The quinn Developers", "0x676e67 <gngppz@gmail.com>"]
 repository = "https://github.com/0x676e67/quic"
@@ -19,6 +20,7 @@ async-io = "2"
 assert_matches = "1.1"
 aws-lc-rs = { version = "1.9", default-features = false }
 bencher = "0.1.5"
+btls = "0.5.5"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 compio-buf = "0.8.3"
@@ -39,7 +41,7 @@ hdrhistogram = { version = "7.2", default-features = false }
 hex-literal = "1"
 h3 = "0.0.8"
 h3-datagram = "0.0.2"
-lru = "0.18.2"
+lru = "0.19.0"
 lru-slab = "0.1.2"
 log = "0.4"
 pin-project-lite = "0.2"
@@ -69,6 +71,7 @@ wasm-bindgen-test = { version = "0.3.76" }
 webpki-roots = "1"
 web-time = "1"
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
+zeroize = "1.9"
 cfg_aliases = "0.2"
 
 [profile.bench]
@@ -89,3 +92,7 @@ unused_qualifications = "warn"
 manual_let_else = "warn"
 or_fun_call = "warn"
 use_self = "warn"
+
+# The QUIC APIs of btls ahead of their release (https://github.com/0x676e67/btls/pull/217).
+[patch.crates-io]
+btls = { git = "https://github.com/0x676e67/btls", rev = "57c7d82b1b1b7b21a1a66cd1e433106f559d0360" }

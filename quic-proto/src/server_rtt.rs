@@ -20,8 +20,17 @@ const MAX_INITIAL_RTT: Duration = Duration::from_secs(1);
 
 /// Storage for measured SRTTs used by subsequent client connections.
 ///
-/// Methods are called synchronously while opening or closing connections. Implementations should
-/// avoid blocking and must not panic. Slow persistence should be queued for separate processing.
+/// These methods run synchronously on connection lifecycle paths: [`ServerRttStore::get`] is
+/// called when opening a client connection, while [`ServerRttStore::insert`] and
+/// [`ServerRttStore::remove_if_eq`] are called when it closes. They are not called for individual
+/// application requests or when an existing connection is reused.
+///
+/// Implementations must return promptly, must not panic, and should not perform blocking file,
+/// database, or network I/O. A persistent implementation should keep an in-memory front cache and
+/// send durable updates through a bounded, non-blocking queue to another execution context. The
+/// background writer should preserve per-endpoint ordering or coalesce updates so an older write
+/// cannot replace a newer RTT. Data needed by [`ServerRttStore::get`] should be loaded before the
+/// store is installed; returning `None` is preferable to blocking while data is loaded.
 pub trait ServerRttStore: Send + Sync {
     /// Store the latest measured SRTT for a server endpoint.
     ///
@@ -35,11 +44,12 @@ pub trait ServerRttStore: Send + Sync {
     /// Returning `None` makes the connection use its configured initial RTT.
     fn get(&self, server_name: &str, server_port: u16) -> Option<Duration>;
 
-    /// Remove the measured SRTT for a server endpoint after a connection fails without a usable
-    /// RTT sample.
+    /// Remove a measured SRTT if it still equals `expected_rtt`.
     ///
-    /// Removing a missing entry should have no effect.
-    fn remove(&self, server_name: &str, server_port: u16);
+    /// This is called after a connection that reused `expected_rtt` closes without a usable RTT
+    /// sample. The comparison and removal must be atomic so that a different sample written by a
+    /// concurrent connection is preserved. A missing or different value should have no effect.
+    fn remove_if_eq(&self, server_name: &str, server_port: u16, expected_rtt: Duration);
 }
 
 /// Bounded in-memory [`ServerRttStore`].
@@ -78,11 +88,11 @@ impl ServerRttStore for ServerRttMemoryStore {
     }
 
     #[inline]
-    fn remove(&self, server_name: &str, server_port: u16) {
+    fn remove_if_eq(&self, server_name: &str, server_port: u16, expected_rtt: Duration) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(server_name, server_port);
+            .remove_if_eq(server_name, server_port, expected_rtt);
     }
 }
 
@@ -153,8 +163,20 @@ impl State {
         Some(self.lru.get_mut(slab_key).rtt)
     }
 
-    /// Remove an endpoint from both the lookup index and the LRU slab.
-    fn remove(&mut self, server_name: &str, server_port: u16) {
+    /// Remove an endpoint only when its RTT still matches the value read by the caller.
+    fn remove_if_eq(&mut self, server_name: &str, server_port: u16, expected_rtt: Duration) {
+        let Some(slab_key) = self
+            .lookup
+            .get(server_name)
+            .and_then(|ports| ports.get(&server_port))
+            .copied()
+        else {
+            return;
+        };
+        if self.lru.peek(slab_key).rtt != expected_rtt {
+            return;
+        }
+
         if let Some(slab_key) = self.remove_lookup(server_name, server_port) {
             self.lru.remove(slab_key);
         }
@@ -263,17 +285,34 @@ mod tests {
     }
 
     #[test]
-    fn memory_store_removes_only_the_selected_endpoint() {
+    fn memory_store_removes_only_the_matching_endpoint_value() {
         let store = ServerRttMemoryStore::default();
         let rtt = Duration::from_millis(20);
         store.insert("example.com", 443, rtt);
         store.insert("example.com", 8443, rtt);
 
-        store.remove("example.com", 443);
-        store.remove("example.com", 443);
+        store.remove_if_eq("example.com", 443, Duration::from_millis(30));
+        assert_eq!(store.get("example.com", 443), Some(rtt));
+
+        store.remove_if_eq("example.com", 443, rtt);
+        store.remove_if_eq("example.com", 443, rtt);
 
         assert_eq!(store.get("example.com", 443), None);
         assert_eq!(store.get("example.com", 8443), Some(rtt));
+    }
+
+    #[test]
+    fn memory_store_preserves_a_different_newer_value_during_stale_removal() {
+        let store = ServerRttMemoryStore::default();
+        let old_rtt = Duration::from_millis(20);
+        let new_rtt = Duration::from_millis(30);
+        store.insert("example.com", 443, old_rtt);
+
+        let cached_rtt = store.get("example.com", 443).unwrap();
+        store.insert("example.com", 443, new_rtt);
+        store.remove_if_eq("example.com", 443, cached_rtt);
+
+        assert_eq!(store.get("example.com", 443), Some(new_rtt));
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub use connection::qlog::QlogStream;
 #[cfg(feature = "rustls")]
 pub use rustls;
 
+#[cfg(feature = "btls")]
+pub use btls;
+
 mod config;
 #[cfg(feature = "qlog")]
 pub use config::QlogConfig;
@@ -73,7 +76,8 @@ pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
 
 mod endpoint;
 pub use crate::endpoint::{
-    AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
+    AcceptError, Accepted, Accepting, ConnectError, ConnectionHandle, DatagramEvent, Endpoint,
+    Incoming, RetryError,
 };
 
 mod packet;

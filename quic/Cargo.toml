@@ -1,6 +1,6 @@
 [package]
 name = "quic"
-version = "0.11.0"
+version.workspace = true
 authors.workspace = true
 license = "Apache-2.0 AND MIT"
 repository.workspace = true
@@ -24,6 +24,11 @@ aws-lc-rs-fips = ["proto/aws-lc-rs-fips"]
 
 # Enables BloomTokenLog, and uses it by default
 bloom = ["proto/bloom"]
+
+# Enable btls/BoringSSL crypto support
+# Also enables `Endpoint::client` and `Endpoint::server` conveniences.
+btls = ["proto/btls"]
+btls-prefix-symbols = ["proto/btls-prefix-symbols"]
 
 # Records how long locks are held, and warns if they are held >= 1ms
 lock_tracking = []
@@ -103,7 +108,7 @@ h3 = { workspace = true, optional = true }
 h3-datagram = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
-proto = { package = "quic-proto", path = "../quic-proto", version = "0.11.16", default-features = false }
+proto = { package = "quic-proto", path = "../quic-proto", version = "0.12.2", default-features = false }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
@@ -112,7 +117,7 @@ synchrony = { workspace = true, optional = true, features = ["async_flag"] }
 thiserror = { workspace = true }
 tracing =  { workspace = true }
 tokio = { workspace = true }
-udp = { package = "quinn-udp", version = "0.6.1", default-features = false, features = ["tracing"] }
+udp = { package = "quinn-udp", version = "0.6.3", default-features = false, features = ["tracing"] }
 webpki-roots = { workspace = true, optional = true }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
@@ -173,6 +178,14 @@ required-features = ["__rustls-post-quantum-test"]
 [[test]]
 name = "compio"
 required-features = ["runtime-compio", "rustls-ring"]
+
+[[test]]
+name = "btls"
+required-features = ["btls", "runtime-tokio"]
+
+[[test]]
+name = "btls_rustls"
+required-features = ["btls", "rustls-ring", "runtime-tokio"]
 
 [[bench]]
 name = "bench"

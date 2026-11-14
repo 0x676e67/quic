@@ -492,19 +492,19 @@ impl Socket {
         }
 
         // GSO
-        if let Some(segment_size) = transmit.segment_size {
-            if segment_size < transmit.size {
-                #[cfg(linux_all)]
-                builder.push(libc::SOL_UDP, libc::UDP_SEGMENT, &(segment_size as u16))?;
-                #[cfg(windows)]
-                builder.push(
-                    WinSock::IPPROTO_UDP,
-                    WinSock::UDP_SEND_MSG_SIZE,
-                    &(segment_size as u32),
-                )?;
-                #[cfg(not(any(linux_all, windows)))]
-                let _ = segment_size;
-            }
+        if let Some(segment_size) = transmit.segment_size
+            && segment_size < transmit.size
+        {
+            #[cfg(linux_all)]
+            builder.push(libc::SOL_UDP, libc::UDP_SEGMENT, &(segment_size as u16))?;
+            #[cfg(windows)]
+            builder.push(
+                WinSock::IPPROTO_UDP,
+                WinSock::UDP_SEND_MSG_SIZE,
+                &(segment_size as u32),
+            )?;
+            #[cfg(not(any(linux_all, windows)))]
+            let _ = segment_size;
         }
 
         Ok(control)

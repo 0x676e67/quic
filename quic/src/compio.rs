@@ -7,6 +7,8 @@
 
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
+#[cfg(feature = "btls")]
+pub use proto::btls;
 pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator, ConnectionStats, Dir,

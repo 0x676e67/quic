@@ -102,10 +102,10 @@ impl EndpointState {
         if event.is_drained() {
             self.connections.remove(&ch);
         }
-        if let Some(event) = self.endpoint.handle_event(ch, event) {
-            if let Some(connection) = self.connections.get(&ch) {
-                let _ = connection.send(ConnectionEvent::Proto(event));
-            }
+        if let Some(event) = self.endpoint.handle_event(ch, event)
+            && let Some(connection) = self.connections.get(&ch)
+        {
+            let _ = connection.send(ConnectionEvent::Proto(event));
         }
     }
 
