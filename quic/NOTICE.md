@@ -3,7 +3,7 @@
 The native Compio frontend in `src/compio.rs` and `src/compio/` is derived from
 `compio-quic` 0.8.0 at commit `08e5a47036cb7be40c1faf5a58909b640d98ee2e`,
 with later fixes reviewed through commit
-`50e13d0519815b0640ac75ab85618d35c4ec4151`.
+`8ee611f08944d1bfcca976956838c84848e52262`.
 
 Compio is Copyright (c) 2023 Berrysoft and is licensed under the MIT License.
 The applicable text is in `LICENSE-MIT`.

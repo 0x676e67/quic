@@ -69,6 +69,12 @@ async fn loopback_uses_the_local_protocol_state_machine() {
             let (mut send, mut recv) = connection.open_bi().unwrap();
             send.write_all(b"ping").await.unwrap();
             send.finish().unwrap();
+            assert_eq!(
+                std::future::poll_fn(|cx| send.poll_stopped(cx))
+                    .await
+                    .unwrap(),
+                None
+            );
             let (_, response) = recv.read_to_end(Vec::new()).await.unwrap();
             assert_eq!(response, b"pong");
         }

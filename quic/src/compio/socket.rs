@@ -140,19 +140,7 @@ pub(crate) struct Socket {
 impl Socket {
     pub(crate) fn new(socket: UdpSocket) -> io::Result<Self> {
         let is_ipv6 = socket.local_addr()?.is_ipv6();
-        #[cfg(unix)]
-        // SAFETY: IPV6_V6ONLY has the `c_int` representation used by Unix socket APIs.
-        let only_v6 = unsafe {
-            is_ipv6
-                && socket.get_socket_option::<libc::c_int>(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)?
-                    != 0
-        };
-        #[cfg(windows)]
-        // SAFETY: Winsock exposes IPV6_V6ONLY as a one-byte boolean socket option.
-        let only_v6 = unsafe {
-            is_ipv6
-                && socket.get_socket_option::<u8>(WinSock::IPPROTO_IPV6, WinSock::IPV6_V6ONLY)? != 0
-        };
+        let only_v6 = is_ipv6 && socket2::SockRef::from(&socket).only_v6()?;
         let is_ipv4 = socket.local_addr()?.is_ipv4() || !only_v6;
 
         // ECN
