@@ -75,7 +75,14 @@ pub async fn connect_client(
         .with_root_certificates(roots)
         .with_no_client_auth();
 
-    let mut client_config = quic::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    // QUIC Initial packets use AES-128-GCM regardless of the negotiated cipher suite.
+    // https://www.rfc-editor.org/rfc/rfc9001.html#section-5.3
+    let initial = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .and_then(|suite| suite.quic_suite())
+        .context("missing AES-128-GCM support for QUIC Initial packets")?;
+    let crypto = QuicClientConfig::with_initial(Arc::new(crypto), initial)?;
+    let mut client_config = quic::ClientConfig::new(Arc::new(crypto));
     client_config.transport_config(Arc::new(transport_config(&opt)));
 
     let connection = endpoint
