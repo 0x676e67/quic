@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     str,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -81,7 +81,7 @@ impl Endpoint {
     /// address like `0.0.0.0:0` or `[::]:0`, which allow communication with any reachable IPv4 or
     /// IPv6 address respectively from an OS-assigned port.
     ///
-    /// If an IPv6 address is provided, attempts to make the socket dual-stack so as to allow
+    /// If an IPv6 wildcard is provided, attempts to make the socket dual-stack so as to allow
     /// communication with both IPv4 and IPv6 addresses. As such, calling `Endpoint::client` with
     /// the address `[::]:0` is a reasonable default to maximize the ability to connect to other
     /// address. For example:
@@ -99,7 +99,8 @@ impl Endpoint {
     ))]
     pub fn client(addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6()
+        if let SocketAddr::V6(v6) = addr
+            && (v6.ip().is_unspecified() || v6.ip().to_ipv4_mapped().is_some())
             && let Err(e) = socket.set_only_v6(false)
         {
             tracing::debug!(%e, "unable to make socket dual-stack");
@@ -126,7 +127,7 @@ impl Endpoint {
     /// address like `0.0.0.0:0` or `[::]:0`, which allow communication with any reachable IPv4 or
     /// IPv6 address respectively from an OS-assigned port.
     ///
-    /// If an IPv6 address is provided, attempts to make the socket dual-stack so as to allow
+    /// If an IPv6 wildcard is provided, attempts to make the socket dual-stack so as to allow
     /// communication with both IPv4 and IPv6 clients. As such, calling `Endpoint::server` with
     /// the address `[::]:0` is a reasonable default to maximize the ability to accept connections
     /// from any address.
@@ -141,7 +142,8 @@ impl Endpoint {
     ))]
     pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6()
+        if let SocketAddr::V6(v6) = addr
+            && (v6.ip().is_unspecified() || v6.ip().to_ipv4_mapped().is_some())
             && let Err(e) = socket.set_only_v6(false)
         {
             tracing::debug!(%e, "unable to make socket dual-stack");
@@ -441,7 +443,8 @@ impl Future for EndpointDriver {
 
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
-        let mut endpoint = self.0.state.lock().unwrap();
+        // The driver may have panicked while holding this lock. Still notify its dependents.
+        let mut endpoint = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         endpoint.driver_lost = true;
         self.0.shared.incoming.notify_waiters();
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
@@ -525,7 +528,10 @@ impl EndpointInner {
     }
 
     pub(crate) fn refuse(&self, incoming: proto::Incoming) {
-        let mut state = self.state.lock().unwrap();
+        // Also called by Incoming::drop, which must tolerate a driver panic.
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
         state.stats.refused_handshakes += 1;
         let mut response_buffer = Vec::new();
         let transmit = state.inner.refuse(incoming, &mut response_buffer);
@@ -855,7 +861,7 @@ impl Drop for EndpointRef {
             return;
         }
 
-        let endpoint = &mut *self.0.state.lock().unwrap();
+        let endpoint = &mut *self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         // If the driver is about to be on its own, ensure it can shut down if the last
         // connection is gone.
         if let Some(task) = endpoint.driver.take() {
@@ -1041,12 +1047,44 @@ struct PollProgress {
     any(feature = "ring", feature = "aws-lc-rs")
 ))]
 mod tests {
-    use std::net::UdpSocket;
+    use std::{
+        net::UdpSocket,
+        panic::{AssertUnwindSafe, catch_unwind},
+        pin::pin,
+    };
 
     use udp::Transmit;
 
     use super::*;
     use crate::runtime::TokioRuntime;
+
+    #[test]
+    fn endpoint_driver_panic_does_not_abort() {
+        let endpoint = EndpointRef::new(
+            Box::new(PanickingSocket),
+            proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true),
+            false,
+            Arc::new(TokioRuntime),
+        );
+        let mut incoming = pin!(endpoint.shared.incoming.notified());
+        let mut idle = pin!(endpoint.shared.idle.notified());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(incoming.as_mut().poll(&mut cx).is_pending());
+        assert!(idle.as_mut().poll(&mut cx).is_pending());
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            // Own the driver inside the catch boundary so that it is dropped during unwinding.
+            let mut driver = pin!(EndpointDriver(endpoint.clone()));
+            let _ = driver.as_mut().poll(&mut cx);
+        }))
+        .unwrap_err();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"receive panic"));
+        assert!(endpoint.state.is_poisoned());
+        assert!(endpoint.state.lock().unwrap_err().into_inner().driver_lost);
+        assert!(incoming.as_mut().poll(&mut cx).is_ready());
+        assert!(idle.as_mut().poll(&mut cx).is_ready());
+    }
 
     #[test]
     fn ignored_receive_errors_respect_work_budget() {
@@ -1091,6 +1129,28 @@ mod tests {
                 assert_eq!(progress.keep_going, keep_going);
                 assert!(!progress.received_connection_packet);
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingSocket;
+
+    impl AsyncUdpSocket for PanickingSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(UnusedSender)
+        }
+
+        fn poll_recv(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            panic!("receive panic");
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
         }
     }
 
