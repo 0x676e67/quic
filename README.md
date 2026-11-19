@@ -46,6 +46,9 @@ Use `quic::compio::Endpoint` inside a running Compio runtime. Compio owns I/O bu
 operation completes, so its endpoint, connection, and stream types are runtime-local and live in
 the `compio` module. The readiness-based Tokio and Smol types remain at the crate root.
 
+Use a current stable Rust toolchain with Compio. The Rust 1.88 minimum-version check covers the
+other features, and CI tests Compio separately on stable.
+
 ## License
 
 The workspace is licensed under Apache License, Version 2.0 ([LICENSE](LICENSE) or
