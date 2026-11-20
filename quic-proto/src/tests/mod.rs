@@ -31,6 +31,7 @@ use crate::{
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     packet::{Header, InitialHeader, PacketNumber},
+    shared::{ConnectionEventInner, DatagramConnectionEvent},
     transport_parameters::TransportParameters,
 };
 mod util;
@@ -1103,6 +1104,74 @@ fn zero_rtt_happypath() {
 }
 
 #[test]
+fn client_discards_0rtt_packets() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let config = client_config();
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(config.clone());
+    pair.drive();
+    pair.server.assert_accept();
+    let now = pair.time;
+    pair.client_conn_mut(client_ch)
+        .close(now, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    info!("resuming session");
+    let client_ch = pair.begin_connect(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.client.drive_outgoing(pair.time);
+
+    // Reflect the client's own 0-RTT packet, coalesced after the Initial in its first datagram,
+    // back to it. The client holds the keys to decrypt it, but RFC 9001 §5.6 requires it to
+    // discard 0-RTT packets without attempting to.
+    let decode = |data| {
+        PartialDecode::new(
+            data,
+            &FixedLengthConnectionIdParser::new(0),
+            DEFAULT_SUPPORTED_VERSIONS,
+            true,
+        )
+        .unwrap()
+    };
+    let (_, datagram) = pair.client.outbound.front().unwrap();
+    let (initial, rest) = decode(BytesMut::from(&datagram[..]));
+    assert!(initial.is_initial());
+    let (first_decode, remaining) = decode(rest.unwrap());
+    assert!(first_decode.is_0rtt());
+    assert!(remaining.is_none());
+    let event = ConnectionEvent(ConnectionEventInner::Datagram(DatagramConnectionEvent {
+        now: pair.time,
+        remote: pair.server.addr,
+        ecn: None,
+        first_decode,
+        remaining,
+    }));
+    pair.client_conn_mut(client_ch).handle_event(event);
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+    assert_eq!(pair.client_conn_mut(client_ch).stats().frame_rx.stream, 0);
+
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+}
+
+#[test]
 fn zero_rtt_rejection() {
     let _guard = subscribe();
     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
@@ -1506,6 +1575,52 @@ fn alpn_success() {
             .downcast_ref::<rustls::CipherSuite>()
             .is_some()
     );
+}
+
+#[test]
+fn alpn_after_hello_retry() {
+    let _guard = subscribe();
+    const ALPN: &[u8] = b"foo";
+    // A server without the group the client sent a key share for asks for a new
+    // ClientHello, and picks the protocol only from that one
+    let mut provider = default_provider();
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::secp256r1);
+    let key = PrivatePkcs8KeyDer::from(CERTIFIED_KEY.signing_key.serialize_der());
+    let cert = CERTIFIED_KEY.cert.der().clone();
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], PrivateKeyDer::from(key))
+        .unwrap();
+    crypto.alpn_protocols = vec![ALPN.into()];
+    let server_config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto).unwrap()));
+
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let client_config = ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![ALPN.into()])));
+    pair.begin_connect(client_config);
+
+    let mut ready = false;
+    while pair.step() {
+        for conn in pair.server.connections.values_mut() {
+            while let Some(event) = conn.poll() {
+                if let Event::HandshakeDataReady = event {
+                    let hd = conn
+                        .crypto_session()
+                        .handshake_data()
+                        .unwrap()
+                        .downcast::<crypto::rustls::HandshakeData>()
+                        .unwrap();
+                    assert_eq!(hd.protocol.as_deref(), Some(ALPN));
+                    ready = true;
+                }
+            }
+        }
+    }
+    assert!(ready);
 }
 
 #[test]
@@ -3620,6 +3735,133 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
 }
 
 #[test]
+fn migration_mtu_probes_respect_anti_amplification_limit() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    assert_eq!(
+        usize::from(pair.server_conn_mut(server_ch).path_mtu()),
+        DEFAULT_MTU
+    );
+
+    // The server's own counters. From here on everything it receives comes from the client's new
+    // address, and everything it sends goes there too, bar the single padded PATH_CHALLENGE it
+    // sends to the old address when it migrates.
+    let server_stats = |pair: &mut Pair| pair.server_conn_mut(server_ch).stats();
+    let before = server_stats(&mut pair);
+
+    let path_responses = |pair: &mut Pair| {
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .path_response
+    };
+    let path_responses_before = path_responses(&mut pair);
+
+    // The client shows up at a new IP address, as after a NAT rebinding that changed its public
+    // address. The server starts MTU discovery from scratch for the new path.
+    pair.client.addr = SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 1).into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(&[0xab; 700]).unwrap();
+
+    // Until the new path is validated, the server includes a PATH_CHALLENGE in every packet it
+    // sends there, padded to `INITIAL_MTU`; only MTU probes are larger. Lose the datagrams of up to
+    // `INITIAL_MTU` so the path stays unvalidated, and deliver the probes.
+    let lose = |datagram: &[u8]| datagram.len() <= usize::from(INITIAL_MTU);
+
+    // Delivering the client's data from its new address migrates the server onto the new path,
+    // where MTU discovery starts over from `INITIAL_MTU`
+    assert!(step_losing_server_datagrams(&mut pair, lose));
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
+    assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), INITIAL_MTU);
+
+    // Hold the path unvalidated for as long as the server keeps trying to validate it, which ends
+    // when its path validation timer expires, because every PATH_CHALLENGE is lost
+    while pair.server_conn_mut(server_ch).remote_address() == pair.client.addr {
+        let now = server_stats(&mut pair);
+        let sent = now.udp_tx.bytes - before.udp_tx.bytes;
+        let received = now.udp_rx.bytes - before.udp_rx.bytes;
+        info!(
+            sent,
+            received, "bytes exchanged with the unvalidated address"
+        );
+        // The anti-amplification limit is three times the bytes received on the path.
+        // `poll_transmit` still starts a full-size datagram while any of that budget is left, and
+        // the PATH_CHALLENGE to the old address is counted here too, so allow two more datagrams
+        // of the unvalidated path's `INITIAL_MTU` on top.
+        assert!(
+            sent < 3 * received + 2 * u64::from(INITIAL_MTU),
+            "server sent {sent} bytes to an unvalidated address it received {received} bytes from"
+        );
+        // MTU probes are not subject to the limit above, so they must wait for validation
+        assert_eq!(
+            now.path.sent_plpmtud_probes, before.path.sent_plpmtud_probes,
+            "server sent an MTU probe to an unvalidated address"
+        );
+        assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), INITIAL_MTU);
+        if !step_losing_server_datagrams(&mut pair, lose) {
+            break;
+        }
+    }
+    assert_eq!(
+        path_responses(&mut pair),
+        path_responses_before,
+        "no PATH_CHALLENGE should have reached the client yet"
+    );
+
+    // More data from the client lifts the limit, a PATH_CHALLENGE gets through, the path is
+    // validated, and MTU discovery runs on it, back up from `INITIAL_MTU`
+    pair.client_send(client_ch, s).write(&[0xab; 700]).unwrap();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
+    assert!(path_responses(&mut pair) > path_responses_before);
+    assert!(server_stats(&mut pair).path.sent_plpmtud_probes > before.path.sent_plpmtud_probes);
+    assert_eq!(
+        usize::from(pair.server_conn_mut(server_ch).path_mtu()),
+        DEFAULT_MTU
+    );
+}
+
+/// Like [`Pair::step`], but drops the server's datagrams to the client's current address for which
+/// `lose` returns true, and all of its datagrams to any other address
+///
+/// Returns false once neither endpoint has anything scheduled.
+fn step_losing_server_datagrams(pair: &mut Pair, lose: impl Fn(&[u8]) -> bool) -> bool {
+    pair.drive_client();
+
+    pair.server.drive(pair.time, pair.client.addr);
+    for (transmit, datagram) in pair.server.outbound.drain(..) {
+        if transmit.destination != pair.client.addr || lose(&datagram) || datagram.len() > pair.mtu
+        {
+            continue;
+        }
+        let arrival = pair.time + pair.latency;
+        let datagram = datagram.as_ref().into();
+        pair.client
+            .inbound
+            .push_back((arrival, transmit.ecn, datagram));
+    }
+
+    match min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+        Some(t) => {
+            pair.time = pair.time.max(t);
+            true
+        }
+        None => false,
+    }
+}
+
+#[test]
 fn connect_runs_mtud_again_after_600_seconds() {
     let _guard = subscribe();
     let mut server_config = server_config();
@@ -5327,4 +5569,73 @@ fn qlog_packet_lost_trigger() {
             PacketLostTrigger::ReorderingThreshold
         ]
     );
+}
+
+#[test]
+fn late_ack_only_packet_is_not_a_spurious_congestion_event() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let s = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
+    pair.server_send(server_ch, s).write(&[0; 4000]).unwrap();
+    pair.drive_server();
+    pair.drive_client();
+    let held: Vec<_> = pair.server.inbound.drain(..).collect();
+    assert!(!held.is_empty());
+
+    let c = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, c).write(&[0; 8000]).unwrap();
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert!(
+        stats.path.lost_packets > 0,
+        "the held packets are deemed lost"
+    );
+    assert_eq!(
+        stats.path.congestion_events, 0,
+        "ACK-only losses are no congestion event"
+    );
+
+    pair.server.inbound.extend(held);
+    pair.client_send(client_ch, c).write(&[0; 2000]).unwrap();
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.path.congestion_events, 0, "no congestion event");
+    assert_eq!(
+        stats.path.spurious_congestion_events, 0,
+        "no spurious congestion event"
+    );
+}
+
+#[test]
+fn late_data_packet_is_a_spurious_congestion_event() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+
+    let c = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, c).write(&[0; 1000]).unwrap();
+    pair.drive_client();
+    let held: Vec<_> = pair.server.inbound.drain(..).collect();
+    assert!(!held.is_empty());
+
+    pair.client_send(client_ch, c).write(&[0; 8000]).unwrap();
+    while pair
+        .client_conn_mut(client_ch)
+        .stats()
+        .path
+        .congestion_events
+        == 0
+    {
+        assert!(pair.step());
+    }
+
+    pair.server.inbound.extend(held);
+    pair.client_send(client_ch, c).write(&[0; 2000]).unwrap();
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.path.spurious_congestion_events, 1);
 }

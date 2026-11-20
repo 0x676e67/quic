@@ -10,6 +10,7 @@ use std::{
     future::Future,
     io::{self, IoSliceMut},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::{Pin, pin},
     str,
     sync::{
@@ -848,6 +849,44 @@ fn echo_dualstack() {
     });
 }
 
+#[cfg_attr(
+    any(target_os = "solaris", target_os = "illumos"),
+    ignore = "Fails on Solaris and Illumos"
+)]
+#[tokio::test]
+async fn specific_v6_addr() {
+    let _guard = subscribe();
+    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let server = Endpoint::server(
+        crate::ServerConfig::with_single_cert(
+            vec![cert.cert.der().clone()],
+            PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+        )
+        .unwrap(),
+        addr,
+    )
+    .unwrap();
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client = Endpoint::client(addr).unwrap();
+    client
+        .set_default_client_config(ClientConfig::with_root_certificates(Arc::new(roots)).unwrap());
+
+    join!(
+        async { server.accept().await.unwrap().await.unwrap() },
+        async {
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+    );
+}
+
 #[test]
 #[ignore]
 #[cfg_attr(target_os = "solaris", ignore = "Hangs in poll() on Solaris")]
@@ -1541,6 +1580,42 @@ async fn two_datagram_readers() {
 }
 
 #[tokio::test]
+async fn read_datagrams() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    assert_eq!(client.read_datagrams(&mut []).await.unwrap(), 0);
+
+    let sent = [&b"one"[..], b"two", b"three"];
+    for x in sent {
+        server.send_datagram(Bytes::from_static(x)).unwrap();
+    }
+    let mut bufs = [Bytes::new(), Bytes::new()];
+    let mut received = Vec::new();
+    while received.len() < sent.len() {
+        let n = client.read_datagrams(&mut bufs).await.unwrap();
+        assert!((1..=bufs.len()).contains(&n));
+        received.extend_from_slice(&bufs[..n]);
+    }
+    assert_eq!(received, sent);
+
+    server.close(0u32.into(), b"done");
+    assert!(matches!(
+        client.read_datagrams(&mut bufs).await,
+        Err(crate::ConnectionError::ApplicationClosed(_))
+    ));
+}
+
+#[tokio::test]
 async fn multiple_conns_with_zero_length_cids() {
     let _guard = subscribe();
     let mut factory = EndpointFactory::new();
@@ -1818,6 +1893,169 @@ async fn recv_stream_cancel_stop_drop() {
             recv_dropped.wait().await;
         },
     );
+}
+
+#[tokio::test]
+async fn connection_handles_drop_after_driver_panic() {
+    for unwinding in [false, true] {
+        let factory = EndpointFactory::new();
+        let server = factory.endpoint();
+        let panic_signal = Arc::new(Mutex::new(None));
+        let client = Endpoint::new_with_abstract_socket(
+            factory.endpoint_config.clone(),
+            None,
+            Box::new(PanickingSendSocket {
+                inner: localhost_socket(),
+                panic_signal: panic_signal.clone(),
+            }),
+            Arc::new(TokioRuntime),
+        )
+        .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(factory.cert.cert.der().clone()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+
+        let (connection, peer) = join!(
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap(),
+            async { server.accept().await.unwrap().await.unwrap() },
+        );
+        let connection = connection.unwrap();
+        let (send, recv) = connection.open_bi().await.unwrap();
+        let mut stopped = Box::pin(send.stopped());
+        assert!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let (finished_send, mut stopped_recv) = connection.open_bi().await.unwrap();
+        stopped_recv.stop(0u32.into()).unwrap();
+        drop(finished_send);
+
+        let (signal, panicked) = tokio::sync::oneshot::channel();
+        *panic_signal.lock().unwrap() = Some(signal);
+        connection
+            .send_datagram(Bytes::from_static(b"panic"))
+            .unwrap();
+        // This test uses a current-thread runtime, so the driver finishes unwinding before
+        // the task waiting for its signal can resume.
+        timeout(Duration::from_secs(5), panicked)
+            .await
+            .unwrap()
+            .unwrap();
+
+        drop_after_poison((stopped, send, recv, stopped_recv, connection), unwinding);
+        drop(peer);
+    }
+}
+
+#[tokio::test]
+async fn incoming_drop_after_endpoint_panic() {
+    for unwinding in [false, true] {
+        let factory = EndpointFactory::new();
+        let client = factory.endpoint();
+        let server = factory.endpoint();
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let incoming = timeout(Duration::from_secs(5), server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _guard = server.inner.state.lock().unwrap();
+                panic!("endpoint state panic");
+            }))
+            .is_err()
+        );
+        assert!(server.inner.state.is_poisoned());
+        drop_after_poison(incoming, unwinding);
+        drop(connecting);
+    }
+}
+
+fn drop_after_poison(value: impl Sized, unwinding: bool) {
+    let result = catch_unwind(AssertUnwindSafe(move || {
+        let _value = value;
+        if unwinding {
+            panic!("application panic");
+        }
+    }));
+    if unwinding {
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"application panic")
+        );
+    } else {
+        assert!(result.is_ok(), "dropping poisoned handles panicked");
+    }
+}
+
+#[derive(Debug)]
+struct PanickingSendSocket {
+    inner: Box<dyn AsyncUdpSocket>,
+    panic_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl AsyncUdpSocket for PanickingSendSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(PanickingSender {
+            inner: self.inner.create_sender(),
+            panic_signal: self.panic_signal.clone(),
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+#[derive(Debug)]
+struct PanickingSender {
+    inner: Pin<Box<dyn UdpSender>>,
+    panic_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl UdpSender for PanickingSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &udp::Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let signal = self.panic_signal.lock().unwrap().take();
+        if let Some(signal) = signal {
+            signal.send(()).unwrap();
+            panic!("connection send panic");
+        }
+        self.inner.as_mut().poll_send(transmit, cx)
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
 }
 
 #[tokio::test(start_paused = true)]

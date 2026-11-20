@@ -268,6 +268,15 @@ impl ConnectionDriver {
     }
 }
 
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        // Drop the sender to avoid keeping the endpoint socket open
+        if let Some(mut conn) = self.conn.state.lock_for_drop("drop") {
+            conn.sender = None;
+        }
+    }
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
@@ -399,6 +408,27 @@ impl Connection {
     pub fn read_datagram(&self) -> ReadDatagram<'_> {
         ReadDatagram {
             conn: &self.0,
+            notify: self.0.shared.datagram_received.notified(),
+        }
+    }
+
+    /// Receive multiple application datagrams
+    ///
+    /// Waits until at least one datagram is available, then fills `bufs` with as many received
+    /// datagrams as fit and returns how many were written. Behaves like calling
+    /// [`read_datagram()`](Self::read_datagram) until no more datagrams are buffered, but takes
+    /// the connection lock once rather than once per datagram, which reduces contention with the
+    /// connection driver and other tasks when datagrams arrive in quick succession.
+    ///
+    /// Returns `Ok(0)` immediately if `bufs` is empty.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancellation safe. If this does not resolve, no datagrams were consumed.
+    pub fn read_datagrams<'a>(&'a self, bufs: &'a mut [Bytes]) -> ReadDatagrams<'a> {
+        ReadDatagrams {
+            conn: &self.0,
+            bufs,
             notify: self.0.shared.datagram_received.notified(),
         }
     }
@@ -969,6 +999,52 @@ impl Future for ReadDatagram<'_> {
 }
 
 pin_project! {
+    /// Future produced by [`Connection::read_datagrams`]
+    pub struct ReadDatagrams<'a> {
+        conn: &'a ConnectionRef,
+        bufs: &'a mut [Bytes],
+        #[pin]
+        notify: Notified<'a>,
+    }
+}
+
+impl Future for ReadDatagrams<'_> {
+    type Output = Result<usize, ConnectionError>;
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if this.bufs.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut state = this.conn.state.lock("ReadDatagrams::poll");
+        // As in `ReadDatagram`, buffered datagrams take precedence over `state.error`
+        let mut datagrams = state.inner.datagrams();
+        let mut n = 0;
+        for buf in this.bufs.iter_mut() {
+            let Some(x) = datagrams.recv() else {
+                break;
+            };
+            *buf = x;
+            n += 1;
+        }
+        if n > 0 {
+            return Poll::Ready(Ok(n));
+        } else if let Some(e) = &state.error {
+            return Poll::Ready(Err(e.clone()));
+        }
+        loop {
+            match this.notify.as_mut().poll(ctx) {
+                // `state` lock ensures we didn't race with readiness
+                Poll::Pending => return Poll::Pending,
+                // Spurious wakeup, get a new future
+                Poll::Ready(()) => this
+                    .notify
+                    .set(this.conn.shared.datagram_received.notified()),
+            }
+        }
+    }
+}
+
+pin_project! {
     /// Future produced by [`Connection::send_datagram_wait`]
     pub struct SendDatagram<'a> {
         conn: &'a ConnectionRef,
@@ -1058,7 +1134,9 @@ impl Drop for ConnectionRef {
             return;
         }
 
-        let conn = &mut *self.state.lock("drop");
+        let Some(mut conn) = self.state.lock_for_drop("drop") else {
+            return;
+        };
 
         if !conn.inner.is_closed() {
             // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
@@ -1115,7 +1193,8 @@ pub(crate) struct State {
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
-    sender: Pin<Box<dyn UdpSender>>,
+    /// None once the connection driver is dropped
+    sender: Option<Pin<Box<dyn UdpSender>>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
@@ -1151,7 +1230,7 @@ impl State {
             blocked_readers: FxHashMap::default(),
             stopped: FxHashMap::default(),
             error: None,
-            sender,
+            sender: Some(sender),
             runtime,
             send_buffer: Vec::new(),
             buffered_transmit: None,
@@ -1160,13 +1239,12 @@ impl State {
     }
 
     fn drive_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let sender = self.sender.as_mut().unwrap();
+
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .sender
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
+        let max_datagrams = sender.max_transmit_segments().min(MAX_TRANSMIT_SEGMENTS);
 
         loop {
             // Retry the last transmit, or get a new one.
@@ -1192,8 +1270,7 @@ impl State {
             };
 
             let len = t.size;
-            match self
-                .sender
+            match sender
                 .as_mut()
                 .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
             {
@@ -1233,7 +1310,7 @@ impl State {
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(sender))) => {
-                    self.sender = sender;
+                    self.sender = Some(sender);
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {

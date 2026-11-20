@@ -1,3 +1,11 @@
+[advisories]
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0542"
+reason = "humantime is unmaintained with no patched release. Keep the existing qlog and Tokio Console integrations while their upstream dependencies are updated."
+expiry = "2027-02-17"
+allow = ["qlog@=0.18.1", "console-subscriber@=0.5.0"]
+
 [licenses]
 allow = [
     "Apache-2.0",

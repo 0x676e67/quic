@@ -13,7 +13,7 @@ A [Sans-I/O][sans-io] aware, QUIC implementation for Rust.
 - Ordered and unordered streams, plus unreliable datagrams per [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html).
 - 0-RTT data for resumed connections.
 - Connection migration and path MTU discovery based on [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html).
-- Async APIs for Linux, macOS and Windows, including Tokio, Smol, and native Compio completion I/O; pluggable cryptography with [rustls][rustls] and [*ring*][ring].
+- Async APIs for Linux, macOS and Windows; pluggable cryptography with [rustls][rustls] and [*ring*][ring].
 - Continues the [quinn] codebase, tracking upstream changes.
 
 ## Usage
@@ -35,26 +35,10 @@ fn main() {
 }
 ```
 
-Compio support is part of the same crate and uses the local `quic-proto` state machine:
-
-```toml
-[dependencies]
-quic = { version = "0.12", features = ["runtime-compio"] }
-```
-
-Use `quic::compio::Endpoint` inside a running Compio runtime. Compio owns I/O buffers until an
-operation completes, so its endpoint, connection, and stream types are runtime-local and live in
-the `compio` module. The readiness-based Tokio and Smol types remain at the crate root.
-
-Use a current stable Rust toolchain with Compio. The Rust 1.88 minimum-version check covers the
-other features, and CI tests Compio separately on stable.
-
 ## License
 
-The workspace is licensed under Apache License, Version 2.0 ([LICENSE](LICENSE) or
-http://www.apache.org/licenses/LICENSE-2.0). The `quic` crate also contains Compio-derived code
-under the MIT terms recorded in [quic/LICENSE-MIT](quic/LICENSE-MIT) and
-[quic/NOTICE.md](quic/NOTICE.md).
+Licensed under either of Apache License, Version 2.0 ([LICENSE](LICENSE) or
+http://www.apache.org/licenses/LICENSE-2.0).
 
 ## Contribution
 
