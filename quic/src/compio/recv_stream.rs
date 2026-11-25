@@ -367,10 +367,8 @@ impl RecvStream {
             return BufResult(Ok(0), buf);
         }
         let len = (end - start) as usize;
-        let cap = buf.buf_capacity();
-        let needed = len.saturating_sub(cap);
-        if needed > 0
-            && let Err(e) = buf.reserve(needed)
+        if len > buf.buf_capacity()
+            && let Err(e) = buf.reserve(len - buf.buf_len())
         {
             return BufResult(Err(io::Error::new(io::ErrorKind::OutOfMemory, e)), buf);
         }

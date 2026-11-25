@@ -236,7 +236,10 @@ fn compio_client_interoperates_with_tokio_server() -> anyhow::Result<()> {
             write_result?;
             send.finish()?;
 
-            let (read_result, response) = recv.read_to_end(Vec::new()).await.into();
+            let (read_result, response) = recv
+                .read_to_end(Vec::with_capacity(b"pon".len()))
+                .await
+                .into();
             read_result?;
             ensure!(
                 response == b"pong",
