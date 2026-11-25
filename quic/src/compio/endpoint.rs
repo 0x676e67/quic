@@ -22,13 +22,13 @@ use compio_runtime::{JoinHandle, Runtime as CompioRuntime};
 use flume::{Receiver, Sender, bounded, unbounded};
 use futures_util::{FutureExt, StreamExt, future, select, task::AtomicWaker};
 use proto::{
-    ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
-    EndpointEvent, ServerConfig, Transmit, VarInt,
+    ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, EndpointConfig, EndpointEvent,
+    ServerConfig, Transmit, VarInt,
 };
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::compio::{
-    Connecting, ConnectionEvent, Incoming, RecvMeta, Socket,
+    Connecting, ConnectionError, ConnectionEvent, Incoming, RecvMeta, Socket,
     sync::{
         async_flag::{AsyncFlag, AsyncFlagHandle},
         mutex_blocking::Mutex,
@@ -44,6 +44,7 @@ struct EndpointState {
     response_worker: Option<JoinHandle<()>>,
     connections: HashMap<ConnectionHandle, Sender<ConnectionEvent>>,
     close: Option<(VarInt, Bytes)>,
+    stopped: bool,
     exit_on_idle: bool,
     incoming: VecDeque<proto::Incoming>,
     incoming_wakers: VecDeque<Waker>,
@@ -118,22 +119,20 @@ impl EndpointState {
     }
 
     fn poll_incoming(&mut self, cx: &mut Context<'_>) -> Poll<Option<proto::Incoming>> {
-        if self.close.is_none() {
-            if let Some(incoming) = self.incoming.pop_front() {
-                Poll::Ready(Some(incoming))
-            } else {
-                if !self
-                    .incoming_wakers
-                    .iter()
-                    .any(|waker| waker.will_wake(cx.waker()))
-                {
-                    self.incoming_wakers.push_back(cx.waker().clone());
-                }
-                Poll::Pending
-            }
-        } else {
-            Poll::Ready(None)
+        if self.stopped || self.close.is_some() {
+            return Poll::Ready(None);
         }
+        if let Some(incoming) = self.incoming.pop_front() {
+            return Poll::Ready(Some(incoming));
+        }
+        if !self
+            .incoming_wakers
+            .iter()
+            .any(|waker| waker.will_wake(cx.waker()))
+        {
+            self.incoming_wakers.push_back(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     fn wake_incoming_waiters(&mut self) {
@@ -209,6 +208,7 @@ impl EndpointInner {
                 response_worker: None,
                 connections: HashMap::default(),
                 close: None,
+                stopped: false,
                 exit_on_idle: false,
                 incoming: VecDeque::new(),
                 incoming_wakers: VecDeque::new(),
@@ -232,7 +232,7 @@ impl EndpointInner {
     ) -> Result<Connecting, ConnectError> {
         let mut state = self.state.lock();
 
-        if state.worker.is_none() {
+        if state.stopped || state.worker.is_none() {
             return Err(ConnectError::EndpointStopping);
         }
         if remote.is_ipv6() && !self.ipv6 {
@@ -275,6 +275,11 @@ impl EndpointInner {
         server_config: Option<ServerConfig>,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock();
+        if state.stopped {
+            state.stats.ignored_handshakes += 1;
+            state.endpoint.ignore(incoming);
+            return Err(ConnectionError::endpoint_stopped());
+        }
         let mut resp_buf = Vec::new();
         let now = Instant::now();
         match state
@@ -295,7 +300,7 @@ impl EndpointInner {
                 if let Some(transmit) = err.response {
                     self.respond(resp_buf, transmit);
                 }
-                Err(err.cause)
+                Err(err.cause.into())
             }
         }
     }
@@ -379,6 +384,27 @@ impl EndpointInner {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointRef(Shared<EndpointInner>);
+
+#[derive(Debug)]
+struct EndpointDriver(EndpointRef);
+
+impl EndpointDriver {
+    async fn run(&self, exit: AsyncFlag) -> io::Result<()> {
+        self.0.run(exit).await
+    }
+}
+
+impl Drop for EndpointDriver {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.stopped = true;
+        state.wake_incoming_waiters();
+        state.connections.clear();
+        if let Some(worker) = state.worker.take() {
+            worker.detach();
+        }
+    }
+}
 
 impl EndpointRef {
     fn into_inner(self) -> Shared<EndpointInner> {
@@ -485,9 +511,9 @@ impl Endpoint {
             exit.handle(),
         )?));
         let worker = inner.runtime.spawn({
-            let inner = inner.clone();
+            let driver = EndpointDriver(inner.clone());
             async move {
-                if let Err(e) = inner.run(exit).await {
+                if let Err(e) = driver.run(exit).await {
                     error!("I/O error: {:?}", e);
                 }
             }
@@ -572,11 +598,11 @@ impl Endpoint {
     /// Wait for the next incoming connection attempt from a client.
     ///
     /// Yields [`Incoming`]s, or `None` if the endpoint is
-    /// [`close`](Self::close)d. [`Incoming`] can be `await`ed to obtain the
-    /// final [`Connection`](crate::compio::Connection), or used to e.g. filter
-    /// connection attempts or force address validation, or converted into an
-    /// intermediate `Connecting` future which can be used to e.g. send 0.5-RTT
-    /// data.
+    /// [`close`](Self::close)d or its I/O worker has stopped. [`Incoming`] can be
+    /// `await`ed to obtain the final [`Connection`](crate::compio::Connection),
+    /// or used to e.g. filter connection attempts or force address validation,
+    /// or converted into an intermediate `Connecting` future which can be used
+    /// to e.g. send 0.5-RTT data.
     pub async fn wait_incoming(&self) -> Option<Incoming> {
         future::poll_fn(|cx| self.inner.state.lock().poll_incoming(cx))
             .await
@@ -648,6 +674,8 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "rustls-ring")]
+    use std::task::Poll;
     use std::{
         future::Future,
         io,
@@ -660,11 +688,19 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(feature = "rustls-ring")]
+    use compio_buf::bytes::Bytes;
     use compio_net::UdpSocket;
     use compio_runtime::time::{sleep, timeout};
     use proto::EndpointConfig;
+    #[cfg(feature = "rustls-ring")]
+    use proto::{ConnectError, TransportErrorCode};
 
+    #[cfg(feature = "rustls-ring")]
+    use super::ConnectionEvent;
     use super::{Endpoint, datagram_stride};
+    #[cfg(feature = "rustls-ring")]
+    use crate::compio::{ClientBuilder, ConnectionError, ServerBuilder, StoppedError};
 
     #[test]
     fn empty_datagram_has_no_stride() {
@@ -684,6 +720,27 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[cfg(feature = "rustls-ring")]
+    fn config_pair() -> (proto::ServerConfig, proto::ClientConfig) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = cert.der().clone();
+        let key = signing_key.serialize_der().try_into().unwrap();
+
+        let server = ServerBuilder::new_with_single_cert(vec![cert.clone()], key)
+            .unwrap()
+            .build()
+            .unwrap();
+        let client = ClientBuilder::new_with_empty_roots()
+            .with_custom_certificate(cert)
+            .unwrap()
+            .with_no_crls()
+            .build()
+            .unwrap();
+        (server, client)
     }
 
     #[compio_macros::test]
@@ -754,5 +811,185 @@ mod tests {
         .unwrap();
 
         drop(rebound);
+    }
+
+    #[compio_macros::test]
+    #[cfg(feature = "rustls-ring")]
+    async fn endpoint_driver_exit_wakes_waiters_and_rejects_connect() {
+        let (_, client_config) = config_pair();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            Endpoint::new(socket, EndpointConfig::default(), None, Some(client_config)).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut incoming = Box::pin(endpoint.wait_incoming());
+        assert!(
+            incoming
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        endpoint.inner.state.lock().exit_on_idle = true;
+        endpoint.inner.exit.clone().notify();
+        timeout(Duration::from_secs(1), async {
+            while !endpoint.inner.state.lock().stopped {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("endpoint worker did not mark the endpoint stopped");
+
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            incoming.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(None)
+        ));
+        assert!(matches!(
+            endpoint.connect(addr, "localhost", None),
+            Err(ConnectError::EndpointStopping)
+        ));
+
+        drop(incoming);
+        endpoint.shutdown().await.unwrap();
+    }
+
+    #[compio_macros::test]
+    #[cfg(feature = "rustls-ring")]
+    async fn incoming_accept_rejects_after_endpoint_driver_exit() {
+        let (server_config, client_config) = config_pair();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint::new(
+            socket,
+            EndpointConfig::default(),
+            Some(server_config),
+            Some(client_config),
+        )
+        .unwrap();
+        let connecting = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost", None)
+            .unwrap();
+        let incoming = timeout(Duration::from_secs(2), endpoint.wait_incoming())
+            .await
+            .expect("loopback Initial did not reach the endpoint")
+            .unwrap();
+        let worker = endpoint.inner.state.lock().worker.take().unwrap();
+
+        worker.cancel().await;
+        timeout(Duration::from_secs(1), async {
+            while !endpoint.inner.state.lock().stopped {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled endpoint worker did not run its cleanup");
+
+        let accept_error = incoming.accept().unwrap_err();
+        assert!(matches!(
+            accept_error,
+            ConnectionError::TransportError(error)
+                if error.code == TransportErrorCode::INTERNAL_ERROR
+        ));
+        assert_eq!(endpoint.stats().ignored_handshakes, 1);
+        let connect_error = timeout(Duration::from_secs(1), connecting)
+            .await
+            .expect("outgoing connection did not observe endpoint shutdown")
+            .unwrap_err();
+        assert!(matches!(
+            connect_error,
+            ConnectionError::TransportError(error)
+                if error.code == TransportErrorCode::INTERNAL_ERROR
+        ));
+
+        endpoint.shutdown().await.unwrap();
+    }
+
+    #[compio_macros::test]
+    #[cfg(feature = "rustls-ring")]
+    async fn cancelling_endpoint_worker_stops_active_connections() {
+        let (server_config, client_config) = config_pair();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint::new(
+            socket,
+            EndpointConfig::default(),
+            Some(server_config),
+            Some(client_config),
+        )
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (server_connection, client_connection) = timeout(Duration::from_secs(2), async {
+            futures_util::join!(
+                async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+                async {
+                    endpoint
+                        .connect(addr, "localhost", None)
+                        .unwrap()
+                        .await
+                        .unwrap()
+                }
+            )
+        })
+        .await
+        .expect("loopback connections did not finish handshaking");
+        let mut send = client_connection.open_uni().unwrap();
+        let stopped_counter = Arc::new(WakeCounter::default());
+        let stopped_waker = Waker::from(stopped_counter.clone());
+        let mut stopped = Box::pin(send.stopped());
+        assert!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(&stopped_waker))
+                .is_pending()
+        );
+        let worker = {
+            let mut state = endpoint.inner.state.lock();
+            state
+                .connections
+                .values()
+                .next()
+                .unwrap()
+                .send(ConnectionEvent::Close(0u32.into(), Bytes::new()))
+                .unwrap();
+            state.worker.take().unwrap()
+        };
+
+        worker.cancel().await;
+        timeout(Duration::from_secs(1), async {
+            while !endpoint.inner.state.lock().stopped {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled endpoint worker did not run its cleanup");
+
+        assert!(endpoint.inner.state.lock().stopped);
+        let (server_error, client_error) = timeout(Duration::from_secs(1), async {
+            futures_util::join!(server_connection.closed(), client_connection.closed())
+        })
+        .await
+        .expect("connections did not observe endpoint shutdown");
+        assert!(
+            [&server_error, &client_error]
+                .into_iter()
+                .any(|error| matches!(error, ConnectionError::LocallyClosed))
+        );
+        assert!([server_error, client_error].into_iter().any(|error| {
+            matches!(
+                error,
+                ConnectionError::TransportError(error)
+                    if error.code == TransportErrorCode::INTERNAL_ERROR
+            )
+        }));
+        let stopped_error = timeout(Duration::from_secs(1), stopped)
+            .await
+            .expect("stopped future did not observe endpoint shutdown")
+            .unwrap_err();
+        assert!(matches!(stopped_error, StoppedError::ConnectionLost(_)));
+        assert!(stopped_counter.0.load(Ordering::Relaxed) >= 1);
+
+        drop(send);
+        drop((server_connection, client_connection));
+        endpoint.shutdown().await.unwrap();
     }
 }

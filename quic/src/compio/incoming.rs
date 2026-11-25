@@ -31,7 +31,7 @@ impl Incoming {
     /// occur).
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
         let inner = self.0.take().unwrap();
-        Ok(inner.endpoint.accept(inner.incoming, None)?)
+        inner.endpoint.accept(inner.incoming, None)
     }
 
     /// Accept this incoming connection using a custom configuration.
@@ -44,7 +44,7 @@ impl Incoming {
         server_config: ServerConfig,
     ) -> Result<Connecting, ConnectionError> {
         let inner = self.0.take().unwrap();
-        Ok(inner.endpoint.accept(inner.incoming, Some(server_config))?)
+        inner.endpoint.accept(inner.incoming, Some(server_config))
     }
 
     /// Reject this incoming connection attempt.

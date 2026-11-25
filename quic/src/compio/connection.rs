@@ -20,8 +20,8 @@ use futures_util::{
     select, stream,
 };
 use proto::{
-    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent, StreamId, VarInt,
-    congestion::Controller,
+    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent, StreamId,
+    TransportError, TransportErrorCode, VarInt, congestion::Controller,
 };
 use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
@@ -214,8 +214,15 @@ impl ConnectionInner {
                     state.conn.handle_timeout(Instant::now());
                     state
                 }
-                events = event_stream.select_next_some() => {
+                events = event_stream.next().fuse() => {
                     let mut state = self.state();
+                    let Some(events) = events else {
+                        if state.error.is_none() {
+                            state.terminate(ConnectionError::endpoint_stopped());
+                            self.closed.notify_waiters();
+                        }
+                        break;
+                    };
                     for event in events {
                         match event {
                             ConnectionEvent::Close(error_code, reason) => {
@@ -1036,7 +1043,7 @@ pub enum ConnectionError {
     /// The peer violated the QUIC specification as understood by this
     /// implementation
     #[error(transparent)]
-    TransportError(#[from] proto::TransportError),
+    TransportError(#[from] TransportError),
     /// The peer's QUIC stack aborted the connection automatically
     #[error("aborted by peer: {0}")]
     ConnectionClosed(proto::ConnectionClose),
@@ -1065,6 +1072,15 @@ pub enum ConnectionError {
     /// Try using longer connection IDs.
     #[error("CIDs exhausted")]
     CidsExhausted,
+}
+
+impl ConnectionError {
+    pub(crate) fn endpoint_stopped() -> Self {
+        Self::TransportError(TransportError::new(
+            TransportErrorCode::INTERNAL_ERROR,
+            "endpoint driver future was dropped".to_string(),
+        ))
+    }
 }
 
 impl From<proto::ConnectionError> for ConnectionError {
