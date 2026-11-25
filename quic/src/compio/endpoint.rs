@@ -170,6 +170,17 @@ fn datagram_stride(len: usize, stride: usize) -> Option<usize> {
     (len != 0).then_some(if stride == 0 { len } else { stride.min(len) })
 }
 
+fn is_recoverable_recv_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::ConnectionReset || crate::endpoint::is_msg_size_err(error) {
+        return true;
+    }
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) {
+        return true;
+    }
+    false
+}
+
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
     state: Mutex<EndpointState>,
@@ -355,9 +366,7 @@ impl EndpointInner {
                     let mut state = self.state.lock();
                     match res {
                         Ok(meta) => state.handle_data(meta, &recv_buf, respond_fn),
-                        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
-                        #[cfg(windows)]
-                        Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
+                        Err(e) if is_recoverable_recv_error(&e) => {}
                         Err(e) => break Err(e),
                     }
                     recv_fut.set(self.socket.recv(recv_buf).fuse());
@@ -707,6 +716,18 @@ mod tests {
         assert_eq!(datagram_stride(0, 0), None);
         assert_eq!(datagram_stride(1200, 0), Some(1200));
         assert_eq!(datagram_stride(2400, 1200), Some(1200));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn winsock_message_size_error_does_not_stop_receiving() {
+        use windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;
+
+        let truncated_datagram = io::Error::from_raw_os_error(WSAEMSGSIZE);
+        assert!(super::is_recoverable_recv_error(&truncated_datagram));
+
+        let fatal = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(!super::is_recoverable_recv_error(&fatal));
     }
 
     #[derive(Default)]
