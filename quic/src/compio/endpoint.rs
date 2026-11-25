@@ -7,7 +7,7 @@ use std::{
     ops::Deref,
     pin::pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::Poll,
     time::Instant,
 };
 
@@ -18,12 +18,13 @@ use compio_net::ToSocketAddrsAsync;
 use compio_net::UdpSocket;
 use compio_runtime::{JoinHandle, Runtime as CompioRuntime};
 use flume::{Receiver, Sender, bounded, unbounded};
-use futures_util::{FutureExt, StreamExt, future, select, task::AtomicWaker};
+use futures_util::{FutureExt, StreamExt, select, task::AtomicWaker};
 use proto::{
     ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, EndpointConfig, EndpointEvent,
     ServerConfig, Transmit, VarInt,
 };
 use rustc_hash::FxHashMap as HashMap;
+use tokio::sync::Notify;
 
 use crate::compio::{
     Connecting, ConnectionError, ConnectionEvent, Incoming, RecvMeta, Socket,
@@ -45,7 +46,6 @@ struct EndpointState {
     stopped: bool,
     exit_on_idle: bool,
     incoming: VecDeque<proto::Incoming>,
-    incoming_wakers: VecDeque<Waker>,
     stats: EndpointStats,
 }
 
@@ -116,27 +116,6 @@ impl EndpointState {
         self.connections.is_empty()
     }
 
-    fn poll_incoming(&mut self, cx: &mut Context<'_>) -> Poll<Option<proto::Incoming>> {
-        if self.stopped || self.close.is_some() {
-            return Poll::Ready(None);
-        }
-        if let Some(incoming) = self.incoming.pop_front() {
-            return Poll::Ready(Some(incoming));
-        }
-        if !self
-            .incoming_wakers
-            .iter()
-            .any(|waker| waker.will_wake(cx.waker()))
-        {
-            self.incoming_wakers.push_back(cx.waker().clone());
-        }
-        Poll::Pending
-    }
-
-    fn wake_incoming_waiters(&mut self) {
-        self.incoming_wakers.drain(..).for_each(Waker::wake);
-    }
-
     fn new_connection(
         &mut self,
         handle: ConnectionHandle,
@@ -186,6 +165,7 @@ pub(crate) struct EndpointInner {
     ipv6: bool,
     events: ChannelPair<(ConnectionHandle, EndpointEvent)>,
     responses: ChannelPair<(Vec<u8>, Transmit)>,
+    incoming: Notify,
     exit: AsyncFlagHandle,
     done: AtomicWaker,
 }
@@ -218,13 +198,13 @@ impl EndpointInner {
                 stopped: false,
                 exit_on_idle: false,
                 incoming: VecDeque::new(),
-                incoming_wakers: VecDeque::new(),
                 stats: EndpointStats::default(),
             }),
             socket,
             ipv6,
             events: unbounded(),
             responses,
+            incoming: Notify::new(),
             exit,
             done: AtomicWaker::new(),
         })
@@ -360,7 +340,7 @@ impl EndpointInner {
         let mut exit = pin!(exit.wait().fuse());
 
         loop {
-            let mut state = select! {
+            let state = select! {
                 () = exit => self.state.lock(),
                 BufResult(res, recv_buf) = recv_fut => {
                     let mut state = self.state.lock();
@@ -384,8 +364,10 @@ impl EndpointInner {
             if state.exit_on_idle && state.is_idle() {
                 break Ok(());
             }
-            if !state.incoming.is_empty() {
-                state.wake_incoming_waiters();
+            let notify_incoming = !state.incoming.is_empty();
+            drop(state);
+            if notify_incoming {
+                self.incoming.notify_waiters();
             }
         }
     }
@@ -411,12 +393,12 @@ impl Drop for EndpointDriver {
         {
             let mut state = self.0.state.lock();
             state.stopped = true;
-            state.wake_incoming_waiters();
             state.connections.clear();
             if let Some(worker) = state.worker.take() {
                 worker.detach();
             }
         }
+        self.0.incoming.notify_waiters();
         self.0.done.wake();
     }
 }
@@ -635,9 +617,19 @@ impl Endpoint {
     /// or converted into an intermediate `Connecting` future which can be used
     /// to e.g. send 0.5-RTT data.
     pub async fn wait_incoming(&self) -> Option<Incoming> {
-        future::poll_fn(|cx| self.inner.state.lock().poll_incoming(cx))
-            .await
-            .map(|incoming| Incoming::new(incoming, self.inner.clone()))
+        loop {
+            let notified = {
+                let mut state = self.inner.state.lock();
+                if state.stopped || state.close.is_some() {
+                    return None;
+                }
+                if let Some(incoming) = state.incoming.pop_front() {
+                    return Some(Incoming::new(incoming, self.inner.clone()));
+                }
+                self.inner.incoming.notified()
+            };
+            notified.await;
+        }
     }
 
     /// Replace the server configuration, affecting new incoming connections
@@ -679,7 +671,8 @@ impl Endpoint {
         for conn in state.connections.values() {
             let _ = conn.send(ConnectionEvent::Close(error_code, reason.clone()));
         }
-        state.wake_incoming_waiters();
+        drop(state);
+        self.inner.incoming.notify_waiters();
     }
 
     /// Gracefully shutdown the endpoint.
@@ -816,11 +809,11 @@ mod tests {
     }
 
     #[compio_macros::test]
-    async fn cancelled_waiter_does_not_consume_incoming_wakeup() {
+    async fn cancelled_waiter_releases_incoming_registration() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
         let cancelled_counter = Arc::new(WakeCounter::default());
-        let cancelled_waker = Waker::from(cancelled_counter);
+        let cancelled_waker = Waker::from(cancelled_counter.clone());
         let mut cancelled = Box::pin(endpoint.wait_incoming());
 
         assert!(
@@ -835,23 +828,34 @@ mod tests {
                 .poll(&mut Context::from_waker(&cancelled_waker))
                 .is_pending()
         );
-        assert_eq!(endpoint.inner.state.lock().incoming_wakers.len(), 1);
         drop(cancelled);
 
-        let active_counter = Arc::new(WakeCounter::default());
-        let active_waker = Waker::from(active_counter.clone());
-        let mut active = Box::pin(endpoint.wait_incoming());
+        let first_counter = Arc::new(WakeCounter::default());
+        let first_waker = Waker::from(first_counter.clone());
+        let mut first = Box::pin(endpoint.wait_incoming());
         assert!(
-            active
+            first
                 .as_mut()
-                .poll(&mut Context::from_waker(&active_waker))
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        let second_counter = Arc::new(WakeCounter::default());
+        let second_waker = Waker::from(second_counter.clone());
+        let mut second = Box::pin(endpoint.wait_incoming());
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker))
                 .is_pending()
         );
 
-        endpoint.inner.state.lock().wake_incoming_waiters();
-        assert_eq!(active_counter.0.load(Ordering::Relaxed), 1);
+        endpoint.inner.incoming.notify_waiters();
+        assert_eq!(cancelled_counter.0.load(Ordering::Relaxed), 0);
+        assert_eq!(first_counter.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second_counter.0.load(Ordering::Relaxed), 1);
 
-        drop(active);
+        drop(first);
+        drop(second);
         endpoint.shutdown().await.unwrap();
     }
 
@@ -978,13 +982,23 @@ mod tests {
             Some(client_config),
         )
         .unwrap();
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter);
+        let mut incoming = Box::pin(endpoint.wait_incoming());
+        assert!(
+            incoming
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         let connecting = endpoint
             .connect(endpoint.local_addr().unwrap(), "localhost", None)
             .unwrap();
-        let incoming = timeout(Duration::from_secs(2), endpoint.wait_incoming())
+        let accepted = timeout(Duration::from_secs(2), incoming.as_mut())
             .await
             .expect("loopback Initial did not reach the endpoint")
             .unwrap();
+        drop(incoming);
         let worker = endpoint.inner.state.lock().worker.take().unwrap();
 
         worker.cancel().await;
@@ -996,7 +1010,7 @@ mod tests {
         .await
         .expect("cancelled endpoint worker did not run its cleanup");
 
-        let accept_error = incoming.accept().unwrap_err();
+        let accept_error = accepted.accept().unwrap_err();
         assert!(matches!(
             accept_error,
             ConnectionError::TransportError(error)
