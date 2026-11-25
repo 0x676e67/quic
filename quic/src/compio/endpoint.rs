@@ -722,15 +722,38 @@ mod tests {
         Runtime as CompioRuntime,
         time::{sleep, timeout},
     };
-    use proto::EndpointConfig;
     #[cfg(feature = "rustls-ring")]
     use proto::{ConnectError, TransportErrorCode};
+    use proto::{
+        EndpointConfig,
+        crypto::{CryptoError, HmacKey},
+    };
 
     #[cfg(feature = "rustls-ring")]
     use super::ConnectionEvent;
     use super::{Endpoint, Shared, datagram_stride};
     #[cfg(feature = "rustls-ring")]
     use crate::compio::{ClientBuilder, ConnectionError, ServerBuilder, StoppedError};
+
+    fn idle_endpoint_config() -> EndpointConfig {
+        struct UnusedResetKey;
+
+        impl HmacKey for UnusedResetKey {
+            fn sign(&self, _: &[u8], _: &mut [u8]) {
+                unreachable!("idle endpoint tests do not send stateless resets");
+            }
+
+            fn signature_len(&self) -> usize {
+                32
+            }
+
+            fn verify(&self, _: &[u8], _: &[u8]) -> Result<(), CryptoError> {
+                Err(CryptoError)
+            }
+        }
+
+        EndpointConfig::new(Arc::new(UnusedResetKey))
+    }
 
     #[test]
     fn empty_datagram_has_no_stride() {
@@ -811,7 +834,7 @@ mod tests {
     #[compio_macros::test]
     async fn cancelled_waiter_releases_incoming_registration() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+        let endpoint = Endpoint::new(socket, idle_endpoint_config(), None, None).unwrap();
         let cancelled_counter = Arc::new(WakeCounter::default());
         let cancelled_waker = Waker::from(cancelled_counter.clone());
         let mut cancelled = Box::pin(endpoint.wait_incoming());
@@ -863,7 +886,7 @@ mod tests {
     async fn dropping_last_endpoint_releases_idle_socket() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+        let endpoint = Endpoint::new(socket, idle_endpoint_config(), None, None).unwrap();
 
         assert_eq!(
             StdUdpSocket::bind(addr).unwrap_err().kind(),
@@ -895,7 +918,7 @@ mod tests {
         let (endpoint, addr) = runtime.block_on(async {
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = socket.local_addr().unwrap();
-            let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+            let endpoint = Endpoint::new(socket, idle_endpoint_config(), None, None).unwrap();
             (endpoint, addr)
         });
         let inner = Shared::downgrade(&endpoint.inner.inner);
