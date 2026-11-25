@@ -3,11 +3,9 @@ use std::{
     fmt::Debug,
     future::poll_fn,
     io,
-    mem::ManuallyDrop,
     net::{SocketAddr, SocketAddrV6},
     ops::Deref,
     pin::pin,
-    ptr,
     sync::Arc,
     task::{Context, Poll, Waker},
     time::Instant,
@@ -185,7 +183,6 @@ fn is_recoverable_recv_error(error: &io::Error) -> bool {
 pub(crate) struct EndpointInner {
     state: Mutex<EndpointState>,
     socket: Socket,
-    runtime: CompioRuntime,
     ipv6: bool,
     events: ChannelPair<(ConnectionHandle, EndpointEvent)>,
     responses: ChannelPair<(Vec<u8>, Transmit)>,
@@ -195,7 +192,6 @@ pub(crate) struct EndpointInner {
 
 impl EndpointInner {
     fn new(
-        runtime: CompioRuntime,
         socket: UdpSocket,
         config: EndpointConfig,
         server_config: Option<ServerConfig>,
@@ -226,7 +222,6 @@ impl EndpointInner {
                 stats: EndpointStats::default(),
             }),
             socket,
-            runtime,
             ipv6,
             events: unbounded(),
             responses,
@@ -240,6 +235,7 @@ impl EndpointInner {
         remote: SocketAddr,
         server_name: &str,
         config: Option<ClientConfig>,
+        runtime: &CompioRuntime,
     ) -> Result<Connecting, ConnectError> {
         let mut state = self.state.lock();
 
@@ -273,7 +269,7 @@ impl EndpointInner {
             conn,
             self.socket.clone(),
             self.events.0.clone(),
-            &self.runtime,
+            runtime,
         ))
     }
 
@@ -287,6 +283,7 @@ impl EndpointInner {
         &self,
         incoming: proto::Incoming,
         server_config: Option<ServerConfig>,
+        runtime: &CompioRuntime,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock();
         if state.stopped {
@@ -307,7 +304,7 @@ impl EndpointInner {
                     conn,
                     self.socket.clone(),
                     self.events.0.clone(),
-                    &self.runtime,
+                    runtime,
                 ))
             }
             Err(err) => {
@@ -395,10 +392,13 @@ impl EndpointInner {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct EndpointRef(Shared<EndpointInner>);
+pub(crate) struct EndpointRef {
+    inner: Shared<EndpointInner>,
+    runtime: CompioRuntime,
+}
 
 #[derive(Debug)]
-struct EndpointDriver(EndpointRef);
+struct EndpointDriver(Shared<EndpointInner>);
 
 impl EndpointDriver {
     async fn run(&self, exit: AsyncFlag) -> io::Result<()> {
@@ -408,26 +408,47 @@ impl EndpointDriver {
 
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock();
-        state.stopped = true;
-        state.wake_incoming_waiters();
-        state.connections.clear();
-        if let Some(worker) = state.worker.take() {
-            worker.detach();
+        {
+            let mut state = self.0.state.lock();
+            state.stopped = true;
+            state.wake_incoming_waiters();
+            state.connections.clear();
+            if let Some(worker) = state.worker.take() {
+                worker.detach();
+            }
         }
+        self.0.done.wake();
     }
 }
 
 impl EndpointRef {
+    fn connect(
+        &self,
+        remote: SocketAddr,
+        server_name: &str,
+        config: Option<ClientConfig>,
+    ) -> Result<Connecting, ConnectError> {
+        self.inner
+            .connect(remote, server_name, config, &self.runtime)
+    }
+
+    pub(crate) fn accept(
+        &self,
+        incoming: proto::Incoming,
+        server_config: Option<ServerConfig>,
+    ) -> Result<Connecting, ConnectionError> {
+        self.inner.accept(incoming, server_config, &self.runtime)
+    }
+
     fn into_inner(self) -> Shared<EndpointInner> {
-        let this = ManuallyDrop::new(self);
-        // SAFETY: `this` is not dropped here, and we're consuming Self
-        unsafe { ptr::read(&this.0) }
+        let inner = self.inner.clone();
+        drop(self);
+        inner
     }
 
     async fn shutdown(self) -> io::Result<()> {
         let (worker, response_worker, idle) = {
-            let mut state = self.0.state.lock();
+            let mut state = self.inner.state.lock();
             let idle = state.is_idle();
             if !idle {
                 state.exit_on_idle = true;
@@ -473,13 +494,13 @@ impl EndpointRef {
 
 impl Drop for EndpointRef {
     fn drop(&mut self) {
-        if Shared::strong_count(&self.0) == 2 {
+        if Shared::strong_count(&self.inner) == 2 {
             // There are actually two cases:
             // 1. User dropped the endpoint but the worker is still running.
-            self.0.state.lock().exit_on_idle = true;
-            self.0.exit.clone().notify();
+            self.inner.state.lock().exit_on_idle = true;
+            self.inner.exit.clone().notify();
             // 2. User is trying to shutdown the socket.
-            self.0.done.wake();
+            self.inner.done.wake();
         }
     }
 }
@@ -488,7 +509,7 @@ impl Deref for EndpointRef {
     type Target = EndpointInner;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
@@ -509,20 +530,18 @@ impl Endpoint {
         let runtime = CompioRuntime::try_current().ok_or_else(|| {
             io::Error::other("a Compio endpoint must be created inside a running Compio runtime")
         })?;
-        // With `runtime-compio-sync`, `Shared` is an `Arc`, but the captured Compio runtime keeps
-        // the endpoint local to its owner thread. The `Arc` only changes the internal handle
-        // primitives; it intentionally does not promise that `Endpoint` itself is `Send`.
+        // Only application-side endpoint references retain the runtime, so dropping it can clear
+        // parked driver tasks.
         let exit = AsyncFlag::new();
         #[allow(clippy::arc_with_non_send_sync)]
-        let inner = EndpointRef(Shared::new(EndpointInner::new(
-            runtime,
+        let inner = Shared::new(EndpointInner::new(
             socket,
             config,
             server_config,
             default_client_config,
             exit.handle(),
-        )?));
-        let worker = inner.runtime.spawn({
+        )?);
+        let worker = runtime.spawn({
             let driver = EndpointDriver(inner.clone());
             async move {
                 if let Err(e) = driver.run(exit).await {
@@ -531,7 +550,7 @@ impl Endpoint {
             }
             .in_current_span()
         });
-        let response_worker = inner.runtime.spawn({
+        let response_worker = runtime.spawn({
             let responses = inner.responses.1.clone();
             let socket = inner.socket.clone();
             async move {
@@ -545,6 +564,7 @@ impl Endpoint {
         state.worker = Some(worker);
         state.response_worker = Some(response_worker);
         drop(state);
+        let inner = EndpointRef { inner, runtime };
         Ok(Self { inner })
     }
 
@@ -674,6 +694,9 @@ impl Endpoint {
     /// exiting immediately could force them to wait out the idle timeout
     /// period.
     ///
+    /// On Windows, await this method on the endpoint's owning Compio runtime
+    /// to ensure the socket is released when a UDP receive is pending.
+    ///
     /// Does not proactively close existing connections. Consider calling
     /// [`close()`] if that is desired.
     ///
@@ -702,14 +725,17 @@ mod tests {
     #[cfg(feature = "rustls-ring")]
     use compio_buf::bytes::Bytes;
     use compio_net::UdpSocket;
-    use compio_runtime::time::{sleep, timeout};
+    use compio_runtime::{
+        Runtime as CompioRuntime,
+        time::{sleep, timeout},
+    };
     use proto::EndpointConfig;
     #[cfg(feature = "rustls-ring")]
     use proto::{ConnectError, TransportErrorCode};
 
     #[cfg(feature = "rustls-ring")]
     use super::ConnectionEvent;
-    use super::{Endpoint, datagram_stride};
+    use super::{Endpoint, Shared, datagram_stride};
     #[cfg(feature = "rustls-ring")]
     use crate::compio::{ClientBuilder, ConnectionError, ServerBuilder, StoppedError};
 
@@ -857,6 +883,45 @@ mod tests {
         .unwrap();
 
         drop(rebound);
+    }
+
+    #[test]
+    fn dropping_endpoint_and_runtime_outside_block_on_reclaims_endpoint_state() {
+        let runtime = CompioRuntime::new().unwrap();
+        let (endpoint, addr) = runtime.block_on(async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+            (endpoint, addr)
+        });
+        let inner = Shared::downgrade(&endpoint.inner.inner);
+
+        assert_eq!(
+            StdUdpSocket::bind(addr).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(endpoint);
+        drop(runtime);
+
+        assert!(inner.upgrade().is_none());
+
+        #[cfg(not(windows))]
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let rebound = loop {
+                match StdUdpSocket::bind(addr) {
+                    Ok(socket) => break socket,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::AddrInUse
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("endpoint leaked its UDP socket: {error}"),
+                }
+            };
+            drop(rebound);
+        }
     }
 
     #[compio_macros::test]
