@@ -29,7 +29,11 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::compio::{
     Connecting, ConnectionEvent, Incoming, RecvMeta, Socket,
-    sync::{mutex_blocking::Mutex, shared::Shared},
+    sync::{
+        async_flag::{AsyncFlag, AsyncFlagHandle},
+        mutex_blocking::Mutex,
+        shared::Shared,
+    },
 };
 
 #[derive(Debug)]
@@ -175,6 +179,7 @@ pub(crate) struct EndpointInner {
     ipv6: bool,
     events: ChannelPair<(ConnectionHandle, EndpointEvent)>,
     responses: ChannelPair<(Vec<u8>, Transmit)>,
+    exit: AsyncFlagHandle,
     done: AtomicWaker,
 }
 
@@ -185,6 +190,7 @@ impl EndpointInner {
         config: EndpointConfig,
         server_config: Option<ServerConfig>,
         default_client_config: Option<ClientConfig>,
+        exit: AsyncFlagHandle,
     ) -> io::Result<Self> {
         let socket = Socket::new(socket)?;
         let ipv6 = socket.local_addr()?.is_ipv6();
@@ -213,6 +219,7 @@ impl EndpointInner {
             ipv6,
             events: unbounded(),
             responses,
+            exit,
             done: AtomicWaker::new(),
         })
     }
@@ -316,7 +323,7 @@ impl EndpointInner {
         state.endpoint.ignore(incoming);
     }
 
-    async fn run(&self) -> io::Result<()> {
+    async fn run(&self, exit: AsyncFlag) -> io::Result<()> {
         let respond_fn = |buf: Vec<u8>, transmit: Transmit| self.respond(buf, transmit);
 
         let mut recv_fut = pin!(
@@ -334,9 +341,11 @@ impl EndpointInner {
         );
 
         let mut event_stream = self.events.1.stream().ready_chunks(100);
+        let mut exit = pin!(exit.wait().fuse());
 
         loop {
             let mut state = select! {
+                () = exit => self.state.lock(),
                 BufResult(res, recv_buf) = recv_fut => {
                     let mut state = self.state.lock();
                     match res {
@@ -428,10 +437,11 @@ impl Drop for EndpointRef {
     fn drop(&mut self) {
         if Shared::strong_count(&self.0) == 2 {
             // There are actually two cases:
-            // 1. User is trying to shutdown the socket.
-            self.0.done.wake();
-            // 2. User dropped the endpoint but the worker is still running.
+            // 1. User dropped the endpoint but the worker is still running.
             self.0.state.lock().exit_on_idle = true;
+            self.0.exit.clone().notify();
+            // 2. User is trying to shutdown the socket.
+            self.0.done.wake();
         }
     }
 }
@@ -464,6 +474,7 @@ impl Endpoint {
         // With `runtime-compio-sync`, `Shared` is an `Arc`, but the captured Compio runtime keeps
         // the endpoint local to its owner thread. The `Arc` only changes the internal handle
         // primitives; it intentionally does not promise that `Endpoint` itself is `Send`.
+        let exit = AsyncFlag::new();
         #[allow(clippy::arc_with_non_send_sync)]
         let inner = EndpointRef(Shared::new(EndpointInner::new(
             runtime,
@@ -471,11 +482,12 @@ impl Endpoint {
             config,
             server_config,
             default_client_config,
+            exit.handle(),
         )?));
         let worker = inner.runtime.spawn({
             let inner = inner.clone();
             async move {
-                if let Err(e) = inner.run().await {
+                if let Err(e) = inner.run(exit).await {
                     error!("I/O error: {:?}", e);
                 }
             }
@@ -638,14 +650,18 @@ impl Endpoint {
 mod tests {
     use std::{
         future::Future,
+        io,
+        net::UdpSocket as StdUdpSocket,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Wake, Waker},
+        time::Duration,
     };
 
     use compio_net::UdpSocket;
+    use compio_runtime::time::{sleep, timeout};
     use proto::EndpointConfig;
 
     use super::{Endpoint, datagram_stride};
@@ -708,5 +724,35 @@ mod tests {
 
         drop(active);
         endpoint.shutdown().await.unwrap();
+    }
+
+    #[compio_macros::test]
+    async fn dropping_last_endpoint_releases_idle_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+
+        assert_eq!(
+            StdUdpSocket::bind(addr).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(endpoint);
+
+        let rebound = timeout(Duration::from_secs(1), async {
+            loop {
+                match StdUdpSocket::bind(addr) {
+                    Ok(socket) => break Ok(socket),
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await
+        .expect("endpoint worker did not release its UDP socket")
+        .unwrap();
+
+        drop(rebound);
     }
 }
