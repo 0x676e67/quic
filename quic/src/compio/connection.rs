@@ -742,7 +742,7 @@ impl Connection {
         if let Some(bytes) = state.conn.datagrams().recv() {
             return Poll::Ready(Ok(bytes));
         }
-        state.datagram_received.push_back(cx.waker().clone());
+        register_waker(&mut state.datagram_received, cx.waker());
         Poll::Pending
     }
 
@@ -777,7 +777,7 @@ impl Connection {
                     // is safer than panicking in application code.
                     return Ok(());
                 };
-                state.datagrams_unblocked.push_back(cx.waker().clone());
+                register_waker(&mut state.datagrams_unblocked, cx.waker());
                 return Err(Err(data));
             }
         }
@@ -834,7 +834,7 @@ impl Connection {
             )))
         } else {
             if let Some(cx) = cx {
-                state.stream_available[dir as usize].push_back(cx.waker().clone());
+                register_waker(&mut state.stream_available[dir as usize], cx.waker());
             }
             Poll::Pending
         }
@@ -910,7 +910,7 @@ impl Connection {
             state.wake();
             Poll::Ready(Ok((stream, state.conn.is_handshaking())))
         } else {
-            state.stream_opened[dir as usize].push_back(cx.waker().clone());
+            register_waker(&mut state.stream_opened[dir as usize], cx.waker());
             Poll::Pending
         }
     }

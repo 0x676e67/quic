@@ -121,6 +121,76 @@ async fn loopback_uses_the_local_protocol_state_machine() {
 }
 
 #[compio_macros::test]
+async fn repeated_polls_register_one_waker_per_connection_wait() {
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct TrackedWake(Waker);
+
+    impl Wake for TrackedWake {
+        fn wake(self: Arc<Self>) {
+            self.0.wake_by_ref();
+        }
+    }
+
+    async fn assert_single_registration(wait: impl Future) {
+        let mut wait = std::pin::pin!(wait);
+        std::future::poll_fn(|cx| {
+            let tracked = Arc::new(TrackedWake(cx.waker().clone()));
+            let waker = Waker::from(tracked.clone());
+            let mut context = Context::from_waker(&waker);
+            let initial_references = Arc::strong_count(&tracked);
+
+            for _ in 0..4 {
+                assert!(wait.as_mut().poll(&mut context).is_pending());
+            }
+
+            assert_eq!(Arc::strong_count(&tracked), initial_references + 1);
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    let mut transport = TransportConfig::default();
+    transport
+        .max_concurrent_uni_streams(0u32.into())
+        .datagram_send_buffer_size(1);
+    let (server_config, client_config) = config_pair(transport);
+    let endpoint = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    compio_runtime::time::timeout(Duration::from_secs(5), async {
+        join!(
+            async {
+                let connection = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                connection.closed().await;
+            },
+            async {
+                let connection = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                connection.handshake_confirmed().await.unwrap();
+
+                assert_single_registration(connection.recv_datagram()).await;
+                assert_single_registration(connection.accept_uni()).await;
+                assert_single_registration(connection.open_uni_wait()).await;
+                connection.send_datagram(b"a".as_slice().into()).unwrap();
+                assert_single_registration(connection.send_datagram_wait(b"b".as_slice().into()))
+                    .await;
+                connection.close(0u32.into(), b"done");
+            }
+        );
+    })
+    .await
+    .unwrap();
+
+    endpoint.shutdown().await.unwrap();
+}
+
+#[compio_macros::test]
 async fn closed_observers_survive_cancellation_and_run_concurrently() {
     const TIMEOUT: Duration = Duration::from_secs(2);
 
