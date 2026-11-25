@@ -373,14 +373,9 @@ impl RecvStream {
             return BufResult(Err(io::Error::new(io::ErrorKind::OutOfMemory, e)), buf);
         }
         let mut buf = buf.slice(..len);
-        let slice = buf.ensure_init();
-        for (offset, bytes) in chunks {
-            let offset = (offset - start) as usize;
-            let buf_len = bytes.len();
-            slice[offset..offset + buf_len].copy_from_slice(&bytes);
-        }
+        copy_read_chunks(&mut buf, start, chunks);
         let mut buf = buf.into_inner();
-        // SAFETY: all `len` bytes were initialized by the copies above.
+        // SAFETY: `copy_read_chunks` initialized every byte in the result range.
         unsafe { buf.advance_to(len) }
         BufResult(Ok(len), buf)
     }
@@ -389,6 +384,17 @@ impl RecvStream {
     #[cfg(feature = "futures-io")]
     pub fn into_compat(self) -> CompatRecvStream {
         CompatRecvStream(self)
+    }
+}
+
+fn copy_read_chunks(buf: &mut impl IoBufMut, start_offset: u64, chunks: Vec<(u64, Bytes)>) {
+    let initialized_len = buf.buf_len();
+    let slice = buf.ensure_init();
+    // `ensure_init` clears only the uninitialized tail.
+    slice[..initialized_len].fill(0);
+    for (offset, bytes) in chunks {
+        let offset = (offset - start_offset) as usize;
+        slice[offset..offset + bytes.len()].copy_from_slice(&bytes);
     }
 }
 
@@ -689,5 +695,25 @@ pub(crate) mod h3_impl {
                 .try_into()
                 .unwrap_or_else(|_| h3::proto::varint::VarInt::MAX.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use compio_buf::{IntoInner, IoBuf, bytes::Bytes};
+
+    use super::copy_read_chunks;
+
+    #[test]
+    fn read_to_end_zeros_gaps_in_a_reused_buffer() {
+        let mut buf = vec![0xff; 6].slice(..5);
+        let chunks = vec![
+            (14, Bytes::from_static(b"e")),
+            (10, Bytes::from_static(b"a")),
+        ];
+
+        copy_read_chunks(&mut buf, 10, chunks);
+
+        assert_eq!(buf.into_inner(), b"a\0\0\0e\xff");
     }
 }
