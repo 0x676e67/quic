@@ -238,7 +238,7 @@ mod verifier {
                     .unwrap_or_else(|| {
                         #[cfg(all(
                             not(feature = "rustls-ring"),
-                            feature = "rustls-aws-lc-rs"
+                            any(feature = "rustls-aws-lc-rs", feature = "rustls-aws-lc-rs-fips")
                         ))]
                         use rustls::crypto::aws_lc_rs::default_provider;
                         #[cfg(feature = "rustls-ring")]
