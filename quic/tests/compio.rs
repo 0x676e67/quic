@@ -123,6 +123,67 @@ async fn loopback_uses_the_local_protocol_state_machine() {
 }
 
 #[compio_macros::test]
+async fn connection_drains_received_streams_and_datagrams_after_peer_closes() {
+    let (server_config, client_config) = config_pair(TransportConfig::default());
+    let endpoint = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    endpoint.set_default_client_config(client_config);
+    let (received_tx, received_rx) = flume::bounded(1);
+
+    compio_runtime::time::timeout(Duration::from_secs(5), async {
+        join!(
+            async {
+                let connection = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                let mut send = connection.open_uni().unwrap();
+                send.write_all(b"stream").await.unwrap();
+                send.finish().unwrap();
+                connection.send_datagram(b"one".as_slice().into()).unwrap();
+                connection.send_datagram(b"two".as_slice().into()).unwrap();
+                assert_eq!(send.stopped().await.unwrap(), None);
+                received_rx.recv_async().await.unwrap();
+                connection.close(1u32.into(), b"done");
+            },
+            async {
+                let connection = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                while connection.stats().frame_rx.datagram < 2 {
+                    compio_runtime::time::sleep(Duration::from_millis(1)).await;
+                }
+                received_tx.send_async(()).await.unwrap();
+                let close = connection.closed().await;
+                assert!(matches!(
+                    close,
+                    quic::compio::ConnectionError::ApplicationClosed(_)
+                ));
+
+                let mut recv = connection.accept_uni().await.unwrap();
+                let (_, payload) = recv.read_to_end(Vec::new()).await.unwrap();
+                assert_eq!(payload, b"stream");
+                assert_eq!(connection.accept_uni().await.unwrap_err(), close);
+
+                let mut datagrams = [
+                    connection.try_recv_datagram().unwrap().unwrap(),
+                    connection.recv_datagram().await.unwrap(),
+                ];
+                datagrams.sort();
+                assert_eq!(&datagrams[0][..], b"one");
+                assert_eq!(&datagrams[1][..], b"two");
+                assert_eq!(connection.try_recv_datagram().unwrap_err(), close);
+                assert_eq!(connection.recv_datagram().await.unwrap_err(), close);
+            }
+        );
+    })
+    .await
+    .expect("test peer did not deliver queued traffic and close");
+
+    endpoint.shutdown().await.unwrap();
+}
+
+#[compio_macros::test]
 async fn repeated_polls_register_one_waker_per_connection_wait() {
     use std::task::{Context, Poll, Wake, Waker};
 

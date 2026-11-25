@@ -745,22 +745,32 @@ impl Connection {
     }
 
     fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, ConnectionError>> {
-        let mut state = self.0.try_state()?;
+        let mut state = self.0.state();
         if let Some(bytes) = state.conn.datagrams().recv() {
             return Poll::Ready(Ok(bytes));
+        }
+        if let Some(error) = &state.error {
+            return Poll::Ready(Err(error.clone()));
         }
         register_waker(&mut state.datagram_received, cx.waker());
         Poll::Pending
     }
 
-    /// Try to receive an application datagram. Returns None if no datagram is
-    /// available.
+    /// Try to receive an application datagram.
+    ///
+    /// Buffered datagrams remain available after the connection closes. When the queue is
+    /// empty, this returns the close reason for a closed connection, or `Ok(None)` otherwise.
     pub fn try_recv_datagram(&self) -> Result<Option<Bytes>, ConnectionError> {
-        let mut state = self.0.try_state()?;
-        Ok(state.conn.datagrams().recv())
+        let mut state = self.0.state();
+        if let Some(bytes) = state.conn.datagrams().recv() {
+            return Ok(Some(bytes));
+        }
+        state.error.clone().map_or(Ok(None), Err)
     }
 
     /// Receive an application datagram.
+    ///
+    /// Buffered datagrams are delivered before the close reason.
     pub async fn recv_datagram(&self) -> Result<Bytes, ConnectionError> {
         future::poll_fn(|cx| self.poll_recv_datagram(cx)).await
     }
@@ -912,23 +922,29 @@ impl Connection {
         cx: &mut Context<'_>,
         dir: Dir,
     ) -> Poll<Result<(StreamId, bool), ConnectionError>> {
-        let mut state = self.0.try_state()?;
+        let mut state = self.0.state();
         if let Some(stream) = state.conn.streams().accept(dir) {
             state.wake();
             Poll::Ready(Ok((stream, state.conn.is_handshaking())))
+        } else if let Some(error) = &state.error {
+            Poll::Ready(Err(error.clone()))
         } else {
             register_waker(&mut state.stream_opened[dir as usize], cx.waker());
             Poll::Pending
         }
     }
 
-    /// Accept the next incoming uni-directional stream
+    /// Accept the next incoming unidirectional stream.
+    ///
+    /// Already-received streams remain available after the connection closes.
     pub async fn accept_uni(&self) -> Result<RecvStream, ConnectionError> {
         let (stream, is_0rtt) = future::poll_fn(|cx| self.poll_accept_stream(cx, Dir::Uni)).await?;
         Ok(RecvStream::new(self.0.clone(), stream, is_0rtt))
     }
 
     /// Accept the next incoming bidirectional stream
+    ///
+    /// Already-received streams remain available after the connection closes.
     ///
     /// **Important Note**: The `Connection` that calls [`open_bi()`] must write
     /// to its [`SendStream`] before the other `Connection` is able to
