@@ -5,6 +5,7 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::{Pin, pin},
+    sync::atomic::Ordering,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
@@ -29,6 +30,7 @@ use tokio::sync::Notify;
 use crate::compio::{
     RecvStream, SendStream, Socket,
     sync::{
+        atomic::AtomicUsize,
         mutex_blocking::{Mutex, MutexGuard},
         shared::Shared,
     },
@@ -123,17 +125,12 @@ fn wake_all_streams(wakers: &mut HashMap<StreamId, Waker>) {
 #[derive(Debug)]
 pub(crate) struct ConnectionInner {
     state: Mutex<ConnectionState>,
+    application_refs: AtomicUsize,
     handle: ConnectionHandle,
     socket: Socket,
     events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     events_rx: Receiver<ConnectionEvent>,
     closed: Notify,
-}
-
-fn implicit_close(this: &Shared<ConnectionInner>) {
-    if Shared::strong_count(this) == 2 {
-        this.state().close(0u32.into(), Bytes::new())
-    }
 }
 
 impl ConnectionInner {
@@ -163,6 +160,7 @@ impl ConnectionInner {
                 readable: HashMap::default(),
                 stopped: HashMap::default(),
             }),
+            application_refs: AtomicUsize::new(1),
             handle,
             socket,
             events_tx,
@@ -319,6 +317,55 @@ impl ConnectionInner {
     }
 }
 
+/// A reference held by an application-facing connection or stream handle.
+///
+/// The connection worker deliberately holds a plain [`Shared`] reference so the last application
+/// handle can close the connection without waiting for the worker to release its own reference.
+#[derive(Debug)]
+pub(crate) struct ConnectionRef(Shared<ConnectionInner>);
+
+impl ConnectionRef {
+    fn new(inner: Shared<ConnectionInner>) -> Self {
+        Self(inner)
+    }
+
+    fn stable_id(&self) -> usize {
+        Shared::as_ptr(&self.0) as usize
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Shared::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Clone for ConnectionRef {
+    fn clone(&self) -> Self {
+        self.application_refs.fetch_add(1, Ordering::Relaxed);
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for ConnectionRef {
+    fn drop(&mut self) {
+        if self.application_refs.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return;
+        }
+
+        let mut state = self.state();
+        if state.error.is_none() {
+            state.close(0u32.into(), Bytes::new());
+        }
+    }
+}
+
+impl std::ops::Deref for ConnectionRef {
+    type Target = ConnectionInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 macro_rules! conn_fn {
     () => {
         /// The side of the connection (client or server)
@@ -371,7 +418,7 @@ macro_rules! conn_fn {
         /// Peer addresses and connection IDs can change, but this value will remain
         /// fixed for the lifetime of the connection.
         pub fn stable_id(&self) -> usize {
-            Shared::as_ptr(&self.0) as usize
+            self.0.stable_id()
         }
 
         /// Derive keying material from this connection's TLS session secrets.
@@ -403,7 +450,7 @@ macro_rules! conn_fn {
 /// In-progress connection attempt future
 #[derive(Debug)]
 #[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
-pub struct Connecting(Shared<ConnectionInner>);
+pub struct Connecting(ConnectionRef);
 
 impl Connecting {
     conn_fn!();
@@ -424,7 +471,7 @@ impl Connecting {
             async move { inner.run().await }.in_current_span()
         });
         inner.state().worker = Some(worker);
-        Self(inner)
+        Self(ConnectionRef::new(inner))
     }
 
     /// Parameters negotiated during the handshake.
@@ -521,15 +568,9 @@ impl Future for Connecting {
     }
 }
 
-impl Drop for Connecting {
-    fn drop(&mut self) {
-        implicit_close(&self.0)
-    }
-}
-
 /// A QUIC connection.
 #[derive(Debug, Clone)]
-pub struct Connection(Shared<ConnectionInner>);
+pub struct Connection(ConnectionRef);
 
 impl Connection {
     conn_fn!();
@@ -939,17 +980,11 @@ impl Connection {
 
 impl PartialEq for Connection {
     fn eq(&self, other: &Self) -> bool {
-        Shared::ptr_eq(&self.0, &other.0)
+        self.0.ptr_eq(&other.0)
     }
 }
 
 impl Eq for Connection {}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        implicit_close(&self.0)
-    }
-}
 
 struct Timer {
     deadline: Option<Instant>,
@@ -1178,7 +1213,7 @@ pub(crate) mod h3_impl {
     }
 
     impl<B> BidiStream<B> {
-        pub(crate) fn new(conn: Shared<ConnectionInner>, stream: StreamId, is_0rtt: bool) -> Self {
+        pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
             Self {
                 send: SendStream::new(conn.clone(), stream, is_0rtt),
                 recv: RecvStream::new(conn, stream, is_0rtt),

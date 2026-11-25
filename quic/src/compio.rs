@@ -49,7 +49,7 @@ pub(crate) use synchrony::sync;
 pub(crate) use synchrony::unsync as sync;
 
 pub(crate) use self::{
-    connection::{ConnectionEvent, ConnectionInner},
+    connection::{ConnectionEvent, ConnectionRef},
     endpoint::EndpointRef,
     socket::*,
 };

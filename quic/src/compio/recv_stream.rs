@@ -10,7 +10,7 @@ use futures_util::future::poll_fn;
 use proto::{Chunk, Chunks, ClosedStream, ReadableError, StreamId, VarInt};
 use thiserror::Error;
 
-use crate::compio::{ConnectionError, ConnectionInner, sync::shared::Shared};
+use crate::compio::{ConnectionError, ConnectionRef};
 
 /// A stream that can only be used to receive data
 ///
@@ -50,7 +50,7 @@ use crate::compio::{ConnectionError, ConnectionInner, sync::shared::Shared};
 /// [`Connection::accept_bi`]: crate::compio::Connection::accept_bi
 #[derive(Debug)]
 pub struct RecvStream {
-    conn: Shared<ConnectionInner>,
+    conn: ConnectionRef,
     stream: StreamId,
     is_0rtt: bool,
     all_data_read: bool,
@@ -58,7 +58,7 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
-    pub(crate) fn new(conn: Shared<ConnectionInner>, stream: StreamId, is_0rtt: bool) -> Self {
+    pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
         Self {
             conn,
             stream,

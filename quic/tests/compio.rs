@@ -287,6 +287,57 @@ async fn rejected_0rtt_handles_do_not_touch_streams_that_reuse_their_id() {
     endpoint.shutdown().await.unwrap();
 }
 
+#[compio_macros::test]
+async fn last_stream_reference_implicitly_closes_the_connection() {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    let (server_config, client_config) = config_pair(TransportConfig::default());
+    let endpoint = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    endpoint.set_default_client_config(client_config);
+    let (server_ready_tx, server_ready_rx) = flume::unbounded();
+
+    compio_runtime::time::timeout(TIMEOUT, async {
+        join!(
+            async {
+                for _ in 0..2 {
+                    let connection = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                    server_ready_tx.send(()).unwrap();
+                    assert!(matches!(
+                        connection.closed().await,
+                        quic::compio::ConnectionError::ApplicationClosed(_)
+                    ));
+                }
+            },
+            async {
+                for keep_send_half in [true, false] {
+                    let connection = endpoint
+                        .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                        .unwrap()
+                        .await
+                        .unwrap();
+                    server_ready_rx.recv_async().await.unwrap();
+                    let (send, recv) = connection.open_bi().unwrap();
+                    if keep_send_half {
+                        drop(recv);
+                        drop(connection);
+                        drop(send);
+                    } else {
+                        drop(send);
+                        drop(connection);
+                        drop(recv);
+                    }
+                }
+            }
+        );
+    })
+    .await
+    .expect("dropping the last stream reference did not close the connection");
+
+    endpoint.shutdown().await.unwrap();
+}
+
 #[test]
 fn endpoint_creation_outside_runtime_returns_an_error() {
     let runtime = compio_runtime::Runtime::new().unwrap();
