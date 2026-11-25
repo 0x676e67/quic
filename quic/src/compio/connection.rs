@@ -50,8 +50,6 @@ pub(crate) struct ConnectionState {
     worker: Option<JoinHandle<()>>,
     poller: Option<Waker>,
     connecting: Option<Waker>,
-    #[cfg(feature = "compio-h3")]
-    poll_waiters: H3Waiters,
     pub(crate) writable: HashMap<StreamId, Waker>,
     pub(crate) readable: HashMap<StreamId, Waker>,
     pub(crate) stopped: HashMap<StreamId, Waker>,
@@ -65,13 +63,14 @@ impl ConnectionState {
         notifications.handshake_data.notify_waiters();
         self.notify_connected(notifications);
         notifications.handshake_confirmed.notify_waiters();
-        self.notify_io_waiters(notifications, IoWait::DatagramReceived);
+        notifications.datagram_received.notify_waiters();
         notifications.datagrams_unblocked.notify_waiters();
-        for dir in [Dir::Bi, Dir::Uni] {
-            self.notify_io_waiters(notifications, IoWait::StreamOpened(dir));
-        }
-        for dir in [Dir::Bi, Dir::Uni] {
-            self.notify_io_waiters(notifications, IoWait::StreamAvailable(dir));
+        for notification in notifications
+            .stream_opened
+            .iter()
+            .chain(&notifications.stream_available)
+        {
+            notification.notify_waiters();
         }
         wake_all_streams(&mut self.writable);
         wake_all_streams(&mut self.readable);
@@ -94,15 +93,6 @@ impl ConnectionState {
             waker.wake();
         }
         notifications.connected.notify_waiters();
-    }
-
-    fn notify_io_waiters(&mut self, notifications: &ConnectionNotifications, wait: IoWait) {
-        notifications.io(wait).notify_waiters();
-        #[cfg(feature = "compio-h3")]
-        self.poll_waiters
-            .for_wait(wait)
-            .drain(..)
-            .for_each(|(_, waker)| waker.wake());
     }
 
     fn recv_datagram(&mut self) -> Result<Option<Bytes>, ConnectionError> {
@@ -167,13 +157,6 @@ async fn wait_for<T, E>(
     }
 }
 
-#[derive(Clone, Copy)]
-enum IoWait {
-    DatagramReceived,
-    StreamOpened(Dir),
-    StreamAvailable(Dir),
-}
-
 #[derive(Debug, Default)]
 struct ConnectionNotifications {
     connected: Notify,
@@ -183,63 +166,6 @@ struct ConnectionNotifications {
     datagrams_unblocked: Notify,
     stream_opened: [Notify; 2],
     stream_available: [Notify; 2],
-}
-
-impl ConnectionNotifications {
-    fn io(&self, wait: IoWait) -> &Notify {
-        match wait {
-            IoWait::DatagramReceived => &self.datagram_received,
-            IoWait::StreamOpened(dir) => &self.stream_opened[dir as usize],
-            IoWait::StreamAvailable(dir) => &self.stream_available[dir as usize],
-        }
-    }
-}
-
-// The H3 polling traits tie the registration to the adapter. Keep one Waker per
-// adapter and operation, and remove it when the operation completes or the adapter drops.
-#[cfg(feature = "compio-h3")]
-#[derive(Debug, Default)]
-struct H3Waiters {
-    next_id: u64,
-    datagram_received: Vec<(u64, Waker)>,
-    stream_opened: [Vec<(u64, Waker)>; 2],
-    stream_available: [Vec<(u64, Waker)>; 2],
-}
-
-#[cfg(feature = "compio-h3")]
-impl H3Waiters {
-    fn for_wait(&mut self, wait: IoWait) -> &mut Vec<(u64, Waker)> {
-        match wait {
-            IoWait::DatagramReceived => &mut self.datagram_received,
-            IoWait::StreamOpened(dir) => &mut self.stream_opened[dir as usize],
-            IoWait::StreamAvailable(dir) => &mut self.stream_available[dir as usize],
-        }
-    }
-
-    fn register(&mut self, wait: IoWait, handle_id: &mut Option<u64>, waker: &Waker) {
-        let id = *handle_id.get_or_insert_with(|| {
-            let id = self.next_id;
-            self.next_id = id.wrapping_add(1);
-            id
-        });
-        let waiters = self.for_wait(wait);
-        if let Some((_, current_waker)) = waiters.iter_mut().find(|(other, _)| *other == id) {
-            current_waker.clone_from(waker);
-        } else {
-            waiters.push((id, waker.clone()));
-        }
-    }
-
-    fn remove(&mut self, id: u64) {
-        self.datagram_received.retain(|(other, _)| *other != id);
-        for waiters in self
-            .stream_opened
-            .iter_mut()
-            .chain(&mut self.stream_available)
-        {
-            waiters.retain(|(other, _)| *other != id);
-        }
-    }
 }
 
 fn wake_all_streams(wakers: &mut HashMap<StreamId, Waker>) {
@@ -275,8 +201,6 @@ impl ConnectionInner {
                 worker: None,
                 poller: None,
                 connecting: None,
-                #[cfg(feature = "compio-h3")]
-                poll_waiters: H3Waiters::default(),
                 writable: HashMap::default(),
                 readable: HashMap::default(),
                 stopped: HashMap::default(),
@@ -414,14 +338,12 @@ impl ConnectionInner {
                         wake_stream(id, &mut state.writable);
                     }
                     Stream(StreamEvent::Available { dir }) => {
-                        state.notify_io_waiters(&self.notifications, IoWait::StreamAvailable(dir));
+                        self.notifications.stream_available[dir as usize].notify_waiters();
                     }
                     Stream(StreamEvent::Opened { dir }) => {
-                        state.notify_io_waiters(&self.notifications, IoWait::StreamOpened(dir));
+                        self.notifications.stream_opened[dir as usize].notify_waiters();
                     }
-                    DatagramReceived => {
-                        state.notify_io_waiters(&self.notifications, IoWait::DatagramReceived);
-                    }
+                    DatagramReceived => self.notifications.datagram_received.notify_waiters(),
                     DatagramsUnblocked => self.notifications.datagrams_unblocked.notify_waiters(),
                     // The Tokio frontend uses this to drive `RemoteAddressWatcher`.
                     // Compio has no watcher yet; `remote_address()` still reads the
@@ -685,7 +607,7 @@ impl Connecting {
             state.conn.has_0rtt() || state.conn.side().is_server()
         };
         if is_ok {
-            Ok(Connection::new(self.0.clone()))
+            Ok(Connection(self.0.clone()))
         } else {
             Err(self)
         }
@@ -699,7 +621,7 @@ impl Future for Connecting {
         let mut state = self.0.try_state()?;
 
         if state.connected {
-            return Poll::Ready(Ok(Connection::new(self.0.clone())));
+            return Poll::Ready(Ok(Connection(self.0.clone())));
         }
 
         if let Some(waker) = &mut state.connecting {
@@ -719,19 +641,11 @@ impl Drop for Connecting {
 }
 
 /// A QUIC connection.
-#[derive(Debug)]
-pub struct Connection(ConnectionRef, #[cfg(feature = "compio-h3")] Option<u64>);
+#[derive(Debug, Clone)]
+pub struct Connection(ConnectionRef);
 
 impl Connection {
     conn_fn!();
-
-    fn new(conn: ConnectionRef) -> Self {
-        Self(
-            conn,
-            #[cfg(feature = "compio-h3")]
-            None,
-        )
-    }
 
     /// Wait for the handshake to be confirmed.
     ///
@@ -971,10 +885,9 @@ impl Connection {
     }
 
     async fn open_stream_wait(&self, dir: Dir) -> Result<(StreamId, bool), ConnectionError> {
-        wait_for(
-            self.0.notifications.io(IoWait::StreamAvailable(dir)),
-            || self.0.state().open_stream(dir),
-        )
+        wait_for(&self.0.notifications.stream_available[dir as usize], || {
+            self.0.state().open_stream(dir)
+        })
         .await
     }
 
@@ -1037,7 +950,7 @@ impl Connection {
     }
 
     async fn accept_stream_wait(&self, dir: Dir) -> Result<(StreamId, bool), ConnectionError> {
-        wait_for(self.0.notifications.io(IoWait::StreamOpened(dir)), || {
+        wait_for(&self.0.notifications.stream_opened[dir as usize], || {
             self.0.state().accept_stream(dir)
         })
         .await
@@ -1095,46 +1008,6 @@ impl Connection {
             Ok(self.0.try_state()?.connected.then_some(()))
         })
         .await
-    }
-
-    #[cfg(feature = "compio-h3")]
-    fn poll_h3<T>(
-        &mut self,
-        cx: &mut Context<'_>,
-        wait: IoWait,
-        try_ready: impl FnOnce(&mut ConnectionState) -> Result<Option<T>, ConnectionError>,
-    ) -> Poll<Result<T, ConnectionError>> {
-        let mut state = self.0.state();
-        let result = match try_ready(&mut state) {
-            Ok(Some(value)) => Ok(value),
-            Err(error) => Err(error),
-            Ok(None) => {
-                state.poll_waiters.register(wait, &mut self.1, cx.waker());
-                return Poll::Pending;
-            }
-        };
-        if let Some(id) = self.1 {
-            state
-                .poll_waiters
-                .for_wait(wait)
-                .retain(|(other, _)| *other != id);
-        }
-        Poll::Ready(result)
-    }
-}
-
-impl Clone for Connection {
-    fn clone(&self) -> Self {
-        Self::new(self.0.clone())
-    }
-}
-
-#[cfg(feature = "compio-h3")]
-impl Drop for Connection {
-    fn drop(&mut self) {
-        if let Some(id) = self.1 {
-            self.0.state().poll_waiters.remove(id);
-        }
     }
 }
 
@@ -1282,303 +1155,4 @@ pub enum OpenStreamError {
     /// The streams in the given direction are currently exhausted
     #[error("streams exhausted")]
     StreamsExhausted,
-}
-
-#[cfg(feature = "compio-h3")]
-pub(crate) mod h3_impl {
-    use std::sync::Arc;
-
-    use compio_buf::bytes::Buf;
-    use futures_util::ready;
-    use h3::{
-        error::Code,
-        quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, WriteBuf},
-    };
-    use h3_datagram::{
-        datagram::EncodedDatagram,
-        quic_traits::{
-            DatagramConnectionExt, RecvDatagram, SendDatagram, SendDatagramErrorIncoming,
-        },
-    };
-
-    use super::*;
-    use crate::compio::send_stream::h3_impl::SendStream;
-
-    impl From<ConnectionError> for ConnectionErrorIncoming {
-        fn from(e: ConnectionError) -> Self {
-            use ConnectionError::*;
-            match e {
-                ApplicationClosed(e) => Self::ApplicationClose {
-                    error_code: e.error_code.into_inner(),
-                },
-                TimedOut => Self::Timeout,
-
-                e => Self::Undefined(Arc::new(e)),
-            }
-        }
-    }
-
-    impl From<ConnectionError> for StreamErrorIncoming {
-        fn from(e: ConnectionError) -> Self {
-            Self::ConnectionErrorIncoming {
-                connection_error: e.into(),
-            }
-        }
-    }
-
-    impl From<SendDatagramError> for SendDatagramErrorIncoming {
-        fn from(e: SendDatagramError) -> Self {
-            use SendDatagramError::*;
-            match e {
-                UnsupportedByPeer | Disabled => Self::NotAvailable,
-                TooLarge => Self::TooLarge,
-                ConnectionLost(e) => Self::ConnectionError(e.into()),
-            }
-        }
-    }
-
-    impl<B> SendDatagram<B> for Connection
-    where
-        B: Buf,
-    {
-        fn send_datagram<T: Into<EncodedDatagram<B>>>(
-            &mut self,
-            data: T,
-        ) -> Result<(), SendDatagramErrorIncoming> {
-            let mut buf: EncodedDatagram<B> = data.into();
-            let buf = buf.copy_to_bytes(buf.remaining());
-            Ok(Self::send_datagram(self, buf)?)
-        }
-    }
-
-    impl RecvDatagram for Connection {
-        type Buffer = Bytes;
-
-        fn poll_incoming_datagram(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::Buffer, ConnectionErrorIncoming>> {
-            Poll::Ready(Ok(ready!(self.poll_h3(
-                cx,
-                IoWait::DatagramReceived,
-                ConnectionState::recv_datagram,
-            ))?))
-        }
-    }
-
-    impl<B: Buf> DatagramConnectionExt<B> for Connection {
-        type RecvDatagramHandler = Self;
-        type SendDatagramHandler = Self;
-
-        fn send_datagram_handler(&self) -> Self::SendDatagramHandler {
-            self.clone()
-        }
-
-        fn recv_datagram_handler(&self) -> Self::RecvDatagramHandler {
-            self.clone()
-        }
-    }
-
-    /// Bidirectional stream.
-    pub struct BidiStream<B> {
-        send: SendStream<B>,
-        recv: RecvStream,
-    }
-
-    impl<B> BidiStream<B> {
-        pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
-            Self {
-                send: SendStream::new(conn.clone(), stream, is_0rtt),
-                recv: RecvStream::new(conn, stream, is_0rtt),
-            }
-        }
-    }
-
-    impl<B> quic::BidiStream<B> for BidiStream<B>
-    where
-        B: Buf,
-    {
-        type RecvStream = RecvStream;
-        type SendStream = SendStream<B>;
-
-        fn split(self) -> (Self::SendStream, Self::RecvStream) {
-            (self.send, self.recv)
-        }
-    }
-
-    impl<B> quic::RecvStream for BidiStream<B>
-    where
-        B: Buf,
-    {
-        type Buf = Bytes;
-
-        fn poll_data(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-            self.recv.poll_data(cx)
-        }
-
-        fn stop_sending(&mut self, error_code: u64) {
-            self.recv.stop_sending(error_code)
-        }
-
-        fn recv_id(&self) -> quic::StreamId {
-            self.recv.recv_id()
-        }
-    }
-
-    impl<B> quic::SendStream<B> for BidiStream<B>
-    where
-        B: Buf,
-    {
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            self.send.poll_ready(cx)
-        }
-
-        fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-            self.send.send_data(data)
-        }
-
-        fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            self.send.poll_finish(cx)
-        }
-
-        fn reset(&mut self, reset_code: u64) {
-            self.send.reset(reset_code)
-        }
-
-        fn send_id(&self) -> quic::StreamId {
-            self.send.send_id()
-        }
-    }
-
-    impl<B> quic::SendStreamUnframed<B> for BidiStream<B>
-    where
-        B: Buf,
-    {
-        fn poll_send<D: Buf>(
-            &mut self,
-            cx: &mut Context<'_>,
-            buf: &mut D,
-        ) -> Poll<Result<usize, StreamErrorIncoming>> {
-            self.send.poll_send(cx, buf)
-        }
-    }
-
-    /// Stream opener.
-    #[derive(Clone)]
-    pub struct OpenStreams(Connection);
-
-    impl<B> quic::OpenStreams<B> for OpenStreams
-    where
-        B: Buf,
-    {
-        type BidiStream = BidiStream<B>;
-        type SendStream = SendStream<B>;
-
-        fn poll_open_bidi(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-            let (stream, is_0rtt) = ready!(self.0.poll_h3(
-                cx,
-                IoWait::StreamAvailable(Dir::Bi),
-                |state| state.open_stream(Dir::Bi),
-            ))?;
-            Poll::Ready(Ok(BidiStream::new(self.0.0.clone(), stream, is_0rtt)))
-        }
-
-        fn poll_open_send(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
-            let (stream, is_0rtt) = ready!(self.0.poll_h3(
-                cx,
-                IoWait::StreamAvailable(Dir::Uni),
-                |state| state.open_stream(Dir::Uni),
-            ))?;
-            Poll::Ready(Ok(SendStream::new(self.0.0.clone(), stream, is_0rtt)))
-        }
-
-        fn close(&mut self, code: Code, reason: &[u8]) {
-            self.0.close(
-                VarInt::from_u64(code.value()).unwrap_or(VarInt::MAX),
-                reason,
-            )
-        }
-    }
-
-    impl<B> quic::OpenStreams<B> for Connection
-    where
-        B: Buf,
-    {
-        type BidiStream = BidiStream<B>;
-        type SendStream = SendStream<B>;
-
-        fn poll_open_bidi(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-            let (stream, is_0rtt) =
-                ready!(self.poll_h3(cx, IoWait::StreamAvailable(Dir::Bi), |state| {
-                    state.open_stream(Dir::Bi)
-                },))?;
-            Poll::Ready(Ok(BidiStream::new(self.0.clone(), stream, is_0rtt)))
-        }
-
-        fn poll_open_send(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
-            let (stream, is_0rtt) = ready!(self.poll_h3(
-                cx,
-                IoWait::StreamAvailable(Dir::Uni),
-                |state| state.open_stream(Dir::Uni),
-            ))?;
-            Poll::Ready(Ok(SendStream::new(self.0.clone(), stream, is_0rtt)))
-        }
-
-        fn close(&mut self, code: Code, reason: &[u8]) {
-            Self::close(
-                self,
-                VarInt::from_u64(code.value()).unwrap_or(VarInt::MAX),
-                reason,
-            )
-        }
-    }
-
-    impl<B> quic::Connection<B> for Connection
-    where
-        B: Buf,
-    {
-        type OpenStreams = OpenStreams;
-        type RecvStream = RecvStream;
-
-        fn poll_accept_recv(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-            let (stream, is_0rtt) =
-                ready!(self.poll_h3(cx, IoWait::StreamOpened(Dir::Uni), |state| {
-                    state.accept_stream(Dir::Uni)
-                },))?;
-            Poll::Ready(Ok(RecvStream::new(self.0.clone(), stream, is_0rtt)))
-        }
-
-        fn poll_accept_bidi(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-            let (stream, is_0rtt) =
-                ready!(self.poll_h3(cx, IoWait::StreamOpened(Dir::Bi), |state| {
-                    state.accept_stream(Dir::Bi)
-                },))?;
-            Poll::Ready(Ok(BidiStream::new(self.0.clone(), stream, is_0rtt)))
-        }
-
-        fn opener(&self) -> Self::OpenStreams {
-            OpenStreams(self.clone())
-        }
-    }
 }

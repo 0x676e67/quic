@@ -53,15 +53,3 @@ pub(crate) use self::{
     endpoint::EndpointRef,
     socket::*,
 };
-
-/// HTTP/3 support via [`h3`].
-#[cfg(feature = "compio-h3")]
-pub mod h3 {
-    #[doc(no_inline)]
-    pub use h3::*;
-
-    pub use super::{
-        connection::h3_impl::{BidiStream, OpenStreams},
-        send_stream::h3_impl::SendStream,
-    };
-}

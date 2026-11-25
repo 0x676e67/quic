@@ -212,9 +212,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Enable the polling fallback for Linux runners that cannot use io_uring.
       - run: >-
-          cargo test --locked -p quic --features runtime-compio-polling,compio-h3,futures-io
+          cargo test --locked -p quic --features runtime-compio-polling,futures-io
           --lib compio::
-      - run: cargo test --locked -p quic --features runtime-compio-polling,compio-h3,futures-io --test compio
+      - run: cargo test --locked -p quic --features runtime-compio-polling,futures-io --test compio
 
   lint:
     runs-on: ubuntu-latest

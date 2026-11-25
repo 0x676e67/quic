@@ -222,43 +222,6 @@ async fn repeated_polls_register_one_waker_per_connection_wait() {
         assert_eq!(Arc::strong_count(&tracked), 1);
     }
 
-    #[cfg(feature = "compio-h3")]
-    async fn assert_h3_registration_lifetime(connection: &quic::compio::Connection) {
-        use h3_datagram::quic_traits::RecvDatagram;
-
-        let mut first = connection.clone();
-        let mut second = connection.clone();
-        let (original, replacement, independent) = std::future::poll_fn(|cx| {
-            let original = Arc::new(TrackedWake(cx.waker().clone()));
-            let replacement = Arc::new(TrackedWake(cx.waker().clone()));
-            let independent = Arc::new(TrackedWake(cx.waker().clone()));
-            let poll = |adapter: &mut quic::compio::Connection, tracked: &Arc<TrackedWake>| {
-                let waker = Waker::from(tracked.clone());
-                assert!(
-                    adapter
-                        .poll_incoming_datagram(&mut Context::from_waker(&waker))
-                        .is_pending()
-                );
-            };
-
-            poll(&mut first, &original);
-            assert_eq!(Arc::strong_count(&original), 2);
-            poll(&mut second, &independent);
-            poll(&mut first, &replacement);
-            Poll::Ready((original, replacement, independent))
-        })
-        .await;
-
-        assert_eq!(Arc::strong_count(&original), 1);
-        assert_eq!(Arc::strong_count(&replacement), 2);
-        assert_eq!(Arc::strong_count(&independent), 2);
-        drop(first);
-        assert_eq!(Arc::strong_count(&replacement), 1);
-        assert_eq!(Arc::strong_count(&independent), 2);
-        drop(second);
-        assert_eq!(Arc::strong_count(&independent), 1);
-    }
-
     let mut transport = TransportConfig::default();
     transport
         .max_concurrent_uni_streams(0u32.into())
@@ -284,8 +247,6 @@ async fn repeated_polls_register_one_waker_per_connection_wait() {
                 connection.handshake_confirmed().await.unwrap();
 
                 assert_single_registration(connection.recv_datagram()).await;
-                #[cfg(feature = "compio-h3")]
-                assert_h3_registration_lifetime(&connection).await;
                 assert_single_registration(connection.accept_uni()).await;
                 assert_single_registration(connection.open_uni_wait()).await;
                 connection.send_datagram(b"a".as_slice().into()).unwrap();

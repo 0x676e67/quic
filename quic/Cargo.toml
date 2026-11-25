@@ -73,8 +73,6 @@ runtime-compio-sync = [
     "compio-io/sync",
     "compio-net/sync",
 ]
-# Enables HTTP/3 trait implementations for the Compio frontend.
-compio-h3 = ["runtime-compio", "dep:h3", "dep:h3-datagram"]
 native-certs = ["runtime-compio", "dep:rustls-native-certs"]
 webpki-roots = ["runtime-compio", "dep:webpki-roots"]
 windows-gro = ["runtime-compio"]
@@ -104,8 +102,6 @@ flume = { workspace = true, optional = true, features = ["async"] }
 # Enables futures::io::{AsyncRead, AsyncWrite} support for streams
 futures-io = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
-h3 = { workspace = true, optional = true }
-h3-datagram = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
 proto = { package = "quic-proto", path = "../quic-proto", version = "0.12.2", default-features = false }

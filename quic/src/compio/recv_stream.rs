@@ -650,54 +650,6 @@ mod compat {
 #[cfg(feature = "futures-io")]
 pub use compat::CompatRecvStream;
 
-#[cfg(feature = "compio-h3")]
-pub(crate) mod h3_impl {
-    use h3::quic::{self, StreamErrorIncoming};
-
-    use super::*;
-
-    impl From<ReadError> for StreamErrorIncoming {
-        fn from(e: ReadError) -> Self {
-            use ReadError::*;
-            match e {
-                Reset(code) => Self::StreamTerminated {
-                    error_code: code.into_inner(),
-                },
-                ConnectionLost(e) => Self::ConnectionErrorIncoming {
-                    connection_error: e.into(),
-                },
-                e => Self::Unknown(Box::new(e)),
-            }
-        }
-    }
-
-    impl quic::RecvStream for RecvStream {
-        type Buf = Bytes;
-
-        fn poll_data(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-            self.execute_poll_read(cx, true, |chunks| match chunks.next(usize::MAX) {
-                Ok(Some(chunk)) => ReadStatus::Readable(chunk.bytes),
-                res => (None, res.err()).into(),
-            })
-            .map_err(Into::into)
-        }
-
-        fn stop_sending(&mut self, error_code: u64) {
-            self.stop(VarInt::from_u64(error_code).unwrap_or(VarInt::MAX))
-                .ok();
-        }
-
-        fn recv_id(&self) -> quic::StreamId {
-            u64::from(self.stream)
-                .try_into()
-                .unwrap_or_else(|_| h3::proto::varint::VarInt::MAX.into())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use compio_buf::{IntoInner, IoBuf, bytes::Bytes};

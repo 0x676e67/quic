@@ -284,11 +284,6 @@ pub enum WriteError {
     /// [`Connecting::into_0rtt()`]: crate::compio::Connecting::into_0rtt()
     #[error("0-RTT rejected")]
     ZeroRttRejected,
-    /// Error when the stream is not ready, because it is still sending
-    /// data from a previous call
-    #[cfg(feature = "compio-h3")]
-    #[error("stream not ready")]
-    NotReady,
 }
 
 impl TryFrom<proto::WriteError> for WriteError {
@@ -319,8 +314,6 @@ impl From<WriteError> for io::Error {
         let kind = match x {
             Stopped(_) | ZeroRttRejected => io::ErrorKind::ConnectionReset,
             ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
-            #[cfg(feature = "compio-h3")]
-            NotReady => io::ErrorKind::Other,
         };
         Self::new(kind, x)
     }
@@ -464,123 +457,3 @@ mod compat {
 
 #[cfg(feature = "futures-io")]
 pub use compat::CompatSendStream;
-
-#[cfg(feature = "compio-h3")]
-pub(crate) mod h3_impl {
-    use compio_buf::bytes::Buf;
-    use h3::quic::{self, StreamErrorIncoming, WriteBuf};
-
-    use super::*;
-
-    impl From<WriteError> for StreamErrorIncoming {
-        fn from(e: WriteError) -> Self {
-            use WriteError::*;
-            match e {
-                Stopped(code) => Self::StreamTerminated {
-                    error_code: code.into_inner(),
-                },
-                ConnectionLost(e) => Self::ConnectionErrorIncoming {
-                    connection_error: e.into(),
-                },
-
-                e => Self::Unknown(Box::new(e)),
-            }
-        }
-    }
-
-    /// A wrapper around `SendStream` that implements `quic::SendStream` and
-    /// `quic::SendStreamUnframed`.
-    pub struct SendStream<B> {
-        inner: super::SendStream,
-        buf: Option<WriteBuf<B>>,
-    }
-
-    impl<B> SendStream<B> {
-        pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
-            Self {
-                inner: super::SendStream::new(conn, stream, is_0rtt),
-                buf: None,
-            }
-        }
-
-        /// Polls for the stream to be stopped or read to completion; see
-        /// [`SendStream::stopped()`](super::SendStream::stopped).
-        pub fn poll_stopped(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Option<VarInt>, StoppedError>> {
-            self.inner.poll_stopped(cx)
-        }
-    }
-
-    impl<B> quic::SendStream<B> for SendStream<B>
-    where
-        B: Buf,
-    {
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            if let Some(data) = &mut self.buf {
-                while data.has_remaining() {
-                    let n = ready!(
-                        self.inner
-                            .execute_poll_write(cx, |mut stream| stream.write(data.chunk()))
-                    )?;
-                    data.advance(n);
-                }
-            }
-            self.buf = None;
-            Poll::Ready(Ok(()))
-        }
-
-        fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-            if self.buf.is_some() {
-                return Err(WriteError::NotReady.into());
-            }
-            self.buf = Some(data.into());
-            Ok(())
-        }
-
-        fn poll_finish(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            Poll::Ready(
-                self.inner
-                    .finish()
-                    .map_err(|_| WriteError::ClosedStream.into()),
-            )
-        }
-
-        fn reset(&mut self, reset_code: u64) {
-            self.inner
-                .reset(reset_code.try_into().unwrap_or(VarInt::MAX))
-                .ok();
-        }
-
-        fn send_id(&self) -> quic::StreamId {
-            u64::from(self.inner.stream)
-                .try_into()
-                .unwrap_or_else(|_| h3::proto::varint::VarInt::MAX.into())
-        }
-    }
-
-    impl<B> quic::SendStreamUnframed<B> for SendStream<B>
-    where
-        B: Buf,
-    {
-        fn poll_send<D: Buf>(
-            &mut self,
-            cx: &mut Context<'_>,
-            buf: &mut D,
-        ) -> Poll<Result<usize, StreamErrorIncoming>> {
-            // This signifies a bug in implementation
-            debug_assert!(
-                self.buf.is_none(),
-                "poll_send called while send stream is not ready"
-            );
-
-            let n = ready!(
-                self.inner
-                    .execute_poll_write(cx, |mut stream| stream.write(buf.chunk()))
-            )?;
-            buf.advance(n);
-            Poll::Ready(Ok(n))
-        }
-    }
-}
