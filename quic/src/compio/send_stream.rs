@@ -67,6 +67,9 @@ impl SendStream {
     /// [`finish()`]: Self::finish
     pub fn finish(&mut self) -> Result<(), ClosedStream> {
         let mut state = self.conn.state();
+        if self.is_0rtt && !state.check_0rtt() {
+            return Err(ClosedStream::default());
+        }
         match state.conn.send_stream(self.stream).finish() {
             Ok(()) => {
                 state.wake();
@@ -109,16 +112,20 @@ impl SendStream {
     /// transmitted. Using many different priority levels per connection may
     /// have a negative impact on performance.
     pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
-        self.conn
-            .state()
-            .conn
-            .send_stream(self.stream)
-            .set_priority(priority)
+        let mut state = self.conn.state();
+        if self.is_0rtt && !state.check_0rtt() {
+            return Err(ClosedStream::default());
+        }
+        state.conn.send_stream(self.stream).set_priority(priority)
     }
 
     /// Get the priority of the stream
     pub fn priority(&self) -> Result<i32, ClosedStream> {
-        self.conn.state().conn.send_stream(self.stream).priority()
+        let mut state = self.conn.state();
+        if self.is_0rtt && !state.check_0rtt() {
+            return Err(ClosedStream::default());
+        }
+        state.conn.send_stream(self.stream).priority()
     }
 
     /// Completes when the peer stops the stream or reads the stream to
@@ -230,12 +237,16 @@ impl SendStream {
 impl Drop for SendStream {
     fn drop(&mut self) {
         let mut state = self.conn.state();
+        // A stream of rejected 0-RTT is gone, and a stream opened since may reuse its ID and waker.
+        if self.is_0rtt && !state.check_0rtt() {
+            return;
+        }
 
         // clean up any previously registered wakers
         state.stopped.remove(&self.stream);
         state.writable.remove(&self.stream);
 
-        if state.error.is_some() || (self.is_0rtt && !state.check_0rtt()) {
+        if state.error.is_some() {
             return;
         }
         match state.conn.send_stream(self.stream).finish() {

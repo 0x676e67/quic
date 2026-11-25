@@ -4,6 +4,7 @@ use compio_io::AsyncWriteExt;
 use futures_util::join;
 use quic::compio::{
     ClientBuilder, ClientConfig as CompioClientConfig, Endpoint, ServerBuilder, ServerConfig,
+    crypto::rustls::QuicServerConfig,
 };
 use quic::{EndpointConfig, TransportConfig};
 
@@ -28,6 +29,42 @@ fn config_pair(transport: TransportConfig) -> (ServerConfig, CompioClientConfig)
         .unwrap();
     client.transport_config(transport);
     (server, client)
+}
+
+fn zero_rtt_config_pair(
+    transport: TransportConfig,
+) -> (ServerConfig, ServerConfig, CompioClientConfig) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = cert.der().clone();
+    let key = signing_key.serialize_der().try_into().unwrap();
+
+    let mut accepting_tls =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+    accepting_tls.max_early_data_size = u32::MAX;
+    let mut rejecting_tls = accepting_tls.clone();
+    rejecting_tls.max_early_data_size = 0;
+
+    let transport = Arc::new(transport);
+    let mut accepting =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(accepting_tls).unwrap()));
+    accepting.transport_config(transport.clone());
+    let mut rejecting =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(rejecting_tls).unwrap()));
+    rejecting.transport_config(transport.clone());
+
+    let mut client = ClientBuilder::new_with_empty_roots()
+        .with_custom_certificate(cert)
+        .unwrap()
+        .with_no_crls()
+        .build()
+        .unwrap();
+    client.transport_config(transport);
+    (accepting, rejecting, client)
 }
 
 fn compio_config(config: quic::ClientConfig) -> CompioClientConfig {
@@ -134,6 +171,118 @@ async fn closed_observers_survive_cancellation_and_run_concurrently() {
     })
     .await
     .expect("closed observers did not all complete");
+
+    endpoint.shutdown().await.unwrap();
+}
+
+#[compio_macros::test]
+async fn rejected_0rtt_handles_do_not_touch_streams_that_reuse_their_id() {
+    use futures_util::future::poll_fn;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut transport = TransportConfig::default();
+    transport.stream_receive_window(8u32.into());
+    let (accepting_server, rejecting_server, client_config) = zero_rtt_config_pair(transport);
+    let endpoint = Endpoint::server("127.0.0.1:0", accepting_server)
+        .await
+        .unwrap();
+    endpoint.set_default_client_config(client_config);
+    let (server_read_tx, server_read_rx) = flume::bounded(1);
+
+    compio_runtime::time::timeout(TIMEOUT, async {
+        join!(
+            async {
+                let first = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = first.accept_bi().await.unwrap();
+                let (_, request) = recv.read_to_end(Vec::new()).await.unwrap();
+                assert_eq!(request, b"ticket");
+                send.write_all(b"ready").await.unwrap();
+                send.finish().unwrap();
+                let _ = first.closed().await;
+
+                let second = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                server_read_rx.recv_async().await.unwrap();
+                let (mut send, mut recv) = second.accept_bi().await.unwrap();
+                let (_, request) = recv.read_to_end(Vec::new()).await.unwrap();
+                assert_eq!(request, [7; 64]);
+                send.write_all(request).await.unwrap();
+                send.finish().unwrap();
+                let _ = second.closed().await;
+            },
+            async {
+                let first = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let (mut send, mut recv) = first.open_bi().unwrap();
+                send.write_all(b"ticket").await.unwrap();
+                send.finish().unwrap();
+                let (_, response) = recv.read_to_end(Vec::new()).await.unwrap();
+                assert_eq!(response, b"ready");
+                first.close(0u32.into(), b"done");
+
+                endpoint.set_server_config(Some(rejecting_server));
+                let connection = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .into_0rtt()
+                    .expect("the client should have received a resumption ticket");
+                let (mut rejected_send, mut rejected_recv) = connection.open_bi().unwrap();
+                rejected_send.write_all(b"0-rtt").await.unwrap();
+                rejected_recv.stop(0u32.into()).unwrap();
+                assert!(!connection.accepted_0rtt().await.unwrap());
+
+                let (mut send, mut recv) = connection.open_bi().unwrap();
+                assert_eq!(send.id(), rejected_send.id());
+                assert_eq!(recv.id(), rejected_recv.id());
+                let (registered_tx, registered_rx) = flume::unbounded();
+                let write_registered = registered_tx.clone();
+                let write_task = compio_runtime::spawn(async move {
+                    let mut write = Box::pin(send.write_all(vec![7; 64]));
+                    poll_fn(|cx| match write.as_mut().poll(cx) {
+                        std::task::Poll::Pending => std::task::Poll::Ready(()),
+                        std::task::Poll::Ready(_) => {
+                            panic!("the flow-controlled write completed before it could block")
+                        }
+                    })
+                    .await;
+                    write_registered.send(()).unwrap();
+                    write.as_mut().await.unwrap();
+                    drop(write);
+                    send.finish().unwrap();
+                });
+                let read_task = compio_runtime::spawn(async move {
+                    let mut read = Box::pin(recv.read_to_end(Vec::new()));
+                    poll_fn(|cx| match read.as_mut().poll(cx) {
+                        std::task::Poll::Pending => std::task::Poll::Ready(()),
+                        std::task::Poll::Ready(_) => {
+                            panic!("the response read completed before the server was released")
+                        }
+                    })
+                    .await;
+                    registered_tx.send(()).unwrap();
+                    let (_, response) = read.as_mut().await.unwrap();
+                    response
+                });
+                registered_rx.recv_async().await.unwrap();
+                registered_rx.recv_async().await.unwrap();
+
+                assert!(rejected_send.finish().is_err());
+                assert!(rejected_send.set_priority(1).is_err());
+                assert!(rejected_send.priority().is_err());
+                drop((rejected_send, rejected_recv));
+                server_read_tx.send_async(()).await.unwrap();
+
+                write_task.await.unwrap();
+                assert_eq!(read_task.await.unwrap(), [7; 64]);
+                connection.close(0u32.into(), b"done");
+            }
+        );
+    })
+    .await
+    .expect("1-RTT streams stalled after rejected 0-RTT handles were dropped");
 
     endpoint.shutdown().await.unwrap();
 }

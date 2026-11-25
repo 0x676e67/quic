@@ -395,11 +395,15 @@ impl RecvStream {
 impl Drop for RecvStream {
     fn drop(&mut self) {
         let mut state = self.conn.state();
+        // A stream of rejected 0-RTT is gone, and a stream opened since may reuse its ID and waker.
+        if self.is_0rtt && !state.check_0rtt() {
+            return;
+        }
 
         // clean up any previously registered wakers
         state.readable.remove(&self.stream);
 
-        if state.error.is_some() || (self.is_0rtt && !state.check_0rtt()) {
+        if state.error.is_some() {
             return;
         }
         if !self.all_data_read {
