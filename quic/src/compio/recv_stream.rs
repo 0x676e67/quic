@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use compio_buf::{BufResult, IntoInner, IoBufMut, bytes::Bytes};
+use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut, bytes::Bytes};
 use compio_io::AsyncRead;
 use futures_util::future::poll_fn;
 use proto::{Chunk, Chunks, ClosedStream, ReadableError, StreamId, VarInt};
@@ -347,8 +347,11 @@ impl RecvStream {
     /// If unordered reads have already been made, the resulting buffer may have
     /// gaps containing zeros.
     ///
+    /// Returns the original buffer with [`io::ErrorKind::OutOfMemory`] if the result span,
+    /// including any gaps, exceeds the maximum slice length or the buffer cannot grow to fit it.
+    ///
     /// This operation is *not* cancel-safe.
-    pub async fn read_to_end<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+    pub async fn read_to_end<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         let mut start = u64::MAX;
         let mut end = 0;
         let mut chunks = vec![];
@@ -362,22 +365,7 @@ impl RecvStream {
             end = end.max(chunk.offset + chunk.bytes.len() as u64);
             chunks.push((chunk.offset, chunk.bytes));
         }
-        if start == u64::MAX || start >= end {
-            // no data read
-            return BufResult(Ok(0), buf);
-        }
-        let len = (end - start) as usize;
-        if len > buf.buf_capacity()
-            && let Err(e) = buf.reserve(len - buf.buf_len())
-        {
-            return BufResult(Err(io::Error::new(io::ErrorKind::OutOfMemory, e)), buf);
-        }
-        let mut buf = buf.slice(..len);
-        copy_read_chunks(&mut buf, start, chunks);
-        let mut buf = buf.into_inner();
-        // SAFETY: `copy_read_chunks` initialized every byte in the result range.
-        unsafe { buf.advance_to(len) }
-        BufResult(Ok(len), buf)
+        finish_read_to_end(buf, start, end, chunks)
     }
 
     /// Convert into an [`futures_util`] compatible stream.
@@ -387,15 +375,46 @@ impl RecvStream {
     }
 }
 
-fn copy_read_chunks(buf: &mut impl IoBufMut, start_offset: u64, chunks: Vec<(u64, Bytes)>) {
-    let initialized_len = buf.buf_len();
-    let slice = buf.ensure_init();
+fn finish_read_to_end<B: IoBufMut>(
+    mut buf: B,
+    start: u64,
+    end: u64,
+    chunks: Vec<(u64, Bytes)>,
+) -> BufResult<usize, B> {
+    if start >= end {
+        return BufResult(Ok(0), buf);
+    }
+    let span = end - start;
+    if span > isize::MAX as u64 {
+        return BufResult(
+            Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "stream contents exceed the maximum buffer length",
+            )),
+            buf,
+        );
+    }
+    let len = span as usize;
+    if len > buf.buf_capacity()
+        && let Err(e) = buf.reserve(len - buf.buf_len())
+    {
+        return BufResult(Err(io::Error::new(io::ErrorKind::OutOfMemory, e)), buf);
+    }
+
+    let mut result = buf.slice(..len);
+    let initialized_len = result.buf_len();
+    let slice = result.ensure_init();
     // `ensure_init` clears only the uninitialized tail.
     slice[..initialized_len].fill(0);
     for (offset, bytes) in chunks {
-        let offset = (offset - start_offset) as usize;
+        // Each chunk lies within the checked `start..end` span.
+        let offset = (offset - start) as usize;
         slice[offset..offset + bytes.len()].copy_from_slice(&bytes);
     }
+    let mut buf = result.into_inner();
+    // SAFETY: Every byte in the result range was initialized above.
+    unsafe { buf.advance_to(len) }
+    BufResult(Ok(len), buf)
 }
 
 impl Drop for RecvStream {
@@ -652,20 +671,35 @@ pub use compat::CompatRecvStream;
 
 #[cfg(test)]
 mod tests {
-    use compio_buf::{IntoInner, IoBuf, bytes::Bytes};
+    use compio_buf::{BufResult, bytes::Bytes};
 
-    use super::copy_read_chunks;
+    use super::finish_read_to_end;
 
     #[test]
     fn read_to_end_zeros_gaps_in_a_reused_buffer() {
-        let mut buf = vec![0xff; 6].slice(..5);
         let chunks = vec![
             (14, Bytes::from_static(b"e")),
             (10, Bytes::from_static(b"a")),
         ];
 
-        copy_read_chunks(&mut buf, 10, chunks);
+        let BufResult(result, buf) = finish_read_to_end(vec![0xff; 6], 10, 15, chunks);
 
-        assert_eq!(buf.into_inner(), b"a\0\0\0e\xff");
+        assert_eq!(result.unwrap(), 5);
+        assert_eq!(buf, b"a\0\0\0e\xff");
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn read_to_end_rejects_a_span_that_wraps_usize() {
+        let start = 10;
+        let last = start + (1u64 << 32) + 2;
+        let chunks = vec![
+            (last, Bytes::from_static(b"z")),
+            (start, Bytes::from_static(b"a")),
+        ];
+        let BufResult(result, buf) = finish_read_to_end(vec![0xff; 4], start, last + 1, chunks);
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
+        assert_eq!(buf, [0xff; 4]);
     }
 }
