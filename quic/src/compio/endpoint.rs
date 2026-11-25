@@ -239,13 +239,16 @@ impl EndpointInner {
         &self,
         remote: SocketAddr,
         server_name: &str,
-        config: ClientConfig,
+        config: Option<ClientConfig>,
     ) -> Result<Connecting, ConnectError> {
         let mut state = self.state.lock();
 
-        if state.stopped || state.worker.is_none() {
+        if state.close.is_some() || state.stopped || state.worker.is_none() {
             return Err(ConnectError::EndpointStopping);
         }
+        let config = config
+            .or_else(|| state.default_client_config.clone())
+            .ok_or(ConnectError::NoDefaultClientConfig)?;
         if remote.is_ipv6() && !self.ipv6 {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
@@ -586,16 +589,15 @@ impl Endpoint {
     }
 
     /// Connect to a remote endpoint.
+    ///
+    /// Returns [`ConnectError::EndpointStopping`] once this endpoint is closed or its I/O
+    /// worker has stopped.
     pub fn connect(
         &self,
         remote: SocketAddr,
         server_name: &str,
         config: Option<ClientConfig>,
     ) -> Result<Connecting, ConnectError> {
-        let config = config
-            .or_else(|| self.inner.state.lock().default_client_config.clone())
-            .ok_or(ConnectError::NoDefaultClientConfig)?;
-
         self.inner.connect(remote, server_name, config)
     }
 
@@ -762,6 +764,28 @@ mod tests {
             .build()
             .unwrap();
         (server, client)
+    }
+
+    #[compio_macros::test]
+    #[cfg(feature = "rustls-ring")]
+    async fn closed_endpoint_rejects_outgoing_connections() {
+        let (_, client_config) = config_pair();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = socket.local_addr().unwrap();
+        let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+
+        endpoint.close(0u32.into(), b"closed");
+
+        assert!(matches!(
+            endpoint.connect(remote, "localhost", Some(client_config)),
+            Err(ConnectError::EndpointStopping)
+        ));
+        assert!(matches!(
+            endpoint.connect(remote, "localhost", None),
+            Err(ConnectError::EndpointStopping)
+        ));
+        assert_eq!(endpoint.stats().outgoing_handshakes, 0);
+        endpoint.shutdown().await.unwrap();
     }
 
     #[compio_macros::test]
