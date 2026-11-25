@@ -761,6 +761,7 @@ mod tests {
             .with_custom_certificate(cert)
             .unwrap()
             .with_no_crls()
+            .unwrap()
             .build()
             .unwrap();
         (server, client)

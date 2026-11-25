@@ -30,6 +30,7 @@ async fn built_in_configs_work_with_both_providers_and_no_process_default() {
         .build()
         .unwrap();
     let _insecure_client = ClientBuilder::new_with_no_server_verification()
+        .unwrap()
         .build()
         .unwrap();
     assert!(rustls::crypto::CryptoProvider::get_default().is_none());

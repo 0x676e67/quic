@@ -25,6 +25,7 @@ fn config_pair(transport: TransportConfig) -> (ServerConfig, CompioClientConfig)
         .with_custom_certificate(cert)
         .unwrap()
         .with_no_crls()
+        .unwrap()
         .build()
         .unwrap();
     client.transport_config(transport);
@@ -61,6 +62,7 @@ fn zero_rtt_config_pair(
         .with_custom_certificate(cert)
         .unwrap()
         .with_no_crls()
+        .unwrap()
         .build()
         .unwrap();
     client.transport_config(transport);

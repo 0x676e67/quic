@@ -27,12 +27,6 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 fn client_config_builder(
     provider: Arc<rustls::crypto::CryptoProvider>,
-) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
-    try_client_config_builder(provider).expect("the selected crypto provider must support TLS 1.3")
-}
-
-fn try_client_config_builder(
-    provider: Arc<rustls::crypto::CryptoProvider>,
 ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, rustls::Error> {
     rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -94,25 +88,37 @@ impl ClientBuilder<rustls::RootCertStore> {
     }
 
     /// Don't configure revocation.
-    pub fn with_no_crls(self) -> ClientBuilder<rustls::ClientConfig> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected crypto provider cannot configure TLS 1.3.
+    pub fn with_no_crls(self) -> Result<ClientBuilder<rustls::ClientConfig>, rustls::Error> {
         ClientBuilder::new_with_root_certificates(self.0)
     }
 
     /// Verify the revocation state of presented client certificates against the
     /// provided certificate revocation lists (CRLs).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected crypto provider cannot configure TLS 1.3 or the
+    /// certificate verifier cannot be built. Verifier construction failures are wrapped in
+    /// [`rustls::Error::Other`].
     pub fn with_crls(
         self,
         crls: impl IntoIterator<Item = rustls::pki_types::CertificateRevocationListDer<'static>>,
-    ) -> Result<ClientBuilder<rustls::ClientConfig>, rustls::client::VerifierBuilderError> {
+    ) -> Result<ClientBuilder<rustls::ClientConfig>, rustls::Error> {
         let provider = crypto_provider();
-        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::new(self.0),
-            provider.clone(),
-        )
-        .with_crls(crls)
-        .build()?;
-        Ok(ClientBuilder::new_with_webpki_verifier_and_provider(
-            verifier, provider,
+        let config_builder = client_config_builder(provider.clone())?;
+        let verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(self.0), provider)
+                .with_crls(crls)
+                .build()
+                .map_err(|error| rustls::Error::Other(rustls::OtherError(Arc::new(error))))?;
+        Ok(ClientBuilder::new_with_early_data(
+            config_builder
+                .with_webpki_verifier(verifier)
+                .with_no_client_auth(),
         ))
     }
 }
@@ -131,52 +137,64 @@ impl ClientBuilder<rustls::ClientConfig> {
 
     /// Do not verify the server's certificate. It is vulnerable to MITM
     /// attacks, but convenient for testing.
-    pub fn new_with_no_server_verification() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected crypto provider cannot configure TLS 1.3.
+    pub fn new_with_no_server_verification() -> Result<Self, rustls::Error> {
         let provider = crypto_provider();
         let verifier = Arc::new(verifier::SkipServerVerification::new(&provider));
-        Self::new_with_early_data(
-            client_config_builder(provider)
+        Ok(Self::new_with_early_data(
+            client_config_builder(provider)?
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth(),
-        )
+        ))
     }
 
     /// Create a builder with [`rustls_platform_verifier`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected crypto provider cannot configure TLS 1.3 or the platform
+    /// verifier cannot be initialized.
     #[cfg(feature = "platform-verifier")]
     pub fn new_with_platform_verifier() -> Result<Self, rustls::Error> {
         use rustls_platform_verifier::BuilderVerifierExt;
 
         Ok(Self::new_with_early_data(
-            try_client_config_builder(crypto_provider())?
+            client_config_builder(crypto_provider())?
                 .with_platform_verifier()?
                 .with_no_client_auth(),
         ))
     }
 
     /// Create a builder with the provided [`rustls::RootCertStore`].
-    pub fn new_with_root_certificates(roots: rustls::RootCertStore) -> Self {
-        Self::new_with_early_data(
-            client_config_builder(crypto_provider())
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected crypto provider cannot configure TLS 1.3.
+    pub fn new_with_root_certificates(roots: rustls::RootCertStore) -> Result<Self, rustls::Error> {
+        Ok(Self::new_with_early_data(
+            client_config_builder(crypto_provider())?
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
-        )
+        ))
     }
 
     /// Create a builder with a custom [`rustls::client::WebPkiServerVerifier`].
-    pub fn new_with_webpki_verifier(verifier: Arc<rustls::client::WebPkiServerVerifier>) -> Self {
-        Self::new_with_webpki_verifier_and_provider(verifier, crypto_provider())
-    }
-
-    fn new_with_webpki_verifier_and_provider(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected crypto provider cannot configure TLS 1.3.
+    pub fn new_with_webpki_verifier(
         verifier: Arc<rustls::client::WebPkiServerVerifier>,
-        provider: Arc<rustls::crypto::CryptoProvider>,
-    ) -> Self {
-        Self::new_with_early_data(
-            client_config_builder(provider)
+    ) -> Result<Self, rustls::Error> {
+        Ok(Self::new_with_early_data(
+            client_config_builder(crypto_provider())?
                 .with_webpki_verifier(verifier)
                 .with_no_client_auth(),
-        )
+        ))
     }
 
     /// Set the ALPN protocols to use.
@@ -358,6 +376,7 @@ mod tests {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).unwrap();
         client_config_builder(crypto_provider())
+            .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth()
     }
@@ -457,6 +476,7 @@ mod tests {
                 .with_custom_certificate(cert)
                 .unwrap()
                 .with_no_crls()
+                .unwrap()
                 .build()
                 .unwrap();
             let endpoint = Endpoint::server("127.0.0.1:0", accepting).await.unwrap();
