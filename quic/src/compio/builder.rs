@@ -224,11 +224,11 @@ impl ClientBuilder<rustls::ClientConfig> {
     ///
     /// See [`Endpoint::client`] for more information.
     pub async fn bind(self, addr: impl ToSocketAddrsAsync) -> io::Result<Endpoint> {
+        let config = self
+            .build()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let endpoint = Endpoint::client(addr).await?;
-        endpoint.set_default_client_config(
-            self.build()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
-        );
+        endpoint.set_default_client_config(config);
         Ok(endpoint)
     }
 }
@@ -424,6 +424,35 @@ mod tests {
         if let Ok(connection) = incoming.await {
             let _ = connection.closed().await;
         }
+    }
+
+    #[compio_macros::test]
+    async fn client_bind_validates_config_before_binding_socket() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+
+        let mut provider = (*crypto_provider()).clone();
+        provider
+            .cipher_suites
+            .retain(|suite| suite.suite() != rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        let error = ClientBuilder::new_with_rustls_client_config(client_config)
+            .bind(occupied_addr)
+            .await
+            .expect_err("invalid QUIC configuration should fail before binding");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<NoInitialCipherSuite>())
+                .is_some()
+        );
     }
 
     #[compio_macros::test]
