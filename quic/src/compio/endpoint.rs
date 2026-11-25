@@ -7,7 +7,7 @@ use std::{
     ops::Deref,
     pin::pin,
     sync::Arc,
-    task::Poll,
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -45,6 +45,7 @@ struct EndpointState {
     close: Option<(VarInt, Bytes)>,
     stopped: bool,
     exit_on_idle: bool,
+    shutdown_in_progress: bool,
     incoming: VecDeque<proto::Incoming>,
     stats: EndpointStats,
 }
@@ -197,6 +198,7 @@ impl EndpointInner {
                 close: None,
                 stopped: false,
                 exit_on_idle: false,
+                shutdown_in_progress: false,
                 incoming: VecDeque::new(),
                 stats: EndpointStats::default(),
             }),
@@ -382,6 +384,52 @@ pub(crate) struct EndpointRef {
 #[derive(Debug)]
 struct EndpointDriver(Shared<EndpointInner>);
 
+#[derive(Debug)]
+struct EndpointShutdown {
+    inner: Option<Shared<EndpointInner>>,
+    _runtime: CompioRuntime,
+}
+
+impl EndpointShutdown {
+    fn new(endpoint: EndpointRef) -> Self {
+        let runtime = endpoint.runtime.clone();
+        Self {
+            inner: Some(endpoint.into_inner()),
+            _runtime: runtime,
+        }
+    }
+
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<EndpointInner> {
+        let Some(shared) = self.inner.take() else {
+            return Poll::Pending;
+        };
+        let shared = match Shared::try_unwrap(shared) {
+            Ok(inner) => return Poll::Ready(inner),
+            Err(shared) => shared,
+        };
+
+        shared.done.register(cx.waker());
+
+        match Shared::try_unwrap(shared) {
+            Ok(inner) => Poll::Ready(inner),
+            Err(shared) => {
+                self.inner = Some(shared);
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for EndpointShutdown {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        inner.state.lock().shutdown_in_progress = false;
+        _ = inner.done.take();
+    }
+}
+
 impl EndpointDriver {
     async fn run(&self, exit: AsyncFlag) -> io::Result<()> {
         self.0.run(exit).await
@@ -429,14 +477,23 @@ impl EndpointRef {
     }
 
     async fn shutdown(self) -> io::Result<()> {
-        let (worker, response_worker, idle) = {
+        let workers = {
             let mut state = self.inner.state.lock();
+            if state.shutdown_in_progress {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "endpoint shutdown is already in progress",
+                ));
+            }
+            state.shutdown_in_progress = true;
             let idle = state.is_idle();
             if !idle {
                 state.exit_on_idle = true;
             }
             (state.worker.take(), state.response_worker.take(), idle)
         };
+        let mut shutdown = EndpointShutdown::new(self);
+        let (worker, response_worker, idle) = workers;
         if let Some(worker) = worker {
             if idle {
                 worker.cancel().await;
@@ -448,29 +505,10 @@ impl EndpointRef {
             worker.cancel().await;
         }
 
-        let mut this = Some(self.into_inner());
-        let inner = poll_fn(move |cx| {
-            let Some(shared) = this.take() else {
-                return Poll::Pending;
-            };
-            let s = match Shared::try_unwrap(shared) {
-                Ok(inner) => return Poll::Ready(inner),
-                Err(s) => s,
-            };
-
-            s.done.register(cx.waker());
-
-            match Shared::try_unwrap(s) {
-                Ok(inner) => Poll::Ready(inner),
-                Err(s) => {
-                    this.replace(s);
-                    Poll::Pending
-                }
-            }
-        })
-        .await;
-
-        inner.socket.close().await
+        let inner = poll_fn(|cx| shutdown.poll_inner(cx)).await;
+        let result = inner.socket.close().await;
+        drop(shutdown);
+        result
     }
 }
 
@@ -693,6 +731,12 @@ impl Endpoint {
     /// Does not proactively close existing connections. Consider calling
     /// [`close()`] if that is desired.
     ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if another clone is already being
+    /// shut down. A surviving clone can retry after the first shutdown is
+    /// cancelled.
+    ///
     /// [`close()`]: Endpoint::close
     pub async fn shutdown(self) -> io::Result<()> {
         self.inner.shutdown().await
@@ -701,8 +745,6 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "rustls-ring")]
-    use std::task::Poll;
     use std::{
         future::Future,
         io,
@@ -711,7 +753,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Wake, Waker},
+        task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
@@ -910,6 +952,50 @@ mod tests {
         .unwrap();
 
         drop(rebound);
+    }
+
+    #[compio_macros::test]
+    async fn concurrent_shutdown_is_exclusive_and_cancellation_safe() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let endpoint = Endpoint::new(socket, idle_endpoint_config(), None, None).unwrap();
+        let first = endpoint.clone();
+        let second = endpoint;
+        let mut first = Box::pin(first.shutdown());
+        let mut second = Box::pin(second.shutdown());
+        let waker = Waker::from(Arc::new(WakeCounter::default()));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        let error = match second.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            Poll::Ready(Ok(())) => panic!("concurrent shutdown unexpectedly succeeded"),
+            Poll::Pending => panic!("concurrent shutdown did not report contention"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        timeout(Duration::from_secs(1), first)
+            .await
+            .expect("shutdown owner did not finish after the competing clone returned")
+            .unwrap();
+        drop(StdUdpSocket::bind(addr).expect("shutdown did not release the UDP socket"));
+        drop(second);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let endpoint = Endpoint::new(socket, idle_endpoint_config(), None, None).unwrap();
+        let owner = endpoint.clone();
+        let retry = endpoint;
+        let mut owner = Box::pin(owner.shutdown());
+
+        assert!(owner.as_mut().poll(&mut cx).is_pending());
+        drop(owner);
+
+        timeout(Duration::from_secs(1), retry.shutdown())
+            .await
+            .expect("surviving clone could not retry a cancelled shutdown")
+            .unwrap();
+        drop(StdUdpSocket::bind(addr).expect("retried shutdown did not release the UDP socket"));
     }
 
     #[test]
