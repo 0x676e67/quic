@@ -11,6 +11,8 @@ use crate::compio::Endpoint;
 /// Helper to construct an [`Endpoint`] for use with outgoing connections only.
 ///
 /// To get one, call `new_with_xxx` methods.
+/// The built-in TLS configuration constructors enable early data. A configuration passed to
+/// [`ClientBuilder::new_with_rustls_client_config`] keeps its `enable_early_data` setting.
 ///
 /// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
 #[derive(Debug)]
@@ -73,15 +75,21 @@ impl ClientBuilder<rustls::RootCertStore> {
 }
 
 impl ClientBuilder<rustls::ClientConfig> {
-    /// Create a builder with the provided [`rustls::ClientConfig`].
+    /// Create a builder with the provided [`rustls::ClientConfig`], preserving its early-data
+    /// setting.
     pub fn new_with_rustls_client_config(client_config: rustls::ClientConfig) -> Self {
         Self(client_config)
+    }
+
+    fn new_with_early_data(mut client_config: rustls::ClientConfig) -> Self {
+        client_config.enable_early_data = true;
+        Self::new_with_rustls_client_config(client_config)
     }
 
     /// Do not verify the server's certificate. It is vulnerable to MITM
     /// attacks, but convenient for testing.
     pub fn new_with_no_server_verification() -> Self {
-        Self(
+        Self::new_with_early_data(
             rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier::SkipServerVerification::new()))
@@ -94,7 +102,7 @@ impl ClientBuilder<rustls::ClientConfig> {
     pub fn new_with_platform_verifier() -> Result<Self, rustls::Error> {
         use rustls_platform_verifier::BuilderVerifierExt;
 
-        Ok(Self(
+        Ok(Self::new_with_early_data(
             rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_platform_verifier()?
                 .with_no_client_auth(),
@@ -103,7 +111,7 @@ impl ClientBuilder<rustls::ClientConfig> {
 
     /// Create a builder with the provided [`rustls::RootCertStore`].
     pub fn new_with_root_certificates(roots: rustls::RootCertStore) -> Self {
-        Self(
+        Self::new_with_early_data(
             rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
@@ -112,7 +120,7 @@ impl ClientBuilder<rustls::ClientConfig> {
 
     /// Create a builder with a custom [`rustls::client::WebPkiServerVerifier`].
     pub fn new_with_webpki_verifier(verifier: Arc<rustls::client::WebPkiServerVerifier>) -> Self {
-        Self(
+        Self::new_with_early_data(
             rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_webpki_verifier(verifier)
                 .with_no_client_auth(),
@@ -136,8 +144,7 @@ impl ClientBuilder<rustls::ClientConfig> {
     }
 
     /// Build a [`ClientConfig`].
-    pub fn build(mut self) -> Result<ClientConfig, NoInitialCipherSuite> {
-        self.0.enable_early_data = true;
+    pub fn build(self) -> Result<ClientConfig, NoInitialCipherSuite> {
         Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
             self.0,
         )?)))
@@ -159,13 +166,16 @@ impl ClientBuilder<rustls::ClientConfig> {
 /// Helper to construct an [`Endpoint`] for use with incoming connections.
 ///
 /// To get one, call `new_with_xxx` methods.
+/// [`ServerBuilder::new_with_single_cert`] enables early data. A configuration passed to
+/// [`ServerBuilder::new_with_rustls_server_config`] keeps its `max_early_data_size` setting.
 ///
 /// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
 #[derive(Debug)]
 pub struct ServerBuilder<T>(T);
 
 impl ServerBuilder<rustls::ServerConfig> {
-    /// Create a builder with the provided [`rustls::ServerConfig`].
+    /// Create a builder with the provided [`rustls::ServerConfig`], preserving its early-data
+    /// setting.
     pub fn new_with_rustls_server_config(server_config: rustls::ServerConfig) -> Self {
         Self(server_config)
     }
@@ -177,10 +187,11 @@ impl ServerBuilder<rustls::ServerConfig> {
         cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
         key_der: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<Self, rustls::Error> {
-        let server_config =
+        let mut server_config =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_no_client_auth()
                 .with_single_cert(cert_chain, key_der)?;
+        server_config.max_early_data_size = u32::MAX;
         Ok(Self::new_with_rustls_server_config(server_config))
     }
 
@@ -201,8 +212,7 @@ impl ServerBuilder<rustls::ServerConfig> {
     }
 
     /// Build a [`ServerConfig`].
-    pub fn build(mut self) -> Result<ServerConfig, NoInitialCipherSuite> {
-        self.0.max_early_data_size = u32::MAX;
+    pub fn build(self) -> Result<ServerConfig, NoInitialCipherSuite> {
         Ok(ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(self.0)?,
         )))
@@ -282,5 +292,151 @@ mod verifier {
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             self.0.supported_schemes()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use compio_io::AsyncWriteExt;
+    use futures_util::join;
+
+    use super::*;
+
+    fn certificate() -> (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (
+            cert.der().clone(),
+            signing_key.serialize_der().try_into().unwrap(),
+        )
+    }
+
+    fn client_config(cert: rustls::pki_types::CertificateDer<'static>) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    }
+
+    fn server_config(
+        cert: rustls::pki_types::CertificateDer<'static>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> rustls::ServerConfig {
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap()
+    }
+
+    async fn prime_resumption(endpoint: &Endpoint) {
+        join!(
+            async {
+                let connection = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                let (_, request) = recv.read_to_end(Vec::new()).await.unwrap();
+                assert_eq!(request, b"ticket");
+                send.write_all(b"ready").await.unwrap();
+                send.finish().unwrap();
+                let _ = connection.closed().await;
+            },
+            async {
+                let connection = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let (mut send, mut recv) = connection.open_bi().unwrap();
+                send.write_all(b"ticket").await.unwrap();
+                send.finish().unwrap();
+                let (_, response) = recv.read_to_end(Vec::new()).await.unwrap();
+                assert_eq!(response, b"ready");
+                connection.close(0u32.into(), b"done");
+            }
+        );
+    }
+
+    async fn accept_until_closed(endpoint: &Endpoint) {
+        let incoming = endpoint.wait_incoming().await.unwrap();
+        if let Ok(connection) = incoming.await {
+            let _ = connection.closed().await;
+        }
+    }
+
+    #[compio_macros::test]
+    async fn custom_client_early_data_setting_is_preserved() {
+        compio_runtime::time::timeout(Duration::from_secs(3), async {
+            let (cert, key) = certificate();
+            let server = ServerBuilder::new_with_single_cert(vec![cert.clone()], key)
+                .unwrap()
+                .build()
+                .unwrap();
+            let client = ClientBuilder::new_with_rustls_client_config(client_config(cert))
+                .build()
+                .unwrap();
+            let endpoint = Endpoint::server("127.0.0.1:0", server).await.unwrap();
+            endpoint.set_default_client_config(client);
+            prime_resumption(&endpoint).await;
+
+            join!(accept_until_closed(&endpoint), async {
+                let connecting = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap();
+                let connection = connecting
+                    .into_0rtt()
+                    .expect_err("custom client configuration disabled early data")
+                    .await
+                    .unwrap();
+                connection.close(0u32.into(), b"done");
+            });
+            endpoint.shutdown().await.unwrap();
+        })
+        .await
+        .expect("custom client early-data test timed out");
+    }
+
+    #[compio_macros::test]
+    async fn custom_server_early_data_setting_is_preserved() {
+        compio_runtime::time::timeout(Duration::from_secs(3), async {
+            let (cert, key) = certificate();
+            let mut accepting_tls = server_config(cert.clone(), key);
+            accepting_tls.max_early_data_size = u32::MAX;
+            let mut rejecting_tls = accepting_tls.clone();
+            rejecting_tls.max_early_data_size = 0;
+            let accepting = ServerBuilder::new_with_rustls_server_config(accepting_tls)
+                .build()
+                .unwrap();
+            let rejecting = ServerBuilder::new_with_rustls_server_config(rejecting_tls)
+                .build()
+                .unwrap();
+            let client = ClientBuilder::new_with_empty_roots()
+                .with_custom_certificate(cert)
+                .unwrap()
+                .with_no_crls()
+                .build()
+                .unwrap();
+            let endpoint = Endpoint::server("127.0.0.1:0", accepting).await.unwrap();
+            endpoint.set_default_client_config(client);
+            prime_resumption(&endpoint).await;
+            endpoint.set_server_config(Some(rejecting));
+
+            join!(accept_until_closed(&endpoint), async {
+                let connection = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .into_0rtt()
+                    .expect("the built-in client should attempt early data");
+                assert!(!connection.accepted_0rtt().await.unwrap());
+                connection.close(0u32.into(), b"done");
+            });
+            endpoint.shutdown().await.unwrap();
+        })
+        .await
+        .expect("custom server early-data test timed out");
     }
 }
