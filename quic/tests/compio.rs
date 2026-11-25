@@ -89,7 +89,13 @@ async fn loopback_uses_the_local_protocol_state_machine() {
 
     join!(
         async {
-            let connection = endpoint.wait_incoming().await.unwrap().await.unwrap();
+            let incoming = endpoint.wait_incoming().await.unwrap();
+            let connection = incoming
+                .accept()
+                .unwrap()
+                .into_0rtt()
+                .expect("the server should be able to use 0.5-RTT");
+            assert!(connection.accepted_0rtt().await.unwrap());
             connection.handshake_confirmed().await.unwrap();
             let (mut send, mut recv) = connection.accept_bi().await.unwrap();
             let (_, request) = recv.read_to_end(Vec::new()).await.unwrap();

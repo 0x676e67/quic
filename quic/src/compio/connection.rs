@@ -666,9 +666,8 @@ impl Connecting {
     ///
     /// ## Incoming
     ///
-    /// For incoming connections, conversion to 0.5-RTT will always fully
-    /// succeed. `into_0rtt` will always return `Ok` and
-    /// [`Connection::accepted_0rtt`] will always resolve to true.
+    /// For incoming connections, conversion to 0.5-RTT always succeeds.
+    /// [`Connection::accepted_0rtt`] returns `Ok(true)` after a successful handshake.
     ///
     /// ## Security
     ///
@@ -1073,14 +1072,16 @@ impl Connection {
         ))
     }
 
-    /// Wait for the connection to be fully established.
+    /// Wait for the handshake to complete and report the outcome of early data.
     ///
-    /// For clients, the resulting value indicates if 0-RTT was accepted. For
-    /// servers, the resulting value is meaningless.
+    /// For clients, this returns whether the server accepted 0-RTT. For servers,
+    /// this returns `true` after a successful handshake.
     pub async fn accepted_0rtt(&self) -> Result<bool, ConnectionError> {
         wait_for(&self.0.notifications.connected, || {
             let state = self.0.try_state()?;
-            Ok(state.connected.then(|| state.conn.accepted_0rtt()))
+            Ok(state
+                .connected
+                .then(|| state.conn.side().is_server() || state.conn.accepted_0rtt()))
         })
         .await
     }
