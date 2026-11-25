@@ -96,8 +96,8 @@ impl ClientBuilder<rustls::RootCertStore> {
         ClientBuilder::new_with_root_certificates(self.0)
     }
 
-    /// Verify the revocation state of presented client certificates against the
-    /// provided certificate revocation lists (CRLs).
+    /// Check the certificates presented by the server against the provided certificate
+    /// revocation lists (CRLs).
     ///
     /// # Errors
     ///
