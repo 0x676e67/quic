@@ -118,12 +118,22 @@ impl EndpointState {
             if let Some(incoming) = self.incoming.pop_front() {
                 Poll::Ready(Some(incoming))
             } else {
-                self.incoming_wakers.push_back(cx.waker().clone());
+                if !self
+                    .incoming_wakers
+                    .iter()
+                    .any(|waker| waker.will_wake(cx.waker()))
+                {
+                    self.incoming_wakers.push_back(cx.waker().clone());
+                }
                 Poll::Pending
             }
         } else {
             Poll::Ready(None)
         }
+    }
+
+    fn wake_incoming_waiters(&mut self) {
+        self.incoming_wakers.drain(..).for_each(Waker::wake);
     }
 
     fn new_connection(
@@ -352,8 +362,7 @@ impl EndpointInner {
                 break Ok(());
             }
             if !state.incoming.is_empty() {
-                let n = state.incoming.len().min(state.incoming_wakers.len());
-                state.incoming_wakers.drain(..n).for_each(Waker::wake);
+                state.wake_incoming_waiters();
             }
         }
     }
@@ -601,7 +610,7 @@ impl Endpoint {
         for conn in state.connections.values() {
             let _ = conn.send(ConnectionEvent::Close(error_code, reason.clone()));
         }
-        state.incoming_wakers.drain(..).for_each(Waker::wake);
+        state.wake_incoming_waiters();
     }
 
     /// Gracefully shutdown the endpoint.
@@ -627,12 +636,77 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::datagram_stride;
+    use std::{
+        future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Wake, Waker},
+    };
+
+    use compio_net::UdpSocket;
+    use proto::EndpointConfig;
+
+    use super::{Endpoint, datagram_stride};
 
     #[test]
     fn empty_datagram_has_no_stride() {
         assert_eq!(datagram_stride(0, 0), None);
         assert_eq!(datagram_stride(1200, 0), Some(1200));
         assert_eq!(datagram_stride(2400, 1200), Some(1200));
+    }
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[compio_macros::test]
+    async fn cancelled_waiter_does_not_consume_incoming_wakeup() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint::new(socket, EndpointConfig::default(), None, None).unwrap();
+        let cancelled_counter = Arc::new(WakeCounter::default());
+        let cancelled_waker = Waker::from(cancelled_counter);
+        let mut cancelled = Box::pin(endpoint.wait_incoming());
+
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(&cancelled_waker))
+                .is_pending()
+        );
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(&cancelled_waker))
+                .is_pending()
+        );
+        assert_eq!(endpoint.inner.state.lock().incoming_wakers.len(), 1);
+        drop(cancelled);
+
+        let active_counter = Arc::new(WakeCounter::default());
+        let active_waker = Waker::from(active_counter.clone());
+        let mut active = Box::pin(endpoint.wait_incoming());
+        assert!(
+            active
+                .as_mut()
+                .poll(&mut Context::from_waker(&active_waker))
+                .is_pending()
+        );
+
+        endpoint.inner.state.lock().wake_incoming_waiters();
+        assert_eq!(active_counter.0.load(Ordering::Relaxed), 1);
+
+        drop(active);
+        endpoint.shutdown().await.unwrap();
     }
 }
