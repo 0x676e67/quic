@@ -24,6 +24,7 @@ use proto::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::compio::{
     RecvStream, SendStream, Socket,
@@ -126,6 +127,7 @@ pub(crate) struct ConnectionInner {
     socket: Socket,
     events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     events_rx: Receiver<ConnectionEvent>,
+    closed: Notify,
 }
 
 fn implicit_close(this: &Shared<ConnectionInner>) {
@@ -165,6 +167,7 @@ impl ConnectionInner {
             socket,
             events_tx,
             events_rx,
+            closed: Notify::new(),
         }
     }
 
@@ -217,7 +220,10 @@ impl ConnectionInner {
                     let mut state = self.state();
                     for event in events {
                         match event {
-                            ConnectionEvent::Close(error_code, reason) => state.close(error_code, reason),
+                            ConnectionEvent::Close(error_code, reason) => {
+                                state.close(error_code, reason);
+                                self.closed.notify_waiters();
+                            }
                             ConnectionEvent::Proto(event) => state.conn.handle_event(event),
                         }
                     }
@@ -273,7 +279,10 @@ impl ConnectionInner {
                         state.handshake_confirmed = true;
                         state.on_handshake_confirmed.drain(..).for_each(Waker::wake);
                     }
-                    ConnectionLost { reason } => state.terminate(reason.into()),
+                    ConnectionLost { reason } => {
+                        state.terminate(reason.into());
+                        self.closed.notify_waiters();
+                    }
                     Stream(StreamEvent::Readable { id }) => wake_stream(id, &mut state.readable),
                     Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut state.writable),
                     Stream(StreamEvent::Finished { id }) => wake_stream(id, &mut state.stopped),
@@ -660,16 +669,24 @@ impl Connection {
         self.0
             .state()
             .close(error_code, Bytes::copy_from_slice(reason));
+        self.0.closed.notify_waiters();
     }
 
     /// Wait for the connection to be closed for any reason.
+    ///
+    /// This operation is cancel-safe. Multiple callers can wait concurrently.
     pub async fn closed(&self) -> ConnectionError {
-        let worker = self.0.state().worker.take();
-        if let Some(worker) = worker {
-            let _ = worker.await;
+        loop {
+            let notified = {
+                let state = self.0.state();
+                if let Some(error) = &state.error {
+                    return error.clone();
+                }
+                // Register for a broadcast before releasing the state lock.
+                self.0.closed.notified()
+            };
+            notified.await;
         }
-
-        self.0.try_state().unwrap_err()
     }
 
     /// If the connection is closed, the reason why.

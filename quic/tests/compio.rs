@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{future::Future, io, sync::Arc, time::Duration};
 
 use compio_io::AsyncWriteExt;
 use futures_util::join;
@@ -79,6 +79,61 @@ async fn loopback_uses_the_local_protocol_state_machine() {
             assert_eq!(response, b"pong");
         }
     );
+
+    endpoint.shutdown().await.unwrap();
+}
+
+#[compio_macros::test]
+async fn closed_observers_survive_cancellation_and_run_concurrently() {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    let (server_config, client_config) = config_pair(TransportConfig::default());
+    let endpoint = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    endpoint.set_default_client_config(client_config);
+    let (ready_tx, ready_rx) = flume::bounded(1);
+
+    compio_runtime::time::timeout(TIMEOUT, async {
+        join!(
+            async {
+                let connection = endpoint.wait_incoming().await.unwrap().await.unwrap();
+                let mut cancelled = Box::pin(connection.closed());
+                struct CancelledObserver;
+                impl std::task::Wake for CancelledObserver {
+                    fn wake(self: Arc<Self>) {
+                        panic!("cancelled closed observer was woken");
+                    }
+                }
+                let observer = Arc::new(CancelledObserver);
+                let waker = std::task::Waker::from(observer.clone());
+                assert!(
+                    cancelled
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&waker))
+                        .is_pending()
+                );
+                drop(cancelled);
+                drop(waker);
+                assert_eq!(Arc::strong_count(&observer), 1);
+                ready_tx.send_async(()).await.unwrap();
+
+                let (first, second) = join!(connection.closed(), connection.closed());
+                assert_eq!(first, second);
+            },
+            async {
+                let connection = endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                ready_rx.recv_async().await.unwrap();
+                connection.close(7u32.into(), b"done");
+            }
+        );
+    })
+    .await
+    .expect("closed observers did not all complete");
 
     endpoint.shutdown().await.unwrap();
 }
