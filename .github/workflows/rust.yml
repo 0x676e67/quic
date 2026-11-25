@@ -125,6 +125,10 @@ jobs:
       - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path quic-proto/Cargo.toml --no-default-features --features rustls-aws-lc-rs-fips
       - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path quic/Cargo.toml --no-default-features --features rustls-aws-lc-rs-fips,runtime-tokio
       - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path quic/Cargo.toml --no-default-features --features rustls-aws-lc-rs-fips,__rustls-post-quantum-test,runtime-tokio
+      # Test both Rustls providers together without a process-wide default.
+      - run: >-
+          cargo test --locked -p quic --no-default-features
+          --features rustls-ring,rustls-aws-lc-rs,runtime-compio-polling --test compio_provider
 
   test-btls:
     runs-on: ubuntu-latest
