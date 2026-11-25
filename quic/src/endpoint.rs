@@ -47,7 +47,7 @@ use crate::{
     connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
 };
 
-fn is_msg_size_err(err: &io::Error) -> bool {
+pub(crate) fn is_msg_size_err(err: &io::Error) -> bool {
     #[cfg(unix)]
     {
         err.raw_os_error() == Some(libc::EMSGSIZE)

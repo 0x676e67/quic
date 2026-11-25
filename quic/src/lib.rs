@@ -41,6 +41,8 @@
 
 use std::pin::Pin;
 
+#[cfg(feature = "runtime-compio")]
+pub mod compio;
 mod connection;
 mod endpoint;
 mod incoming;
@@ -90,7 +92,7 @@ pub use crate::runtime::default_runtime;
 pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime-tokio"))]
 mod tests;
 
 #[derive(Debug)]

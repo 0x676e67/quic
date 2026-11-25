@@ -2,7 +2,7 @@
 name = "quic"
 version.workspace = true
 authors.workspace = true
-license.workspace = true
+license = "Apache-2.0 AND MIT"
 repository.workspace = true
 description = "Versatile QUIC transport protocol implementation"
 readme = "../README.md"
@@ -34,7 +34,7 @@ btls-prefix-symbols = ["proto/btls-prefix-symbols"]
 lock_tracking = []
 
 # Provides `ClientConfig::with_platform_verifier()` convenience method
-platform-verifier = ["proto/platform-verifier"]
+platform-verifier = ["proto/platform-verifier", "dep:rustls-platform-verifier"]
 
 # For backwards compatibility, `rustls` forwards to `rustls-ring`
 rustls = ["rustls-ring"]
@@ -51,6 +51,31 @@ rustls-ring = ["dep:rustls", "ring", "proto/rustls-ring", "proto/ring"]
 ring = ["proto/ring"]
 runtime-tokio = ["tokio/time", "tokio/rt", "tokio/net"]
 runtime-smol = ["dep:async-io", "dep:smol"]
+# Enables the completion-I/O frontend under `quic::compio`.
+runtime-compio = [
+    "dep:compio-buf",
+    "dep:compio-driver",
+    "dep:compio-io",
+    "dep:compio-log",
+    "dep:compio-net",
+    "dep:compio-runtime",
+    "dep:flume",
+    "dep:futures-util",
+    "dep:synchrony",
+    "compio-driver/io-uring",
+]
+# Uses Compio's polling driver on Linux in addition to the default io_uring driver.
+runtime-compio-polling = ["runtime-compio", "compio-driver/polling"]
+# Uses thread-safe handles inside the Compio frontend. Compio tasks remain runtime-local.
+runtime-compio-sync = [
+    "runtime-compio",
+    "compio-driver/sync",
+    "compio-io/sync",
+    "compio-net/sync",
+]
+native-certs = ["runtime-compio", "dep:rustls-native-certs"]
+webpki-roots = ["runtime-compio", "dep:webpki-roots"]
+windows-gro = ["runtime-compio"]
 
 # Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
 tracing-log = ["tracing/log", "proto/tracing-log", "udp/tracing-log"]
@@ -67,17 +92,29 @@ __rustls-post-quantum-test =  ["rustls/prefer-post-quantum", "rustls-aws-lc-rs",
 [dependencies]
 async-io = { workspace = true, optional = true }
 bytes = { workspace = true }
+compio-buf = { workspace = true, optional = true, features = ["bytes"] }
+compio-driver = { workspace = true, optional = true }
+compio-io = { workspace = true, optional = true, features = ["ancillary", "bytemuck"] }
+compio-log = { workspace = true, optional = true }
+compio-net = { workspace = true, optional = true }
+compio-runtime = { workspace = true, optional = true, features = ["time"] }
+flume = { workspace = true, optional = true, features = ["async"] }
 # Enables futures::io::{AsyncRead, AsyncWrite} support for streams
 futures-io = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
 proto = { package = "quic-proto", path = "../quic-proto", version = "0.12.2", default-features = false }
 rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 smol = { workspace = true, optional = true }
+synchrony = { workspace = true, optional = true, features = ["async_flag"] }
 thiserror = { workspace = true }
 tracing =  { workspace = true }
 tokio = { workspace = true }
 udp = { package = "quinn-udp", version = "0.6.3", default-features = false, features = ["tracing"] }
+webpki-roots = { workspace = true, optional = true }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 socket2 = { workspace = true }
@@ -102,6 +139,7 @@ clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
+compio-macros = { workspace = true }
 
 [build-dependencies]
 cfg_aliases = { workspace = true }
@@ -134,6 +172,10 @@ name = "post_quantum"
 required-features = ["__rustls-post-quantum-test"]
 
 [[test]]
+name = "compio"
+required-features = ["runtime-compio", "rustls-ring"]
+
+[[test]]
 name = "btls"
 required-features = ["btls", "runtime-tokio"]
 
@@ -148,4 +190,4 @@ required-features = ["rustls-ring"]
 
 [package.metadata.docs.rs]
 # all non-default features except fips (cannot build on docs.rs environment)
-features = ["lock_tracking", "rustls-aws-lc-rs", "rustls-ring", "runtime-tokio", "runtime-smol", "tracing-log", "rustls-log"]
+features = ["lock_tracking", "rustls-aws-lc-rs", "rustls-ring", "runtime-tokio", "runtime-smol", "runtime-compio", "runtime-compio-polling", "tracing-log", "rustls-log"]
