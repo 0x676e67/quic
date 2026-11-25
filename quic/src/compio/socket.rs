@@ -94,11 +94,11 @@ fn error_is_unsupported(e: &io::Error) -> bool {
     };
     #[cfg(unix)]
     {
-        raw == libc::ENOPROTOOPT
+        matches!(raw, libc::ENOPROTOOPT | libc::EAFNOSUPPORT)
     }
     #[cfg(windows)]
     {
-        raw == WinSock::WSAENOPROTOOPT
+        matches!(raw, WinSock::WSAENOPROTOOPT | WinSock::WSAEAFNOSUPPORT)
     }
 }
 
@@ -173,7 +173,8 @@ impl Socket {
             set_socket_option!(socket, WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO, &1);
         }
 
-        // disable fragmentation
+        // RFC 8899 section 3 requires IPv4 probes to set DF and avoid source fragmentation.
+        // https://www.rfc-editor.org/rfc/rfc8899#section-3
         #[allow(unused_mut)]
         let mut may_fragment = false;
         if is_ipv4 {
@@ -186,7 +187,7 @@ impl Socket {
                     &libc::IP_PMTUDISC_PROBE,
                 ));
             }
-            #[cfg(any(aix, freebsd, apple))]
+            #[cfg(any(aix, freebsd, solarish, apple))]
             {
                 may_fragment |= fragmentation_may_occur(set_socket_option!(
                     socket,
@@ -194,6 +195,10 @@ impl Socket {
                     libc::IP_DONTFRAG,
                     &1,
                 ));
+            }
+            #[cfg(not(any(linux_all, aix, freebsd, solarish, apple, windows)))]
+            {
+                may_fragment = true;
             }
             #[cfg(windows)]
             {
@@ -232,6 +237,10 @@ impl Socket {
                     WinSock::IPV6_DONTFRAG,
                     &1,
                 ));
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                may_fragment = true;
             }
         }
 
@@ -570,6 +579,17 @@ mod tests {
     fn mtud_requires_dont_fragment_support() {
         assert!(!fragmentation_may_occur(true));
         assert!(fragmentation_may_occur(false));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn address_family_error_means_socket_option_is_unsupported() {
+        #[cfg(unix)]
+        let error = io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+        #[cfg(windows)]
+        let error = io::Error::from_raw_os_error(WinSock::WSAEAFNOSUPPORT);
+
+        assert!(error_is_unsupported(&error));
     }
 
     async fn test_send_recv<T: IoBuf>(
