@@ -316,9 +316,33 @@ impl ConnectionInner {
                 break;
             }
         }
+    }
+}
 
-        // Break the reference cycle.
-        if let Some(worker) = self.state().worker.take() {
+/// Owns cleanup that must run whether the connection worker completes or is cancelled.
+#[derive(Debug)]
+struct ConnectionDriver(Shared<ConnectionInner>);
+
+impl ConnectionDriver {
+    async fn run(&self) {
+        self.0.run().await;
+    }
+}
+
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        let worker = {
+            let mut state = self.0.state();
+            if state.error.is_none() {
+                state.terminate(ConnectionError::endpoint_stopped());
+            }
+            let worker = state.worker.take();
+            drop(state);
+            worker
+        };
+
+        self.0.closed.notify_waiters();
+        if let Some(worker) = worker {
             worker.detach();
         }
     }
@@ -474,8 +498,8 @@ impl Connecting {
             handle, conn, socket, events_tx, events_rx,
         ));
         let worker = runtime.spawn({
-            let inner = inner.clone();
-            async move { inner.run().await }.in_current_span()
+            let driver = ConnectionDriver(inner.clone());
+            async move { driver.run().await }.in_current_span()
         });
         inner.state().worker = Some(worker);
         Self(ConnectionRef::new(inner))

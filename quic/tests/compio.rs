@@ -482,6 +482,88 @@ fn endpoint_creation_outside_runtime_returns_an_error() {
     assert_eq!(error.kind(), io::ErrorKind::Other);
 }
 
+#[test]
+fn dropping_the_owner_runtime_wakes_connection_closed() {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    struct ClosedWake(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for ClosedWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let (server_config, client_config) = config_pair(TransportConfig::default());
+    let owner_runtime = compio_runtime::Runtime::new().unwrap();
+    let (endpoint, server_connection, client_connection) = owner_runtime.block_on(async {
+        let endpoint = Endpoint::server("127.0.0.1:0", server_config)
+            .await
+            .unwrap();
+        endpoint.set_default_client_config(client_config);
+        let (server_connection, client_connection) =
+            compio_runtime::time::timeout(TIMEOUT, async {
+                join!(
+                    async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+                    async {
+                        endpoint
+                            .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                            .unwrap()
+                            .await
+                            .unwrap()
+                    }
+                )
+            })
+            .await
+            .expect("loopback handshake timed out");
+        let (server_confirmed, client_confirmed) = join!(
+            server_connection.handshake_confirmed(),
+            client_connection.handshake_confirmed()
+        );
+        server_confirmed.unwrap();
+        client_confirmed.unwrap();
+        (endpoint, server_connection, client_connection)
+    });
+
+    let mut closed = Box::pin(client_connection.closed());
+    let wake = Arc::new(ClosedWake(std::sync::atomic::AtomicBool::new(false)));
+    let waker = std::task::Waker::from(wake.clone());
+    assert!(
+        closed
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+
+    drop(endpoint);
+    drop(owner_runtime);
+    assert!(
+        wake.0.load(std::sync::atomic::Ordering::SeqCst),
+        "dropping the connection driver did not wake closed()"
+    );
+
+    let observer_runtime = compio_runtime::Runtime::new().unwrap();
+    let reason = observer_runtime.block_on(async {
+        compio_runtime::time::timeout(TIMEOUT, closed)
+            .await
+            .expect("closed() remained pending after its driver was dropped")
+    });
+    match reason {
+        quic::compio::ConnectionError::TransportError(error) => {
+            assert_eq!(error.code, quic::TransportErrorCode::INTERNAL_ERROR);
+            assert_eq!(error.reason, "endpoint driver future was dropped");
+        }
+        other => panic!("unexpected driver-drop close reason: {other}"),
+    }
+
+    drop(server_connection);
+}
+
 #[cfg(feature = "runtime-tokio")]
 #[test]
 fn compio_client_interoperates_with_tokio_server() -> anyhow::Result<()> {
